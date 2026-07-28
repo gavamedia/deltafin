@@ -26,6 +26,7 @@ import mmap
 import os
 import re
 import ssl
+import sys
 import threading
 import time
 import urllib.parse
@@ -69,13 +70,34 @@ MAX_COALESCE = int(os.environ.get("K3_FETCH_COALESCE", "4"))  # experts per merg
 #           kernel only ever touches resident memory. Measured ~7.0 GB/s.
 EXPERT_READ = os.environ.get("K3_EXPERT_READ", "pread")
 PREAD_WORKERS = int(os.environ.get("K3_PREAD_WORKERS", "6"))
-PREAD_NOCACHE = os.environ.get("K3_PREAD_NOCACHE", "1") == "1"
+# Cache-bypass for expert reads. On Darwin this is essential: a 64 GB Mac cannot let
+# 25.8 GB/token of expert traffic evict the page cache the resident spine depends on.
+# On Linux the calculus INVERTS on a large-RAM host — RAM beyond the spine is the best
+# expert cache available, so bypassing the page cache there throws away free hit-rate.
+# Hence: default ON for Darwin, OFF elsewhere; K3_PREAD_NOCACHE always overrides.
+PREAD_NOCACHE = os.environ.get(
+    "K3_PREAD_NOCACHE", "1" if sys.platform == "darwin" else "0") == "1"
 # free-slot high-water mark; prefill unions (up to 5 x 16 experts/layer) grow the
 # pool transiently and are trimmed back to this after the layer is done.
 PREAD_MAX_FREE = int(os.environ.get("K3_PREAD_MAX_FREE", "40"))
 # how many read_layer() results stay valid at once (buffer recycling depth).
 PREAD_DEPTH = int(os.environ.get("K3_PREAD_DEPTH", "2"))
 F_NOCACHE = 48          # <sys/fcntl.h>, Darwin: bypass the unified buffer cache
+
+
+def _drop_cache(fd, nbytes=0):
+    """Ask the OS not to retain this fd's pages. Darwin: F_NOCACHE before the read.
+    Linux: posix_fadvise(DONTNEED) after it (there is no pre-read equivalent, and
+    fcntl cmd 48 is UNDEFINED on Linux -> OSError(EINVAL) in every pread worker,
+    which is what this guard exists to prevent). Any other platform: no-op.
+    Advisory everywhere; never allowed to break a read that already succeeded."""
+    try:
+        if sys.platform == "darwin":
+            fcntl.fcntl(fd, F_NOCACHE, 1)
+        elif hasattr(os, "posix_fadvise"):
+            os.posix_fadvise(fd, 0, nbytes, os.POSIX_FADV_DONTNEED)
+    except OSError:
+        pass    # safe swallow: cache hinting is an optimisation, not correctness
 
 stats = {
     "expert_http": 0, "expert_disk": 0, "http_bytes": 0, "http_s": 0.0,
@@ -365,14 +387,19 @@ class _Slot:
     def read(self, path):
         fd = os.open(path, os.O_RDONLY)
         try:
-            if PREAD_NOCACHE:
-                fcntl.fcntl(fd, F_NOCACHE, 1)
+            # Darwin's F_NOCACHE must be set BEFORE the read (it changes how the read
+            # is serviced); Linux's fadvise(DONTNEED) only evicts pages that already
+            # exist, so it must run AFTER. Same intent, opposite placement.
+            if PREAD_NOCACHE and sys.platform == "darwin":
+                _drop_cache(fd)
             off = 0
             while off < EXPERT_SPAN:
                 n = os.preadv(fd, [self.mv[off:]], off)
                 if n <= 0:
                     raise IOError(f"short read {off}/{EXPERT_SPAN} from {path}")
                 off += n
+            if PREAD_NOCACHE and sys.platform != "darwin":
+                _drop_cache(fd, EXPERT_SPAN)
         finally:
             os.close(fd)
 
