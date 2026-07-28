@@ -42,7 +42,9 @@ INT8_DIR = os.path.join(ROOT, "k3-resident-int8/tensors")
 def _auto_dev():
     if torch.backends.mps.is_available():
         return "mps"
-    print("[config] no MPS GPU found — running on CPU (slow). "
+    if torch.cuda.is_available():
+        return "cuda"
+    print("[config] no MPS or CUDA GPU found — running on CPU (slow). "
           "Deltafin targets Apple Silicon.", flush=True)
     return "cpu"
 
@@ -56,7 +58,7 @@ def _auto_spine():
     return "bf16"
 
 
-DEV = torch.device(os.environ.get("K3_DEV") or _auto_dev())   # cpu | mps
+DEV = torch.device(os.environ.get("K3_DEV") or _auto_dev())   # cpu | mps | cuda
 SPINE = os.environ.get("K3_SPINE") or _auto_spine()           # bf16 | int8
 if SPINE == "bf16" and "K3_SPINE" not in os.environ:
     print("[config] int8 spine not found — using bf16 (2x the per-token I/O). "
@@ -162,7 +164,10 @@ def _ram_budget_layers():
     if os.environ.get("K3_PIN_LAYERS") is not None:
         return int(os.environ["K3_PIN_LAYERS"])
     import subprocess
-    total_gb = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"])) / 2**30
+    try:  # macOS
+        total_gb = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"])) / 2**30
+    except (OSError, subprocess.CalledProcessError, ValueError):  # Linux
+        total_gb = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 2**30
     reserve = max(10.0, 0.18 * total_gb)
     budget = float(os.environ.get("K3_RAM_GB", 0)) or (total_gb - reserve)
     overhead = 8.0 + (4.7 if DT == torch.float32 else 2.35) + 2.0   # process+lm_head+transients
@@ -519,6 +524,13 @@ def _spine_apply(module, prefix, pack):
     (copy_resident if TEMPLATES else _apply_resident)(module, prefix, pack)
 
 
+def _dev_sync():
+    if DEV.type == "mps":
+        torch.mps.synchronize()
+    elif DEV.type == "cuda":
+        torch.cuda.synchronize()
+
+
 def causal_mask(T, dtype=None):
     dtype = dtype or DT
     m = torch.zeros(1, 1, T, T, dtype=dtype, device=DEV)
@@ -578,14 +590,14 @@ def forward_pass(layers, cache, hidden, step, verbose=True):
                 layer._k3_res = True   # pinned from now on
         if pilot.enabled():
             pilot.arm(layer)
-        if PROFILE and DEV.type == "mps":
-            torch.mps.synchronize()
+        if PROFILE:
+            _dev_sync()
         t0 = time.time()
         hidden, block_residual = layer(
             hidden, attention_mask=mask, position_ids=None,
             past_key_values=cache, use_cache=True, block_residual=block_residual)
-        if PROFILE and DEV.type == "mps":
-            torch.mps.synchronize()
+        if PROFILE:
+            _dev_sync()
         dt_layer = time.time() - t0
         TIMES["compute"] += dt_layer
         if PROFILE:

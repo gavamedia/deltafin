@@ -38,6 +38,7 @@ tools/expert_index.npy
 tools/expert_index.meta.json
 tools/libmxfp4gemv.dylib
 *.dylib
+*.so
 *.o
 router_trace*.jsonl
 

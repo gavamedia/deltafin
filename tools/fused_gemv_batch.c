@@ -13,8 +13,10 @@
 // so every row still takes the 2-row path exactly as run_gemv_mt() did; a row's value
 // does not depend on which thread or which chunk computed it.
 //
-// Build:
+// Build (macOS):
 //   clang -O3 -mcpu=native -shared -DNO_MAIN -o libmxfp4batch.dylib fused_gemv_batch.c -lpthread
+// Build (Linux x86-64):
+//   gcc -O3 -march=x86-64-v3 -shared -fPIC -DNO_MAIN -o libmxfp4batch.so fused_gemv_batch.c -lpthread
 //
 // Exports:
 //   int  mxfp4_pool_init(int nthreads)      // idempotent; rebuilds if size changed
@@ -74,7 +76,7 @@ static pthread_cond_t  g_cv_work = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t  g_cv_done = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t g_api     = PTHREAD_MUTEX_INITIALIZER;  // serializes dispatches
 
-static inline void k3_pause(void) { __asm__ __volatile__("yield"); }
+static inline void k3_pause(void) { k3_cpu_relax(); }   // yield / pause (fused_gemv.c)
 
 // unit index -> (matrix, row range). n_mats is tiny (<=48 in practice) so a binary
 // search costs nothing next to 32 rows x 3584 cols of streaming work.
@@ -122,7 +124,7 @@ static void k3_run_units(void) {
 // ---------------------------------------------------------------- worker
 static void *k3_worker(void *arg) {
     (void)arg;
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    k3_qos_self();
     // Latch the start generation and announce readiness. mxfp4_pool_init() blocks until
     // every worker has done this, so no dispatch can be missed by a slow-starting thread
     // (which would hang the caller waiting for a completion that never arrives).
@@ -185,7 +187,9 @@ int mxfp4_pool_init(int nthreads) {
         atomic_store_explicit(&g_ready, 0, memory_order_relaxed);
         pthread_attr_t at;
         pthread_attr_init(&at);
+#ifdef __APPLE__
         pthread_attr_set_qos_class_np(&at, QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
         int made = 0;
         for (int i = 0; i < nthreads; i++) {
             if (pthread_create(&g_th[i], &at, k3_worker, NULL) != 0) break;

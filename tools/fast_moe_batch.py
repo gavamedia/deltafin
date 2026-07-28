@@ -15,36 +15,51 @@ combine accumulates in the same order.
 
 Interface mirrors fast_moe: expert_ffn(raw, x), moe_infer_fast(x, ids, w, raw_experts).
 """
-import ctypes, os
+import ctypes, os, sys
 import numpy as np
 import torch
 
+from mxfp4 import dequant_mxfp4
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_LIB = ctypes.CDLL(os.path.join(_HERE, "libmxfp4batch.dylib"))
+_LIBPATH = os.environ.get("K3_BATCH_LIB") or os.path.join(
+    _HERE, "libmxfp4batch" + (".dylib" if sys.platform == "darwin" else ".so"))
 
-_u8p = np.ctypeslib.ndpointer(np.uintp, flags="C_CONTIGUOUS")   # array of raw pointers
-_i32 = np.ctypeslib.ndpointer(np.int32, flags="C_CONTIGUOUS")
-_f32 = np.ctypeslib.ndpointer(np.float32, flags="C_CONTIGUOUS")
+_LIB = None
+try:
+    _LIB = ctypes.CDLL(_LIBPATH)
+except OSError as e:
+    print(f"[fast_moe_batch] SLOW PATH: batch kernel unavailable ({e}); using "
+          f"the pure-numpy mxfp4 reference. Build it with the command in "
+          f"tools/fused_gemv_batch.c.", file=sys.stderr, flush=True)
 
-_LIB.mxfp4_gemv_batch.argtypes = [_u8p, _u8p, _u8p, _u8p, _i32, _i32,
-                                  ctypes.c_int, ctypes.c_int]
-_LIB.mxfp4_gemv_batch.restype = None
-_LIB.mxfp4_moe_layer.argtypes = [_u8p, _u8p, _i32, _i32, ctypes.c_int,
-                                 _f32, _f32, ctypes.c_int]
-_LIB.mxfp4_moe_layer.restype = None
-_LIB.mxfp4_situ_batch.argtypes = [_f32, _f32, ctypes.c_int, ctypes.c_int, ctypes.c_int]
-_LIB.mxfp4_situ_batch.restype = None
-_LIB.mxfp4_moe_expert_set.argtypes = [_u8p, _u8p, _u8p, _u8p, _f32, _f32,
-                                      ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                                      ctypes.c_void_p, _f32, ctypes.c_int]
-_LIB.mxfp4_moe_expert_set.restype = None
-_LIB.mxfp4_pool_init.argtypes = [ctypes.c_int]
-_LIB.mxfp4_pool_init.restype = ctypes.c_int
-_LIB.mxfp4_pool_threads.argtypes = []
-_LIB.mxfp4_pool_threads.restype = ctypes.c_int
-_LIB.mxfp4_pool_shutdown.argtypes = []
-_LIB.mxfp4_pool_shutdown.restype = None
+if _LIB is not None:
+    _u8p = np.ctypeslib.ndpointer(np.uintp, flags="C_CONTIGUOUS")   # array of raw pointers
+    _i32 = np.ctypeslib.ndpointer(np.int32, flags="C_CONTIGUOUS")
+    _f32 = np.ctypeslib.ndpointer(np.float32, flags="C_CONTIGUOUS")
 
+    _LIB.mxfp4_gemv_batch.argtypes = [_u8p, _u8p, _u8p, _u8p, _i32, _i32,
+                                      ctypes.c_int, ctypes.c_int]
+    _LIB.mxfp4_gemv_batch.restype = None
+    _LIB.mxfp4_moe_layer.argtypes = [_u8p, _u8p, _i32, _i32, ctypes.c_int,
+                                     _f32, _f32, ctypes.c_int]
+    _LIB.mxfp4_moe_layer.restype = None
+    _LIB.mxfp4_situ_batch.argtypes = [_f32, _f32, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    _LIB.mxfp4_situ_batch.restype = None
+    _LIB.mxfp4_moe_expert_set.argtypes = [_u8p, _u8p, _u8p, _u8p, _f32, _f32,
+                                          ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                          ctypes.c_void_p, _f32, ctypes.c_int]
+    _LIB.mxfp4_moe_expert_set.restype = None
+    _LIB.mxfp4_pool_init.argtypes = [ctypes.c_int]
+    _LIB.mxfp4_pool_init.restype = ctypes.c_int
+    _LIB.mxfp4_pool_threads.argtypes = []
+    _LIB.mxfp4_pool_threads.restype = ctypes.c_int
+    _LIB.mxfp4_pool_shutdown.argtypes = []
+    _LIB.mxfp4_pool_shutdown.restype = None
+    print(f"[fast_moe_batch] batched MXFP4 kernel active: {_LIBPATH}",
+          file=sys.stderr, flush=True)
+
+KERNEL = "fused" if _LIB is not None else "numpy"
 THREADS = int(os.environ.get("K3_GEMV_THREADS", "4"))
 SITU_BETA, SITU_LINEAR_BETA = 4.0, 25.0
 
@@ -54,6 +69,9 @@ _POOL_READY = False
 def pool_init(nthreads=None):
     """Create the persistent worker pool up front (otherwise done lazily in C)."""
     global _POOL_READY
+    if _LIB is None:
+        _POOL_READY = True
+        return 0
     n = _LIB.mxfp4_pool_init(THREADS if nthreads is None else nthreads)
     _POOL_READY = True
     return n
@@ -61,12 +79,13 @@ def pool_init(nthreads=None):
 
 def pool_shutdown():
     global _POOL_READY
-    _LIB.mxfp4_pool_shutdown()
+    if _LIB is not None:
+        _LIB.mxfp4_pool_shutdown()
     _POOL_READY = False
 
 
 def pool_threads():
-    return _LIB.mxfp4_pool_threads()
+    return _LIB.mxfp4_pool_threads() if _LIB is not None else 0
 
 
 # --------------------------------------------------------------- scratch (reused)
@@ -105,6 +124,10 @@ def gemv_batch(mats, nthreads=None):
     """
     n = len(mats)
     if n == 0:
+        return
+    if _LIB is None:                       # pure-numpy fallback (announced on import)
+        for p, s, x, y in mats:
+            y[:] = dequant_mxfp4(p, s) @ x
         return
     _S.grow(n)
     pp, sp, xp, yp, rows, cols = _S.pp, _S.sp, _S.xp, _S.yp, _S.rows, _S.cols
@@ -186,6 +209,8 @@ def moe_infer_fused(x, topk_ids, topk_weight, raw_experts, nthreads=None):
     per token per layer instead of two. NOT bit-exact vs numpy — libm tanhf/expf differ
     from numpy's vectorized transcendentals by ~1 ulp. Kept behind its own name so the
     bit-exact path stays the default."""
+    if _LIB is None:                       # no C SiTU without the lib
+        return moe_infer_fast(x, topk_ids, topk_weight, raw_experts, nthreads)
     xnp = np.ascontiguousarray(x.detach().to("cpu", torch.float32).numpy())
     N, d_model = xnp.shape
     out = np.zeros((N, d_model), dtype=np.float32)

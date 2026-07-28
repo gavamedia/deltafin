@@ -1,16 +1,36 @@
-// Fused MXFP4 dequant + GEMV NEON kernel for Kimi-K3 experts (Apple Silicon).
+// Fused MXFP4 dequant + GEMV SIMD kernel for Kimi-K3 experts.
 // Never materializes the fp32 weight matrix.
+//
+// Written in NEON intrinsics (Apple Silicon); on x86-64 the identical code runs
+// through the 1:1 128-bit mapping in neon_compat_x86.h (SSSE3 + FMA3), keeping
+// the same lanes, the same fused multiply-adds and the same reduction order.
 //
 // Layout: packed U8 [rows, cols/2] (two e2m1 nibbles/byte, LOW first),
 //         scales U8 [rows, cols/32] (e8m0: 2^(s-127)).
 // GEMV: y[r] = dot(W[r,:], x)  (row-major, streaming rows)
 //
-// Build exe:   clang -O3 -mcpu=native -o fused_gemv fused_gemv.c -lpthread -framework Accelerate
-// Build dylib: clang -O3 -mcpu=native -shared -DNO_MAIN -o libmxfp4gemv.dylib fused_gemv.c -lpthread
+// Build exe (macOS):   clang -O3 -mcpu=native -o fused_gemv fused_gemv.c -lpthread -framework Accelerate
+// Build dylib (macOS): clang -O3 -mcpu=native -shared -DNO_MAIN -o libmxfp4gemv.dylib fused_gemv.c -lpthread
+// Build .so (Linux):   gcc -O3 -march=x86-64-v3 -shared -fPIC -DNO_MAIN -o libmxfp4gemv.so fused_gemv.c -lpthread
+// Build exe (Linux):   gcc -O3 -march=x86-64-v3 -o fused_gemv fused_gemv.c -lpthread -lopenblas
 
+#if defined(__aarch64__) || defined(__ARM_NEON)
 #include <arm_neon.h>
+#else
+#include "neon_compat_x86.h"
+#endif
 #include <pthread.h>
+#ifdef __APPLE__
 #include <pthread/qos.h>
+#define k3_qos_self() pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)
+#else
+#define k3_qos_self() ((void)0)   // Linux: no QoS classes; plain pthreads
+#endif
+#if defined(__aarch64__)
+#define k3_cpu_relax() __asm__ volatile("yield")
+#else
+#define k3_cpu_relax() _mm_pause()
+#endif
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -20,7 +40,11 @@
 #include <math.h>
 #include <sched.h>
 #ifndef NO_MAIN
+#ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
+#else
+#include <cblas.h>   /* any CBLAS, e.g. -lopenblas */
+#endif
 #endif
 
 static double now_s(void) {
@@ -241,7 +265,7 @@ typedef struct { // generic row-partition job for one gemv
 } gjob_t;
 
 static void *gworker(void *arg) {
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    k3_qos_self();
     gjob_t *j = (gjob_t *)arg;
     for (int it = 0; it < j->iters; it++)
         j->fn(j->p, j->s, j->x, j->y, j->row0, j->row1, j->cols);
@@ -282,12 +306,12 @@ static void barrier_wait(_Atomic int *ctr, int nthreads, int phase) {
     int spins = 0;
     while (atomic_load_explicit(ctr, memory_order_acquire) < target) {
         if (++spins > 2000) { sched_yield(); spins = 0; }  // machine is oversubscribed
-        else __asm__ volatile("yield");
+        else k3_cpu_relax();
     }
 }
 
 static void *tworker(void *arg) {
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    k3_qos_self();
     tjob_t *j = (tjob_t *)arg;
     const int C13 = 3584, C2 = 3072;
     const int CH = 32;                       // rows per work unit (even: rows2-safe)

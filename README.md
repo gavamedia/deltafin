@@ -38,6 +38,10 @@ python3 -m venv venv
 
 # 2. build the fused MXFP4 kernel
 clang -O3 -mcpu=native -shared -DNO_MAIN -o tools/libmxfp4gemv.dylib tools/fused_gemv.c
+#    (Linux x86-64 with AVX2+FMA:
+#     gcc -O3 -march=x86-64-v3 -shared -fPIC -DNO_MAIN -o tools/libmxfp4gemv.so tools/fused_gemv.c -lpthread
+#     gcc -O3 -march=x86-64-v3 -shared -fPIC -DNO_MAIN -o tools/libmxfp4batch.so tools/fused_gemv_batch.c -lpthread
+#     validate with: ./venv/bin/python tools/test_fused_gemv_port.py)
 
 # 3. download the model  (see the two modes below)
 ./venv/bin/python tools/setup_k3.py --full
