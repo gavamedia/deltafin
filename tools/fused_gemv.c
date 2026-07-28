@@ -374,6 +374,135 @@ double mxfp4_expert_triple(const uint8_t *p1, const uint8_t *s1,
     return now_s() - t0;
 }
 
+// ================= native 256-bit AVX2 kernel (x86-64 only) =================
+// The portable path above runs NEON intrinsics through neon_compat_x86.h, which maps every
+// 128-bit NEON op to one SSE op. Correct, but it leaves half of each YMM register idle: a
+// Zen 2 core retires vpshufb/vpaddw/vfmadd at full 256-bit width for the same 1 uop.
+//
+// Three changes vs. the compat path, per 32-value group:
+//   * ONE vpshufb does 32 table lookups (the compat path issues 4 pshufb for the same work),
+//     because AVX2 shuffles each 128-bit lane against its own copy of the 16-byte table.
+//   * 4 YMM accumulators replace 8 XMM, halving the FMA count.
+//   * The table's low/high byte split is built with a shuffle + two permutes instead of the
+//     compat vuzp1q/vuzp2q pair, which each expand to shuffle+shuffle+unpack.
+//
+// The lane problem and why x is permuted. Widening bf16->f32 with vpunpcklwd is per-lane, so a
+// YMM of weights comes out as [elems 0..3 | elems 16..19] -- two disjoint 4-element runs, not
+// one contiguous 8. Gathering matching x with two 128-bit loads + vinsertf128 would cost 3 uops
+// per FMA and hand back everything the widening saved. Instead x is permuted ONCE per call into
+// that same interleaved order, so every FMA reads it with a plain contiguous 256-bit load. The
+// permute is O(cols) against O(rows*cols) of GEMV, i.e. 3584 floats vs 11M -- free. y is
+// unaffected: each accumulator lane holds a partial dot product and the final reduction sums
+// them all, so lane assignment never escapes the kernel.
+//
+// Bit-exactness is preserved, not approximated. Accumulator Ai holds NEON's [ai | ai+4], so
+// (A0+A1)+(A2+A3) reproduces (b0+b1) in lane 0 and (b2+b3) in lane 1 -- exactly reduce8's
+// association -- and the 128-bit fold plus vaddvq_f32 finishes it in the same order. Verified
+// bit-identical to the compat kernel on every row, not merely within tolerance.
+#if defined(__AVX2__)
+#include <immintrin.h>
+
+// x[g*32 .. g*32+31] -> [0..3|16..19][4..7|20..23][8..11|24..27][12..15|28..31]
+static void k3_permute_x(const float *restrict x, float *restrict xp, int cols) {
+    for (int g = 0; g < cols / 32; g++) {
+        const float *src = x + g * 32;
+        float *dst = xp + g * 32;
+        for (int q = 0; q < 4; q++) {
+            memcpy(dst + q * 8,     src + q * 4,      4 * sizeof(float));
+            memcpy(dst + q * 8 + 4, src + 16 + q * 4, 4 * sizeof(float));
+        }
+    }
+}
+
+static const uint8_t k3_uzp_bytes[16] = { 0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15 };
+
+// Build the group's dequant table, broadcast to both 128-bit lanes so one vpshufb serves 32 idx.
+#define K3_TABLE(scale_byte, TL, TH)                                                             \
+    do {                                                                                          \
+        __m256i _a = _mm256_set1_epi16((short)((((int)(scale_byte)) - 127) << 7));                \
+        __m256i _t = _mm256_add_epi16(BZ, _mm256_and_si256(_a, ZZ));                              \
+        __m256i _u = _mm256_shuffle_epi8(_t, UZP);   /* per lane: 8 low bytes then 8 high */      \
+        (TL) = _mm256_permute4x64_epi64(_u, 0x88);   /* qwords 0,2 -> low bytes,  both lanes */   \
+        (TH) = _mm256_permute4x64_epi64(_u, 0xDD);   /* qwords 1,3 -> high bytes, both lanes */   \
+    } while (0)
+
+// 32 weights -> 4 YMM f32 in the permuted order, then 4 FMAs against contiguous x.
+#define K3_GRP(pp, TL, TH, xq, c0, c1, c2, c3)                                                    \
+    do {                                                                                          \
+        __m128i _P  = _mm_loadu_si128((const __m128i *)((pp) + g * 16));                          \
+        __m128i _lo = _mm_and_si128(_P, M0F);                                                     \
+        __m128i _hi = _mm_and_si128(_mm_srli_epi16(_P, 4), M0F);                                  \
+        __m256i _ix = _mm256_set_m128i(_mm_unpackhi_epi8(_lo, _hi),   /* lane1: elems 16..31 */   \
+                                       _mm_unpacklo_epi8(_lo, _hi));  /* lane0: elems  0..15 */   \
+        __m256i _bl = _mm256_shuffle_epi8(TL, _ix);                                               \
+        __m256i _bh = _mm256_shuffle_epi8(TH, _ix);                                               \
+        __m256i _w0 = _mm256_unpacklo_epi8(_bl, _bh);  /* bf16 e0..e7   | e16..e23 */             \
+        __m256i _w1 = _mm256_unpackhi_epi8(_bl, _bh);  /* bf16 e8..e15  | e24..e31 */             \
+        (c0) = _mm256_fmadd_ps(_mm256_castsi256_ps(_mm256_unpacklo_epi16(ZR, _w0)), (xq)[0], (c0)); \
+        (c1) = _mm256_fmadd_ps(_mm256_castsi256_ps(_mm256_unpackhi_epi16(ZR, _w0)), (xq)[1], (c1)); \
+        (c2) = _mm256_fmadd_ps(_mm256_castsi256_ps(_mm256_unpacklo_epi16(ZR, _w1)), (xq)[2], (c2)); \
+        (c3) = _mm256_fmadd_ps(_mm256_castsi256_ps(_mm256_unpackhi_epi16(ZR, _w1)), (xq)[3], (c3)); \
+    } while (0)
+
+// reduce4: lane0 = NEON's c0, lane1 = c1 -> fold to 128 bits, then the identical vaddvq order.
+static inline float k3_reduce4(__m256 A0, __m256 A1, __m256 A2, __m256 A3) {
+    __m256 S = _mm256_add_ps(_mm256_add_ps(A0, A1), _mm256_add_ps(A2, A3));
+    return vaddvq_f32(_mm_add_ps(_mm256_castps256_ps128(S), _mm256_extractf128_ps(S, 1)));
+}
+
+void mxfp4_gemv_rows2_avx2(const uint8_t *restrict p, const uint8_t *restrict s,
+                           const float *restrict x, float *restrict y,
+                           int row0, int row1, int cols) {
+    const int cp = cols / 2, groups = cols / 32;
+    const __m256i BZ  = _mm256_loadu_si256((const __m256i *)base16);
+    const __m256i ZZ  = _mm256_loadu_si256((const __m256i *)mask16);
+    const __m256i ZR  = _mm256_setzero_si256();
+    const __m128i M0F = _mm_set1_epi8(0x0F);
+    const __m256i UZP = _mm256_broadcastsi128_si256(
+        _mm_loadu_si128((const __m128i *)k3_uzp_bytes));
+
+    float *xp = aligned_alloc(64, ((size_t)cols * sizeof(float) + 63) & ~(size_t)63);
+    if (!xp) { mxfp4_gemv_rows2(p, s, x, y, row0, row1, cols); return; }  // fail soft, same math
+    k3_permute_x(x, xp, cols);
+
+    int r = row0;
+    for (; r + 1 < row1; r += 2) {
+        const uint8_t *ppA = p + (size_t)r * cp,       *spA = s + (size_t)r * groups;
+        const uint8_t *ppB = p + (size_t)(r + 1) * cp, *spB = s + (size_t)(r + 1) * groups;
+        __m256 A0 = _mm256_setzero_ps(), A1 = _mm256_setzero_ps();
+        __m256 A2 = _mm256_setzero_ps(), A3 = _mm256_setzero_ps();
+        __m256 C0 = _mm256_setzero_ps(), C1 = _mm256_setzero_ps();
+        __m256 C2 = _mm256_setzero_ps(), C3 = _mm256_setzero_ps();
+        for (int g = 0; g < groups; g++) {
+            const float *xg = xp + g * 32;
+            const __m256 xq[4] = { _mm256_load_ps(xg),      _mm256_load_ps(xg + 8),
+                                   _mm256_load_ps(xg + 16), _mm256_load_ps(xg + 24) };
+            __m256i TLA, THA, TLB, THB;
+            K3_TABLE(spA[g], TLA, THA);
+            K3_GRP(ppA, TLA, THA, xq, A0, A1, A2, A3);
+            K3_TABLE(spB[g], TLB, THB);
+            K3_GRP(ppB, TLB, THB, xq, C0, C1, C2, C3);
+        }
+        y[r]     = k3_reduce4(A0, A1, A2, A3);
+        y[r + 1] = k3_reduce4(C0, C1, C2, C3);
+    }
+    free(xp);
+    if (r < row1) mxfp4_gemv_rows(p, s, x, y, r, row1, cols);  // odd tail: scalar-count rows
+}
+
+void mxfp4_gemv_avx2(const uint8_t *p, const uint8_t *s, const float *x, float *y,
+                     int rows, int cols) {
+    mxfp4_gemv_rows2_avx2(p, s, x, y, 0, rows, cols);
+}
+void mxfp4_gemv_mt_avx2(const uint8_t *p, const uint8_t *s, const float *x, float *y,
+                        int rows, int cols, int nthreads) {
+    run_gemv_mt_k(mxfp4_gemv_rows2_avx2, p, s, x, y, rows, cols, nthreads, 1);
+}
+int mxfp4_have_avx2(void) { return 1; }
+#else
+int mxfp4_have_avx2(void) { return 0; }
+#endif  // __AVX2__
+
 // simple exported single-gemv for ctypes
 void mxfp4_gemv(const uint8_t *p, const uint8_t *s, const float *x, float *y,
                 int rows, int cols) {
