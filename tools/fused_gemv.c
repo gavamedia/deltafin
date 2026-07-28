@@ -275,7 +275,16 @@ static void *gworker(void *arg) {
 // one gemv, nthreads, iters back-to-back; returns seconds total
 static double run_gemv_mt_k(gemv_fn fn, const uint8_t *p, const uint8_t *s, const float *x, float *y,
                             int rows, int cols, int nthreads, int iters) {
-    pthread_t th[16]; gjob_t jobs[16];
+    // CLAMP: these are fixed-size STACK arrays. nthreads was previously unbounded, so any
+    // caller asking for more than K3_GEMV_MAX_THREADS smashed the stack (reproduced with
+    // nthreads=32: "*** stack smashing detected ***"). Never a problem on a 10-core M1 Max;
+    // immediately reachable on a 32-thread server, where asking for one thread per hardware
+    // thread is the obvious first thing to try. Clamping is safe — over-subscribing past the
+    // core count loses throughput anyway (measured peak here is 12T).
+    enum { K3_GEMV_MAX_THREADS = 16 };
+    pthread_t th[K3_GEMV_MAX_THREADS]; gjob_t jobs[K3_GEMV_MAX_THREADS];
+    if (nthreads < 1) nthreads = 1;
+    if (nthreads > K3_GEMV_MAX_THREADS) nthreads = K3_GEMV_MAX_THREADS;
     int per = (rows + nthreads - 1) / nthreads;
     per = (per + 1) & ~1;  // even split so rows2 stays on 2-row boundaries
     double t0 = now_s();
