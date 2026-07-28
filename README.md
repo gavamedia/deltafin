@@ -41,6 +41,9 @@ clang -O3 -mcpu=native -shared -DNO_MAIN -o tools/libmxfp4gemv.dylib tools/fused
 #    (Linux x86-64 with AVX2+FMA:
 #     gcc -O3 -march=x86-64-v3 -shared -fPIC -DNO_MAIN -o tools/libmxfp4gemv.so tools/fused_gemv.c -lpthread
 #     gcc -O3 -march=x86-64-v3 -shared -fPIC -DNO_MAIN -o tools/libmxfp4batch.so tools/fused_gemv_batch.c -lpthread
+#     Linux aarch64 (e.g. NVIDIA GB10 / Grace, Ampere) — native NEON, use -mcpu=native:
+#     gcc -O3 -mcpu=native   -shared -fPIC -DNO_MAIN -o tools/libmxfp4gemv.so tools/fused_gemv.c -lpthread -lm
+#     gcc -O3 -mcpu=native   -shared -fPIC -DNO_MAIN -o tools/libmxfp4batch.so tools/fused_gemv_batch.c -lpthread -lm
 #     validate with: ./venv/bin/python tools/test_fused_gemv_port.py)
 
 # 3. download the model  (see the two modes below)
@@ -177,7 +180,8 @@ startup. These variables exist for overriding that:
 
 ## Requirements
 
-- An Apple Silicon Mac. All published numbers are from an M1 Max with 64 GB —
+- Apple Silicon, Linux x86-64 (AVX2+FMA), or Linux aarch64. All published numbers
+  are from an M1 Max with 64 GB —
   the slowest machine it has run on. More RAM is used automatically (a 128 GB
   machine pins several times more of the model), and newer chips bring higher
   memory bandwidth, more GPU cores and faster storage. See
