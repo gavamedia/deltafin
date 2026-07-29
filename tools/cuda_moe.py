@@ -43,7 +43,7 @@ _OUT_CAP = 0
 # GPU expert cache: maps expert_id -> _ExpertUpload (LRU, pinned)
 # Auto-sizes from VRAM unless K3_CUDA_EXPERT_CACHE is explicitly set.
 _CACHE_ENV = os.environ.get("K3_CUDA_EXPERT_CACHE")
-_RESERVED_BYTES = int(11.6e9)  # template arena + pilot gates + spine staging + misc
+_RESERVED_BYTES = int(16e9)  # template arena (4.4G) + gates (2.2G) + staging + lm_head + PyTorch overhead
 
 
 def _auto_cache_size():
