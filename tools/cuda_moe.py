@@ -41,7 +41,39 @@ _OUT_BUF = None
 _OUT_CAP = 0
 
 # GPU expert cache: maps expert_id -> _ExpertUpload (LRU, pinned)
-_GPU_CACHE_MAX = int(os.environ.get("K3_CUDA_EXPERT_CACHE", "512"))
+# Auto-sizes from VRAM unless K3_CUDA_EXPERT_CACHE is explicitly set.
+_CACHE_ENV = os.environ.get("K3_CUDA_EXPERT_CACHE")
+_RESERVED_BYTES = int(11.6e9)  # template arena + pilot gates + spine staging + misc
+
+
+def _auto_cache_size():
+    """Pick a safe expert cache size from device VRAM.
+
+    Budget = 75% of card, subtract fixed reserved overhead, divide by
+    expert byte size.  Clamped to [128, 2048].
+    """
+    if not torch.cuda.is_available():
+        return 256
+    try:
+        total = torch.cuda.get_device_properties(0).total_memory
+        budget = int(total * 0.75)
+        avail = max(0, budget - _RESERVED_BYTES)
+        return max(128, min(avail // EXPERT_SPAN, 2048))
+    except Exception:
+        return 256
+
+
+if _CACHE_ENV is not None:
+    _GPU_CACHE_MAX = int(_CACHE_ENV)
+else:
+    _GPU_CACHE_MAX = _auto_cache_size()
+    if torch.cuda.is_available():
+        total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        cache_gb = _GPU_CACHE_MAX * EXPERT_SPAN / 1e9
+        print(f"[cuda-moe] VRAM {total_gb:.0f} GiB | "
+              f"GPU expert cache: {_GPU_CACHE_MAX} entries ({cache_gb:.1f} GiB)",
+              flush=True)
+
 _gpu_cache = {}
 _gpu_cache_order = []
 _gpu_cache_lock = threading.Lock()
