@@ -41,42 +41,10 @@ _OUT_BUF = None
 _OUT_CAP = 0
 
 # GPU expert cache: maps expert_id -> _ExpertUpload (LRU, pinned)
-# Auto-sizes from VRAM unless K3_CUDA_EXPERT_CACHE is explicitly set.
+# Auto-sizes from actual free VRAM on first use.
 _CACHE_ENV = os.environ.get("K3_CUDA_EXPERT_CACHE")
-_RESERVED_BYTES = int(14e9)  # template arena + gates + staging + lm_head + PyTorch overhead
-# Resulting defaults:
-#   RTX 5090 (34 GB): 0.75*34-14 = 11.5 GB → ~657 entries
-#   RTX 3090 (24 GB): 0.75*24-14 = 4.0 GB  → ~228 entries
-# Both safe.  Override with K3_CUDA_EXPERT_CACHE for specific tuning.
-
-
-def _auto_cache_size():
-    """Pick a safe expert cache size from device VRAM.
-
-    Budget = 75% of card, subtract fixed reserved overhead, divide by
-    expert byte size.  Clamped to [128, 2048].
-    """
-    if not torch.cuda.is_available():
-        return 256
-    try:
-        total = torch.cuda.get_device_properties(0).total_memory
-        budget = int(total * 0.75)
-        avail = max(0, budget - _RESERVED_BYTES)
-        return max(128, min(avail // EXPERT_SPAN, 2048))
-    except Exception:
-        return 256
-
-
-if _CACHE_ENV is not None:
-    _GPU_CACHE_MAX = int(_CACHE_ENV)
-else:
-    _GPU_CACHE_MAX = _auto_cache_size()
-    if torch.cuda.is_available():
-        total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-        cache_gb = _GPU_CACHE_MAX * EXPERT_SPAN / 1e9
-        print(f"[cuda-moe] VRAM {total_gb:.0f} GiB | "
-              f"GPU expert cache: {_GPU_CACHE_MAX} entries ({cache_gb:.1f} GiB)",
-              flush=True)
+_GPU_CACHE_MAX = int(_CACHE_ENV) if _CACHE_ENV is not None else None  # None = lazy
+_GPU_CACHE_INITED = False
 
 _gpu_cache = {}
 _gpu_cache_order = []
@@ -127,7 +95,36 @@ def _checked_output(out, x_cpu, ids, weights, raw_experts):
               f"(tol={CHECK_TOL:g}) OK", flush=True)
 
 
+def _gpu_cache_init():
+    """Lazy-init cache size from actual free VRAM.
+
+    Uses 60% of current free memory at first cache operation, after
+    templates, gates, and staging have already been allocated.  This
+    adapts to whatever the runtime has consumed.
+    """
+    global _GPU_CACHE_MAX, _GPU_CACHE_INITED
+    if _GPU_CACHE_INITED:
+        return
+    _GPU_CACHE_INITED = True
+    if _GPU_CACHE_MAX is not None:
+        return  # explicit env var, already set
+    if not torch.cuda.is_available():
+        _GPU_CACHE_MAX = 256
+        return
+    try:
+        free_bytes, _ = torch.cuda.mem_get_info(0)
+        # Use 60% of remaining free VRAM for expert cache
+        avail = int(free_bytes * 0.6)
+        _GPU_CACHE_MAX = max(64, min(avail // EXPERT_SPAN, 2048))
+        gb = _GPU_CACHE_MAX * EXPERT_SPAN / 1e9
+        print(f"[cuda-moe] GPU expert cache: {_GPU_CACHE_MAX} entries ({gb:.1f} GiB "
+              f"from {free_bytes/1e9:.1f} GiB free)", flush=True)
+    except Exception:
+        _GPU_CACHE_MAX = 256
+
+
 def _gpu_cache_get(eid, raw, device_id=0):
+    _gpu_cache_init()
     with _gpu_cache_lock:
         if eid in _gpu_cache:
             _gpu_cache_order.remove(eid)
