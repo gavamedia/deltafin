@@ -143,7 +143,9 @@ class _ExpertUpload:
 
         def _upload(a):
             # Pinned CPU tensor enables async DMA H2D (~2x throughput)
-            cpu = torch.tensor(np.ascontiguousarray(a), pin_memory=True)
+            arr = np.ascontiguousarray(a)
+            cpu = torch.empty(arr.shape, dtype=torch.uint8, pin_memory=True)
+            cpu.copy_(torch.from_numpy(arr))
             gpu = cpu.to(device=dev, dtype=torch.uint8, non_blocking=True)
             refs.append(gpu)
             return gpu
