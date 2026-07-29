@@ -31,6 +31,22 @@ TOOLS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TOOLS_DIR.parent
 NATIVE_ABI_VERSION = 1
 METAL_SHAPES = (3584, 3072, 17_547_264)
+
+
+def _find_nvcc() -> str | None:
+    """Locate nvcc in PATH or common CUDA install directories."""
+    nvcc = shutil.which("nvcc")
+    if nvcc is not None:
+        return nvcc
+    candidates = [
+        "/usr/local/cuda/bin/nvcc",
+        "/usr/lib/cuda/bin/nvcc",
+        "/opt/cuda/bin/nvcc",
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return None
 X86_64_BASE_FEATURES = {
     "avx": frozenset(("avx",)),
     "fma": frozenset(("fma",)),
@@ -105,6 +121,16 @@ METAL_SYMBOLS = (
     "k3_metal_flush",
     "k3_metal_moe_layer",
     "k3_metal_moe_positions",
+)
+
+CUDA_MOE_SYMBOLS = (
+    "cuda_moe_available",
+    "cuda_mxfp4_gemv",
+    "cuda_mxfp4_moe_layer",
+    "cuda_moe_zero_output",
+    "cuda_int8_deq",
+    "cuda_mxfp4_moe_positions",
+    "cuda_moe_error",
 )
 
 
@@ -235,6 +261,17 @@ def artifacts_for(
                 expected_metal_shapes=METAL_SHAPES,
             )
         )
+    # CUDA MoE library: built on Linux x86-64 or aarch64 when nvcc is found.
+    if target.platform == "linux" and _find_nvcc() is not None:
+        artifacts.append(
+            Artifact(
+                "CUDA MoE",
+                tools_dir / "cuda_moe_kernels.cu",
+                tools_dir / "libcudamoe.so",
+                "cuda",
+                CUDA_MOE_SYMBOLS,
+            )
+        )
     return artifacts
 
 
@@ -293,6 +330,27 @@ def compile_command(
             str(output),
             "-lpthread",
             "-lm",
+        ]
+
+    if artifact.language == "cuda":
+        nvcc = _find_nvcc()
+        if nvcc is None:
+            raise BuildError(
+                "nvcc not found; install CUDA Toolkit or skip this artifact"
+            )
+        return [
+            nvcc,
+            "-O3",
+            "-shared",
+            "-gencode", "arch=compute_75,code=sm_75",
+            "-gencode", "arch=compute_80,code=sm_80",
+            "-gencode", "arch=compute_90,code=sm_90",
+            "-gencode", "arch=compute_100,code=sm_100",
+            "-gencode", "arch=compute_120,code=sm_120",
+            "-t", "8",          # parallel compilation
+            str(artifact.source),
+            "-o",
+            str(output),
         ]
 
     if artifact.language == "cxx" and target.platform == "darwin":

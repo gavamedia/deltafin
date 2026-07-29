@@ -925,6 +925,21 @@ if MOE_BACKEND == "metal":
         MOE_BACKEND = "cpu"
         print(f"[config] K3_MOE=metal unavailable ({metal_moe.last_error()}) "
               f"— falling back to cpu", flush=True)
+
+# CUDA MoE backend: consumes raw MXFP4 on GPU with fused dequant+GEMV kernels.
+# Built as tools/libcudamoe.so; falls back to cpu if unavailable.
+if MOE_BACKEND == "cuda":
+    import cuda_moe  # noqa: E402
+    if cuda_moe.available():
+        _MOE_FN = cuda_moe.moe_infer
+        FAST_MOE = True  # CUDA kernel consumes raw MXFP4, never dequantized
+        print(f"[config] MoE backend: cuda "
+              f"({cuda_moe.describe()})", flush=True)
+    else:
+        MOE_BACKEND = "cpu"
+        print(f"[config] K3_MOE=cuda unavailable ({cuda_moe.last_error()}) "
+              f"— falling back to cpu", flush=True)
+
 if MOE_BACKEND == "cpu" and CPU_BATCH_ACTIVE:
     print(f"[config] CPU MoE: persistent worker ring "
           f"({fast_moe_batch.pool_threads()} threads, "

@@ -98,6 +98,60 @@ def metal_available():
     return _lib is not None
 
 
+# --------------------------------------------------------- cuda dequant ----
+_cuda_lib = None
+_cuda_lib_lock = threading.Lock()
+
+
+def cuda_available():
+    """Check CUDA availability (lazy load)."""
+    global _cuda_lib
+    if _cuda_lib is not None:
+        return True
+    if not torch.cuda.is_available():
+        return False
+    with _cuda_lib_lock:
+        if _cuda_lib is not None:
+            return True
+        try:
+            import ctypes
+            _HERE = os.path.dirname(os.path.abspath(__file__))
+            so = os.path.join(_HERE, "libcudamoe.so")
+            if not os.path.isfile(so):
+                return False
+            lib = ctypes.CDLL(so)
+            if not lib.cuda_moe_available(0):
+                return False
+            lib.cuda_int8_deq.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+            lib.cuda_int8_deq.restype = None
+            _cuda_lib = lib
+            return True
+        except Exception:
+            return False
+
+
+def dequant_cuda(dst, q, sc):
+    """dst[fp32, (rows, cols), on CUDA] <- float(q[int8]) * float(sc[fp16, rows]).
+
+    Bit-identical to torch expression. Returns True on success.
+    """
+    import ctypes
+    lib = _cuda_lib
+    if lib is None:
+        return False
+    rows, cols = dst.shape
+    stream_ptr = torch.cuda.current_stream().cuda_stream
+    lib.cuda_int8_deq(
+        ctypes.c_void_p(dst.data_ptr()),
+        ctypes.c_void_p(q.data_ptr()),
+        ctypes.c_void_p(sc.data_ptr()),
+        rows, cols,
+        ctypes.c_void_p(stream_ptr))
+    return True
+
+
 def metal_error():
     return _lib_err
 
@@ -1773,6 +1827,11 @@ def apply_pack(module, prefix, pack, dev, dt, inv, dtmap, set_param, load_reside
                 and p.dtype == torch.float32 and dt == torch.float32)
         if fits and use_metal:
             dequant_into(p.data, q, sc)
+            if packed_qkv is not None and packed_qkv.consumes(name):
+                packed_qkv.mark_dense(name)
+            continue
+        if fits and dev.type == "cuda" and cuda_available():
+            dequant_cuda(p.data, q, sc)
             if packed_qkv is not None and packed_qkv.consumes(name):
                 packed_qkv.mark_dense(name)
             continue

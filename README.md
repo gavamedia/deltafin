@@ -250,6 +250,7 @@ startup. These variables exist for overriding that:
 | `K3_GEMV_THREADS` | auto | native CPU MXFP4 workers: up to 4 effective CPUs on macOS and 8 on Linux, respecting affinity and cgroup quota; override to retune a specific host |
 | `K3_METAL_POSITION_BATCH` | `0` | MPS/Metal-specific exact opt-in T>1 position-major MoE; measured +2.0% on accepted speculative passes and should be retuned per Mac |
 | `K3_MOE_TOP_K` | `16` | explicit quality/speed dial; fewer routed experts reduce expert bytes and can change output |
+| `K3_CUDA_EXPERT_CACHE` | `512` | GPU expert cache size (entries); each cache entry holds one expert's MXFP4 weights (~17.5 MB). Larger values reduce CPU→GPU re-upload on VRAM-rich cards; reduce (e.g. `256`) on a 24 GB RTX 3090 to avoid OOM |
 | `K3_CPU_MOE_BATCH` | `auto` | exact persistent CPU MXFP4 worker ring; padded counters measured +3.6% at eight threads |
 | `K3_ASYNC_CACHE_WRITE` | `0` | opt-in cache-miss write overlap; `K3_CACHE_WRITE_QUEUE` (4) bounds outstanding buffers and `K3_CACHE_WRITE_WORKERS` (1) is retunable per host |
 | `K3_APPROX` | `0` | fp16 numerics; not reproducible at near-ties |

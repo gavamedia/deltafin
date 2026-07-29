@@ -215,13 +215,17 @@ def synchronize_device(torch_module, device) -> None:
 
 
 def choose_moe_backend(requested: str | None, device_type: str) -> str:
-    """Use Metal only by default on MPS; retain explicit Metal bring-up."""
+    """Use Metal on MPS, CUDA on CUDA device, CPU otherwise.
+
+    Explicit K3_MOE=cpu|metal|cuda overrides the auto-detect.
+    """
     value = (
         requested if requested is not None
-        else ("metal" if device_type == "mps" else "cpu")
+        else ("metal" if device_type == "mps"
+              else "cuda" if device_type.startswith("cuda") else "cpu")
     ).strip().lower()
-    if value not in ("cpu", "metal"):
-        raise ValueError("K3_MOE must be cpu or metal")
+    if value not in ("cpu", "metal", "cuda"):
+        raise ValueError("K3_MOE must be cpu, metal, or cuda")
     return value
 
 
