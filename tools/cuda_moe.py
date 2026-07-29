@@ -142,10 +142,11 @@ class _ExpertUpload:
         refs = []
 
         def _upload(a):
-            t = torch.from_numpy(np.ascontiguousarray(a)).to(
-                device=dev, dtype=torch.uint8, non_blocking=True)
-            refs.append(t)
-            return t
+            # Pinned CPU tensor enables async DMA H2D (~2x throughput)
+            cpu = torch.tensor(np.ascontiguousarray(a), pin_memory=True)
+            gpu = cpu.to(device=dev, dtype=torch.uint8, non_blocking=True)
+            refs.append(gpu)
+            return gpu
 
         w1p, w1s = raw["w1"]
         w3p, w3s = raw["w3"]
@@ -197,10 +198,11 @@ def _build_descriptors(ids, weights, uploads, device, stream):
         struct.pack_into('<f', buf, off + 48, float(weights[i]))
         # bytes 52-55 are padding
 
-    # Async H2D copy of descriptor data
-    desc_t = torch.frombuffer(buf, dtype=torch.uint8).to(
-        device=device, non_blocking=True)
-    return desc_t
+    # Pinned + async H2D for descriptor data
+    desc_t = torch.frombuffer(buf, dtype=torch.uint8)
+    desc_pinned = desc_t.pin_memory()
+    desc_dev = desc_pinned.to(device=device, non_blocking=True)
+    return desc_dev
 
 
 # ──────── main MoE inference ──────────────────────────────────────────────
