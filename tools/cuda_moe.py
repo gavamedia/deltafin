@@ -46,6 +46,50 @@ _gpu_cache = {}
 _gpu_cache_order = []
 _gpu_cache_lock = threading.Lock()
 
+# Optional CPU cross-check: compare CUDA output against fast_moe for first N calls
+CHECK = int(os.environ.get("K3_MOE_CHECK", "0"))
+CHECK_TOL = float(os.environ.get("K3_MOE_CHECK_TOL", "1e-4"))
+_checked = 0
+_check_worst = 0.0
+
+
+def check_stats():
+    return {"checked": _checked, "worst_rel": _check_worst}
+
+
+def _checked_output(out, x_cpu, ids, weights, raw_experts):
+    """Compare CUDA output against the CPU reference path.
+
+    out: torch [H] CUDA tensor  |  x_cpu: torch [H] CPU tensor
+    ids: [K] ints  |  weights: [K] floats
+
+    Runs on the same raw_experts buffers the GPU just read, in the same
+    layer — catches weight-corruption bugs (stale cache aliasing, etc.)
+    that produce wrong tokens.
+    """
+    global _checked, _check_worst
+    if _checked >= CHECK:
+        return
+    _checked += 1
+    import fast_moe
+    # Build [1, H], [1, K], [1, K] per fast_moe's interface
+    x_2d = x_cpu.unsqueeze(0)  # [1, H]
+    kid = torch.tensor([ids], dtype=torch.long)       # [1, K]
+    kwt = torch.tensor([weights], dtype=torch.float32) # [1, K]
+    ref = fast_moe.moe_infer_fast(x_2d, kid, kwt, raw_experts)
+    ref_np = ref.detach().to("cpu", torch.float32).numpy()
+    out_np = out.detach().to("cpu", torch.float32).numpy()
+    denom = max(np.max(np.abs(ref_np)), np.max(np.abs(out_np)), 1e-10)
+    rel = float(np.max(np.abs(ref_np - out_np)) / denom)
+    _check_worst = max(_check_worst, rel)
+    if rel > CHECK_TOL:
+        raise RuntimeError(
+            f"K3_MOE_CHECK: CUDA vs CPU rel_error {rel:.3e} > {CHECK_TOL:g} "
+            f"on call {_checked} (ids={ids})")
+    elif _checked <= 3:  # quiet after first few
+        print(f"[cuda-moe] check {_checked}: CUDA vs CPU rel_error {rel:.3e} "
+              f"(tol={CHECK_TOL:g}) OK", flush=True)
+
 
 def _gpu_cache_get(eid, raw, device_id=0):
     with _gpu_cache_lock:
@@ -127,7 +171,9 @@ def last_error():
 def describe():
     if not available():
         return f"unavailable ({last_error()})"
-    return "CUDA MoE kernels loaded (phases 1-5)"
+    check_info = f", check={CHECK}" if CHECK else ""
+    cache_info = f", cache={len(_gpu_cache)}/{_GPU_CACHE_MAX}" if _gpu_cache else ""
+    return f"CUDA MoE kernels loaded{check_info}{cache_info}"
 
 
 # ──────── per-expert upload + GPU cache ────────────────────────────────────
@@ -250,6 +296,8 @@ def moe_infer(x, topk_ids, topk_weight, raw_experts, routing_record=None):
     out_np = np.zeros((N, H), dtype=np.float32) if N > 1 else None
     stream_ptr = ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
 
+    x_cpu = x.detach().to("cpu", torch.float32).numpy() if CHECK > 0 else None
+
     for t in range(N):
         pos_ids = ids[t]
         pos_ws = ws[t]
@@ -281,6 +329,19 @@ def moe_infer(x, topk_ids, topk_weight, raw_experts, routing_record=None):
             out_np[t] = _OUT_BUF.cpu().numpy()
         else:
             result = _OUT_BUF.to(x.dtype)  # stays on GPU
+
+    if CHECK > 0:
+        # Sync before CPU comparison
+        torch.cuda.synchronize(device)
+        if N > 1:
+            out_t = torch.from_numpy(out_np).to(device=device, dtype=x.dtype)
+            out_slice = out_t[0]
+            x_slice = torch.from_numpy(x_cpu[0])
+        else:
+            out_slice = result
+            x_slice = torch.from_numpy(x_cpu)
+        # Check the first position only (covers the common N=1 case)
+        _checked_output(out_slice, x_slice, ids[0], ws[0], raw_experts)
 
     if N > 1:
         return torch.from_numpy(out_np).to(device=device, dtype=x.dtype)
