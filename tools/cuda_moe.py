@@ -113,8 +113,10 @@ def _gpu_cache_init():
         return
     try:
         free_bytes, _ = torch.cuda.mem_get_info(0)
-        # Use 60% of remaining free VRAM for expert cache
-        avail = int(free_bytes * 0.6)
+        # Use 35% of remaining free VRAM for expert cache.
+        # The lm_head (4.4 GiB) and PyTorch's caching allocator (3+ GiB
+        # reserved) come later, so we must leave generous headroom.
+        avail = int(free_bytes * 0.35)
         _GPU_CACHE_MAX = max(64, min(avail // EXPERT_SPAN, 2048))
         gb = _GPU_CACHE_MAX * EXPERT_SPAN / 1e9
         print(f"[cuda-moe] GPU expert cache: {_GPU_CACHE_MAX} entries ({gb:.1f} GiB "
