@@ -43,7 +43,11 @@ _OUT_CAP = 0
 # GPU expert cache: maps expert_id -> _ExpertUpload (LRU, pinned)
 # Auto-sizes from VRAM unless K3_CUDA_EXPERT_CACHE is explicitly set.
 _CACHE_ENV = os.environ.get("K3_CUDA_EXPERT_CACHE")
-_RESERVED_BYTES = int(16e9)  # template arena (4.4G) + gates (2.2G) + staging + lm_head + PyTorch overhead
+_RESERVED_BYTES = int(14e9)  # template arena + gates + staging + lm_head + PyTorch overhead
+# Resulting defaults:
+#   RTX 5090 (34 GB): 0.75*34-14 = 11.5 GB → ~657 entries
+#   RTX 3090 (24 GB): 0.75*24-14 = 4.0 GB  → ~228 entries
+# Both safe.  Override with K3_CUDA_EXPERT_CACHE for specific tuning.
 
 
 def _auto_cache_size():
