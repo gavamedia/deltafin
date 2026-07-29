@@ -117,13 +117,13 @@ __global__ void mxfp4_moe_hidden_kernel(
     for (int i = lane; i < H; i += 32) {
         int g = i / 32;
         int bi = i / 2;
-        uint8_t b1 = d.w1_packed[(size_t)row * (H / 2) + bi];
+        uint8_t b1 = __ldg(&d.w1_packed[(size_t)row * (H / 2) + bi]);
         int n1 = (i & 1) ? (b1 >> 4) : (b1 & 0x0F);
-        float s1 = e8m0_to_f32(d.w1_scales[(size_t)row * (H / 32) + g]);
+        float s1 = e8m0_to_f32(__ldg(&d.w1_scales[(size_t)row * (H / 32) + g]));
         gate += c_e2m1_tab[n1] * s1 * x[i];
-        uint8_t b3 = d.w3_packed[(size_t)row * (H / 2) + bi];
+        uint8_t b3 = __ldg(&d.w3_packed[(size_t)row * (H / 2) + bi]);
         int n3 = (i & 1) ? (b3 >> 4) : (b3 & 0x0F);
-        float s3 = e8m0_to_f32(d.w3_scales[(size_t)row * (H / 32) + g]);
+        float s3 = e8m0_to_f32(__ldg(&d.w3_scales[(size_t)row * (H / 32) + g]));
         up += c_e2m1_tab[n3] * s3 * x[i];
     }
 
@@ -161,9 +161,9 @@ __global__ void mxfp4_moe_output_kernel(
     for (int i = lane; i < I; i += 32) {
         int g = i / 32;
         int bi = i / 2;
-        uint8_t b = d.w2_packed[(size_t)row * (I / 2) + bi];
+        uint8_t b = __ldg(&d.w2_packed[(size_t)row * (I / 2) + bi]);
         int n = (i & 1) ? (b >> 4) : (b & 0x0F);
-        float sc = e8m0_to_f32(d.w2_scales[(size_t)row * (I / 32) + g]);
+        float sc = e8m0_to_f32(__ldg(&d.w2_scales[(size_t)row * (I / 32) + g]));
         dot += c_e2m1_tab[n] * sc * hidden[(size_t)e * I + i];
     }
 
@@ -233,13 +233,13 @@ __global__ void mxfp4_moe_pos_hidden_kernel(
     for (int i = lane; i < H; i += 32) {
         int g = i / 32;
         int bi = i / 2;
-        uint8_t b1 = d.w1_packed[(size_t)row * (H / 2) + bi];
+        uint8_t b1 = __ldg(&d.w1_packed[(size_t)row * (H / 2) + bi]);
         int n1 = (i & 1) ? (b1 >> 4) : (b1 & 0x0F);
-        float s1 = e8m0_to_f32(d.w1_scales[(size_t)row * (H / 32) + g]);
+        float s1 = e8m0_to_f32(__ldg(&d.w1_scales[(size_t)row * (H / 32) + g]));
         gate += c_e2m1_tab[n1] * s1 * x[(size_t)pos * H + i];
-        uint8_t b3 = d.w3_packed[(size_t)row * (H / 2) + bi];
+        uint8_t b3 = __ldg(&d.w3_packed[(size_t)row * (H / 2) + bi]);
         int n3 = (i & 1) ? (b3 >> 4) : (b3 & 0x0F);
-        float s3 = e8m0_to_f32(d.w3_scales[(size_t)row * (H / 32) + g]);
+        float s3 = e8m0_to_f32(__ldg(&d.w3_scales[(size_t)row * (H / 32) + g]));
         up += c_e2m1_tab[n3] * s3 * x[(size_t)pos * H + i];
     }
 
@@ -280,9 +280,9 @@ __global__ void mxfp4_moe_pos_output_kernel(
     for (int i = lane; i < I; i += 32) {
         int g = i / 32;
         int bi = i / 2;
-        uint8_t b = d.w2_packed[(size_t)row * (I / 2) + bi];
+        uint8_t b = __ldg(&d.w2_packed[(size_t)row * (I / 2) + bi]);
         int n = (i & 1) ? (b >> 4) : (b & 0x0F);
-        float sc = e8m0_to_f32(d.w2_scales[(size_t)row * (I / 32) + g]);
+        float sc = e8m0_to_f32(__ldg(&d.w2_scales[(size_t)row * (I / 32) + g]));
         dot += c_e2m1_tab[n] * sc *
             hidden[((size_t)pos * (size_t)max_experts + (size_t)e) * (size_t)I + (size_t)i];
     }
