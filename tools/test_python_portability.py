@@ -734,8 +734,15 @@ def _spine_io_hint_checks():
             ) as call:
         path = os.path.join(td, "layer.bin")
         pathlib.Path(path).write_bytes(b"x" * 32)
-        assert spine_io.rdadvise(path, 4, 12) is True
-        call.assert_called_once_with(mock.ANY, 4, 12, 3)
+        # These hints are POSIX file-descriptor operations.  A Windows reader is
+        # an overlapped handle with no descriptor, so rdadvise must decline
+        # rather than invent one, even with the platform flags forced on.
+        if os.name == "nt":
+            assert spine_io.rdadvise(path, 4, 12) is False
+            call.assert_not_called()
+        else:
+            assert spine_io.rdadvise(path, 4, 12) is True
+            call.assert_called_once_with(mock.ANY, 4, 12, 3)
 
 
 def _fetch_v2_hint_checks():
@@ -774,22 +781,26 @@ def _fetch_v2_nocache_checks(fetch_v2):
 
 
 def _fetch_v2_read_order_checks(fetch_v2):
-    # The Darwin hint must precede preadv; Linux eviction must follow the last
+    # The Darwin hint must precede the read; Linux eviction must follow the last
     # successful read. Exercise the actual _Slot.read control flow with 4 bytes.
     events = []
     slot = object.__new__(fetch_v2._Slot)
     slot.mv = memoryview(bytearray(4))
 
-    def fake_preadv(_fd, views, _offset):
-        events.append("read")
-        return len(views[0])
+    class FakeSource:
+        def fileno(self):
+            return 11
+
+        def read_into(self, destination, _offset):
+            events.append("read")
+            return len(destination)
+
+        def close(self):
+            events.append("close")
 
     with mock.patch.object(fetch_v2, "EXPERT_SPAN", 4), \
-            mock.patch.object(fetch_v2.os, "open", return_value=11), \
-            mock.patch.object(fetch_v2.os, "close",
-                              side_effect=lambda _fd: events.append("close")), \
-            mock.patch.object(fetch_v2.os, "preadv",
-                              side_effect=fake_preadv, create=True), \
+            mock.patch.object(fetch_v2.positional_io, "open_positional",
+                              return_value=FakeSource()), \
             mock.patch.object(
                 fetch_v2, "_apply_pread_nocache",
                 side_effect=lambda _fd: events.append("darwin-before"),

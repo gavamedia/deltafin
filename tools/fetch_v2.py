@@ -42,9 +42,11 @@ import numpy as np
 
 try:
     from cache_writer import AsyncCacheWriter, atomic_publish
+    import positional_io
     import runtime_platform
 except ImportError:  # imported as tools.fetch_v2 instead of a top-level module
     from .cache_writer import AsyncCacheWriter, atomic_publish
+    from . import positional_io
     from . import runtime_platform
 
 ROOT = os.environ.get("DELTAFIN_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -546,18 +548,16 @@ class _Slot:
         _bump(pread_slots=1)
 
     def read(self, path):
-        fd = os.open(path, os.O_RDONLY)
+        source = positional_io.open_positional(path)
         try:
+            fd = source.fileno()
             _apply_pread_nocache(fd)
-            off = 0
-            while off < EXPERT_SPAN:
-                n = os.preadv(fd, [self.mv[off:]], off)
-                if n <= 0:
-                    raise IOError(f"short read {off}/{EXPERT_SPAN} from {path}")
-                off += n
+            got = source.read_into(self.mv, 0)
+            if got != EXPERT_SPAN:
+                raise IOError(f"short read {got}/{EXPERT_SPAN} from {path}")
             _drop_linux_pread_cache(fd)
         finally:
-            os.close(fd)
+            source.close()
 
 
 class GroupReadError(IOError):

@@ -16,6 +16,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))    # fla shim, k3loader, mxfp4
 # modeling files imported via tools/k3pkg package
 
+import positional_io  # noqa: E402
 import runtime_platform  # noqa: E402
 import packed_q8  # noqa: E402
 import routing_record as routing_records  # noqa: E402
@@ -1257,28 +1258,28 @@ def _pilot_load(full):
 
 # --- embeddings via memmap (row reads only) -----------------------------------
 class LazyEmbed:
-    """bf16 embedding rows from a persistent local fd, else HTTP Range."""
+    """bf16 embedding rows from a persistent local file, else HTTP Range."""
     NAME = PFX + "embed_tokens.weight"
 
     def __init__(self):
         self.path = os.path.join(ROOT, "k3-resident/tensors", self.NAME)
         self.meta = k3loader.INV[self.NAME]
         self.rowbytes = H * 2
-        self._fd = None
-        self._ensure_fd()
+        self._source = None
+        self._ensure_source()
 
-    def _ensure_fd(self):
-        if self._fd is None:
+    def _ensure_source(self):
+        if self._source is None:
             try:
-                self._fd = os.open(self.path, os.O_RDONLY)
+                self._source = positional_io.open_positional(self.path)
             except FileNotFoundError:
                 pass
-        return self._fd
+        return self._source
 
     def close(self):
-        if self._fd is not None:
-            os.close(self._fd)
-            self._fd = None
+        if self._source is not None:
+            self._source.close()
+            self._source = None
 
     def __del__(self):
         try:
@@ -1287,7 +1288,7 @@ class LazyEmbed:
             pass
 
     def _local_rows(self, tids):
-        """Read sorted unique ids, coalescing adjacent rows into one pread."""
+        """Read sorted unique ids, coalescing adjacent rows into one read."""
         rows = {}
         uniq = sorted(set(tids))
         i = 0
@@ -1297,9 +1298,10 @@ class LazyEmbed:
                 j += 1
             first, count = uniq[i], j - i
             want = count * self.rowbytes
-            data = os.pread(self._fd, want, first * self.rowbytes)
-            if len(data) != want:
-                raise IOError(f"short embedding read {len(data)}/{want}")
+            try:
+                data = self._source.read(want, first * self.rowbytes)
+            except OSError as exc:
+                raise IOError(f"short embedding read of {want} bytes") from exc
             for k, tid in enumerate(uniq[i:j]):
                 lo = k * self.rowbytes
                 rows[tid] = data[lo:lo + self.rowbytes]
@@ -1307,11 +1309,13 @@ class LazyEmbed:
         return b"".join(rows[tid] for tid in tids)
 
     def _row(self, tid):
-        if self._ensure_fd() is not None:
-            buf = os.pread(self._fd, self.rowbytes, tid * self.rowbytes)
-            if len(buf) != self.rowbytes:
-                raise IOError(f"short embedding read {len(buf)}/{self.rowbytes}")
-            return buf
+        if self._ensure_source() is not None:
+            try:
+                return self._source.read(self.rowbytes, tid * self.rowbytes)
+            except OSError as exc:
+                raise IOError(
+                    f"short embedding read of {self.rowbytes} bytes"
+                ) from exc
         m = self.meta
         start = 8 + m["hlen"] + m["offsets"][0] + tid * self.rowbytes
         import urllib.request
@@ -1323,7 +1327,7 @@ class LazyEmbed:
 
     def __call__(self, ids):
         tids = [int(t) for t in ids]
-        buf = (self._local_rows(tids) if self._ensure_fd() is not None
+        buf = (self._local_rows(tids) if self._ensure_source() is not None
                else b"".join(self._row(tid) for tid in tids))
         t = torch.frombuffer(bytearray(buf), dtype=torch.bfloat16).reshape(len(tids), H)
         return t.to(DEV, DT).unsqueeze(0)  # [1, T, H]
