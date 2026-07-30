@@ -23,7 +23,10 @@ CFG = json.load(open(ROOT + "/k3-meta/config.json"))["text_config"]
 Cfg = getattr(ml, "KimiLinearConfig", None) or importlib.import_module(
     "k3pkg.configuration_kimi_k3").KimiLinearConfig
 config = Cfg(**CFG); config._attn_implementation = "eager"
-DEV = torch.device("mps"); H = config.hidden_size
+DEV = torch.device(os.environ.get("K3_DEV") or (
+    "mps" if torch.backends.mps.is_available()
+    else "cuda" if torch.cuda.is_available()
+    else "cpu")); H = config.hidden_size
 
 
 def set_param(root, dotted, tensor):
