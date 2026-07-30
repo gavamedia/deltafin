@@ -118,6 +118,10 @@ class CapabilityTests(unittest.TestCase):
         if sys.platform == "darwin":
             self.assertGreater(caps.physical_memory_bytes or 0, 0)
             self.assertTrue(pathlib.Path(asi.NATIVE_SOURCE).exists())
+        if os.name == "nt":
+            # Windows answers through GlobalMemoryStatusEx.  Reporting nothing
+            # here makes the layer cache pin nothing at all.
+            self.assertGreater(caps.physical_memory_bytes or 0, 0)
 
 
 if __name__ == "__main__":

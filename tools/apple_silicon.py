@@ -59,15 +59,50 @@ def _positive_int(value: Any) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def _windows_physical_memory_bytes() -> int | None:
+    """Installed RAM from GlobalMemoryStatusEx.
+
+    Callers size a RAM budget with this.  Returning None instead makes them
+    pin nothing at all, which on a large-memory host silently forfeits the
+    resident tier the layer cache exists for.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class MemoryStatusEx(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", wintypes.DWORD),
+            ("dwMemoryLoad", wintypes.DWORD),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+    status = MemoryStatusEx()
+    status.dwLength = ctypes.sizeof(MemoryStatusEx)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    if not kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        return None
+    return _positive_int(status.ullTotalPhys)
+
+
 def _physical_memory_bytes() -> int | None:
     if platform.system() == "Darwin":
         value = _command_output(["sysctl", "-n", "hw.memsize"])
         parsed = _positive_int(value)
         if parsed is not None:
             return parsed
+    if os.name == "nt":
+        try:
+            return _windows_physical_memory_bytes()
+        except OSError:
+            return None
     try:
-        # Windows has no sysconf at all, which is an AttributeError rather than
-        # the OSError a POSIX host raises for an unknown name.
+        # A POSIX host without this name raises; there is nothing else to try.
         pages = os.sysconf("SC_PHYS_PAGES")
         page_size = os.sysconf("SC_PAGE_SIZE")
     except (AttributeError, OSError, ValueError):

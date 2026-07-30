@@ -562,7 +562,7 @@ Validation is intentionally separated from platform support:
 | Linux aarch64 / CUDA + CPU MoE | community end-to-end run and contributor kernel tests on DGX Spark |
 | Linux x86-64 / CPU | strict fat-binary compilation plus selected/compatibility exactness under Rosetta; native Linux AVX2 timing is still wanted |
 | Windows x86-64 / CPU | MSVC build, the selected/compatibility and scale-LUT exactness gates, and bit-exact layer reads through the overlapped read path all run natively; an end-to-end token timing is still wanted |
-| Native CUDA MXFP4 MoE | implementation is ABI/KAT/fallback-gated; CUDA hardware parity and throughput measurements are still wanted |
+| Native CUDA MXFP4 MoE | ABI/KAT/fallback-gated, and the real-bridge tests now pass on an sm_120 device: exact e2m1 decode across all sixteen codes, cache identity, eviction and route combine. Throughput measurements are still wanted |
 
 ### Where this could go
 
