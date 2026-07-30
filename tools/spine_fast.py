@@ -48,8 +48,21 @@ import runtime_platform
 FAST = os.environ.get("K3_FAST_SPINE", "1") == "1"
 # fine-grained overrides so the orchestrator can bisect the three changes
 _DEQ_EXPLICIT = "K3_SPINE_DEQ" in os.environ
+def _default_deq():
+    """Pick the native dequant backend for this platform."""
+    if not FAST:
+        return "torch"
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "metal"
+
+
 DEQ = os.environ.get(
-    "K3_SPINE_DEQ", "metal" if FAST else "torch"
+    "K3_SPINE_DEQ", _default_deq()
 )  # metal|cuda|mulout|torch
 PACK = os.environ.get("K3_SPINE_PACK", "1" if FAST else "0") == "1"  # packed read + 1 H2D
 READ_THREADS = runtime_platform.configured_cpu_workers(

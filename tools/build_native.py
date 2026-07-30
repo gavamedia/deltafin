@@ -314,6 +314,32 @@ def _compiler_argv(
     return argv
 
 
+def detect_cuda_arch(
+    nvidia_smi: str = "nvidia-smi",
+) -> str | None:
+    """Detect the compute capability of the first CUDA-capable GPU.
+
+    Returns "sm_XY" (e.g. "sm_89" for Ada Lovelace, "sm_120" for Blackwell)
+    or None if no GPU is detected or nvidia-smi is unavailable.
+    """
+    try:
+        result = subprocess.run(
+            [nvidia_smi, "--query-gpu=compute_cap", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        cap = result.stdout.strip()
+        if not cap:
+            return None
+        major, _, minor = cap.partition(".")
+        return f"sm_{major}{minor}"
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return None
+
+
 def cuda_compiler_argv(
     environ: Mapping[str, str],
     *,
@@ -362,14 +388,16 @@ def compile_command(
                 "NVCC compiler not found; install the CUDA toolkit, set NVCC, "
                 "or use --cuda=off"
             )
+        gpu_arch = environ.get("K3_CUDA_ARCH") or detect_cuda_arch() or "sm_75"
+        compute = gpu_arch.removeprefix("sm_")
         return [
             *compiler,
             "-O3",
             "-std=c++17",
             "-shared",
-            "-Xcompiler=-fPIC",
-            "-gencode=arch=compute_75,code=sm_75",
-            "-gencode=arch=compute_75,code=compute_75",
+            f"-Xcompiler=-fPIC",
+            f"-gencode=arch=compute_{compute},code={gpu_arch}",
+            f"-gencode=arch=compute_{compute},code=compute_{compute}",
             str(artifact.source),
             "-o",
             str(output),

@@ -111,6 +111,10 @@ __global__ void mxfp4_gemv_kernel(
     for (int group = threadIdx.x; group < groups; group += blockDim.x) {
         const uint8_t scale_byte = row_scales[group];
         if (scale_byte == 255u) {
+#ifndef CUDART_NAN_F
+            // CUDA 13.x dropped this macro; provide the IEEE 754 quiet NaN encoding.
+#define CUDART_NAN_F  __int_as_float(0x7fffffff)
+#endif
             local = CUDART_NAN_F;
             break;
         }
@@ -262,14 +266,51 @@ extern "C" int k3_cuda_moe_available(int device) {
         set_error("CUDA availability", "device index is outside the visible range");
         return kUnsupported;
     }
+    int compute_mode = -1;
+#if CUDART_VERSION >= 12000
+    // CUDA 12+ uses the attribute API; direct struct access was deprecated.
+    status = cudaDeviceGetAttribute(
+        &compute_mode, cudaDevAttrComputeMode, device);
+    if (status != cudaSuccess) {
+        return cuda_status("cudaDeviceGetAttribute(computeMode)", status);
+    }
+#else
     cudaDeviceProp properties{};
     status = cudaGetDeviceProperties(&properties, device);
     if (status != cudaSuccess) {
         return cuda_status("cudaGetDeviceProperties", status);
     }
-    if (properties.computeMode == cudaComputeModeProhibited) {
+    compute_mode = properties.computeMode;
+#endif
+    if (compute_mode == cudaComputeModeProhibited) {
         set_error("CUDA availability", "device compute mode is prohibited");
         return kUnsupported;
+    }
+
+#if CUDART_VERSION >= 12000
+    int major = 0, minor = 0;
+    status = cudaDeviceGetAttribute(
+        &major, cudaDevAttrComputeCapabilityMajor, device);
+    if (status != cudaSuccess) {
+        return cuda_status("cudaDeviceGetAttribute(major)", status);
+    }
+    status = cudaDeviceGetAttribute(
+        &minor, cudaDevAttrComputeCapabilityMinor, device);
+    if (status != cudaSuccess) {
+        return cuda_status("cudaDeviceGetAttribute(minor)", status);
+    }
+    std::snprintf(
+        g_last_error,
+        sizeof(g_last_error),
+        "available: device %d compute capability %d.%d",
+        device,
+        major,
+        minor);
+#else
+    cudaDeviceProp properties{};
+    status = cudaGetDeviceProperties(&properties, device);
+    if (status != cudaSuccess) {
+        return cuda_status("cudaGetDeviceProperties", status);
     }
     std::snprintf(
         g_last_error,
@@ -278,6 +319,7 @@ extern "C" int k3_cuda_moe_available(int device) {
         properties.name,
         properties.major,
         properties.minor);
+#endif
     return 1;
 }
 

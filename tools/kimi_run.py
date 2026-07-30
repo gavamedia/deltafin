@@ -576,8 +576,10 @@ _TEMPLATE_ARENA_INFO = {}
 import spine_fast  # noqa: E402
 import spine_io  # noqa: E402
 
-if spine_fast.FAST or spine_fast.DEQ == "metal":
-    spine_fast.metal_available()          # compile once, on the main thread
+# Compile the platform-specific dequant shader once on the main thread.
+if spine_fast.DEQ == "metal":
+    spine_fast.metal_available()
+if spine_fast.FAST or spine_fast.DEQ != "torch":
     print(f"[spine] fast path: {spine_fast.describe()}", flush=True)
 
 # N1: keep every eligible same-input KDA first-stage projection as row-int8 and
