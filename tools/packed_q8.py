@@ -154,6 +154,11 @@ def _parse_max_tokens(
         return 2 if torch_threads >= 2 else 1
     if device_type == "mps":
         return 9
+    # CUDA n-gram spec decode produces 2-row batches. The packed int8 head
+    # handles T=2 without materializing the dense 4.38 GiB head; T=13 had
+    # a verified greedy-token change, so stay well below that.
+    if device_type == "cuda":
+        return 2
     return 1
 
 

@@ -324,6 +324,7 @@ startup. These variables exist for overriding that:
 | `DELTAFIN_ROOT` | repo root | where caches and weights live |
 | `K3_HF_HOST` / `K3_HF_PATH` | Hugging Face | point expert fetching at a mirror |
 | `K3_SERVER_MAX_TOKENS` | unlimited | optional hard ceiling on server generations |
+| `K3_REASONING_EFFORT` | `max` | controls K3's thinking depth in chat mode; `low`, `high`, or `max` (maps to the API's `reasoning_effort` / template `thinking_effort`) |
 | `K3_RESPONSE_MEMO_ENTRIES` | `32` | exact in-process replay cache for identical deterministic API requests; `0` disables |
 
 Less commonly needed experimental controls, including packed-KDA storage and

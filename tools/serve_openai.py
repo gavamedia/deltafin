@@ -151,7 +151,21 @@ class Handler(BaseHTTPRequestHandler):
             messages = body.get("messages")
             if not messages:
                 return self._err(400, "messages required")
-            ids = _tok.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+            reff = body.get("reasoning_effort") or os.environ.get("K3_REASONING_EFFORT")
+            if reff is not None:
+                valid = {"low", "high", "max"}
+                stripped = str(reff).strip().lower()
+                if stripped not in valid:
+                    return self._err(400, f"reasoning_effort must be one of {sorted(valid)}")
+                reff = stripped
+            if reff is not None:
+                print(f"[serve] reasoning_effort={reff}", flush=True)
+            te_kwargs = {}
+            if reff is not None:
+                te_kwargs["thinking_effort"] = reff
+            ids = _tok.apply_chat_template(messages, tokenize=True,
+                                           add_generation_prompt=True,
+                                           **te_kwargs)
         else:
             prompt = body.get("prompt")
             if not isinstance(prompt, str):

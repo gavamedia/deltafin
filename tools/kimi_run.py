@@ -171,10 +171,10 @@ if _INT8_KDA_STAGE_SYNC_MODE not in {"event", "mps_fifo"}:
     )
 _INT8_LM_HEAD_REQUESTED = _mode_enabled(
     _INT8_LM_HEAD_MODE,
-    # Preserve the established, fully exercised MPS head default. CPU has
-    # decisive microbench evidence but remains opt-in until a full active-path
-    # Linux/CPU sequence gate lands.
-    automatic=DEV.type == "mps",
+    # The packed int8 head saves ~3.2 GiB on every platform (1.18 vs 4.38 GiB).
+    # Auto-enable on MPS and CUDA where the backend is qualified; CPU remains
+    # opt-in until a full active-path Linux/CPU sequence gate lands.
+    automatic=DEV.type in ("mps", "cuda"),
 )
 # Keep the existing MPS int8 pilot-router default independent from the head and
 # KDA switches.  The CPU path remains dense here until its variable-T router
@@ -496,15 +496,20 @@ def _load_int8_packed(full):
     rows, cols = k3loader.INV[full]["shape"]
     q = torch.from_file(
         op, shared=False, size=rows * cols, dtype=torch.int8
-    ).reshape(rows, cols).to(DEV)
+    ).reshape(rows, cols)
     sc = torch.from_file(
         sp, shared=False, size=rows, dtype=torch.float16
-    ).to(device=DEV, dtype=torch.float32)
+    ).to(dtype=torch.float32)
     return q, sc
 
 
 def _lm_head_forward(hidden):
-    """Capability-gated native-int8 head with a one-time dense fallback."""
+    """Capability-gated native-int8 head with a one-time dense fallback.
+
+    All weight tensors live on CPU to save ~1.18 GiB of GPU VRAM. The
+    activation slice is moved to CPU for the matmul; the [T, vocab] output
+    (a few MiB) is moved back to GPU.
+    """
     global _LM_Q, _LM_SC, _LM_W, _LM_PACKED_CALLS, _LM_DENSE_CALLS
     global _LM_DENSE_CROSSOVERS, _LM_DISABLE_REASON
     flat = hidden.reshape(-1, H)
@@ -512,14 +517,11 @@ def _lm_head_forward(hidden):
         if _PACKED_Q8_BACKEND.supports_tokens(flat.shape[0]):
             try:
                 output = _PACKED_Q8_BACKEND.matmul(
-                    flat, _LM_Q, _LM_SC
-                )
+                    flat.cpu(), _LM_Q, _LM_SC
+                ).to(device=hidden.device, dtype=hidden.dtype)
                 _LM_PACKED_CALLS += 1
                 return output.view(*hidden.shape[:-1], -1)
             except (NotImplementedError, RuntimeError, TypeError) as exc:
-                # A newer/older PyTorch build may expose the schema without a
-                # working backend for this device/shape. Preserve support
-                # rather than making a product-name assumption.
                 _LM_DISABLE_REASON = f"{type(exc).__name__}: {exc}"
                 print(f"[lm-head] native int8 unavailable ({exc}); "
                       "falling back to dequantized dense weights", flush=True)
@@ -534,12 +536,13 @@ def _lm_head_forward(hidden):
                 flush=True,
             )
         # Materialize before dropping the owned packed tensors, so a failure
-        # cannot leave the head with neither representation.
+        # cannot leave the head with neither representation. Keep on CPU.
         dense = _LM_Q.to(torch.float32) * _LM_SC[:, None]
         _LM_W = dense
         _LM_Q = _LM_SC = None
     _LM_DENSE_CALLS += 1
-    return hidden @ _LM_W.T
+    # hidden on GPU, _LM_W on CPU. Move activation to CPU, then result back.
+    return (hidden.cpu() @ _LM_W.T).to(device=hidden.device, dtype=hidden.dtype)
 
 
 def _lm_head_runtime_status():
@@ -2649,9 +2652,21 @@ def main():
     import universal_draft
 
     tok = AutoTokenizer.from_pretrained(os.path.join(ROOT, "k3-meta"), trust_remote_code=True)
+    reasoning_effort = os.environ.get("K3_REASONING_EFFORT")
+    if reasoning_effort is not None:
+        valid = {"low", "high", "max"}
+        if reasoning_effort.strip().lower() not in valid:
+            ap.error(f"K3_REASONING_EFFORT={reasoning_effort!r} not in {sorted(valid)}")
+        reasoning_effort = reasoning_effort.strip().lower()
+        print(f"[config] reasoning_effort={reasoning_effort}", flush=True)
+
     if args.chat:
+        te_kwargs = {}
+        if reasoning_effort is not None:
+            te_kwargs["thinking_effort"] = reasoning_effort
         ids = tok.apply_chat_template([{"role": "user", "content": args.prompt}],
-                                      tokenize=True, add_generation_prompt=True)
+                                      tokenize=True, add_generation_prompt=True,
+                                      **te_kwargs)
     else:
         ids = tok.encode(args.prompt)
     if args.max_new is not None and args.max_new < 0:
