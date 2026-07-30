@@ -2,6 +2,7 @@
 """Weight-free portability gates for native loading, I/O hints, and devices."""
 
 import ast
+import contextlib
 import importlib.util
 import os
 import pathlib
@@ -46,8 +47,9 @@ def _native_loader_checks():
     assert rp.native_library_filename("libx", "darwin") == "libx.dylib"
     assert rp.native_library_filename("libx", "linux") == "libx.so"
     assert rp.native_library_filename("libx", "linux-musl") == "libx.so"
+    assert rp.native_library_filename("libx", "win32") == "libx.dll"
     try:
-        rp.native_library_filename("libx", "win32")
+        rp.native_library_filename("libx", "freebsd14")
     except rp.NativeLibraryError:
         pass
     else:
@@ -104,6 +106,48 @@ def _native_loader_checks():
         assert rp.missing_native_cpu_features(
             platform="linux", machine="x86_64", cpuinfo_path=cpuinfo
         ) == ("fma",)
+
+        # Windows answers through IsProcessorFeaturePresent instead of
+        # /proc/cpuinfo, and infers FMA3 from AVX2 because it cannot report it.
+        full_windows = {
+            rp._PF_SSE3_INSTRUCTIONS_AVAILABLE,
+            rp._PF_SSSE3_INSTRUCTIONS_AVAILABLE,
+            rp._PF_AVX_INSTRUCTIONS_AVAILABLE,
+            rp._PF_AVX2_INSTRUCTIONS_AVAILABLE,
+        }
+        assert rp.missing_native_cpu_features(
+            platform="win32",
+            machine="AMD64",
+            feature_probe=lambda item: item in full_windows,
+            environ={},
+        ) == ()
+        no_avx2 = full_windows - {rp._PF_AVX2_INSTRUCTIONS_AVAILABLE}
+        assert rp.missing_native_cpu_features(
+            platform="win32",
+            machine="AMD64",
+            feature_probe=lambda item: item in no_avx2,
+            environ={},
+        ) == ("fma",)
+        # The override exists for AVX+FMA3 parts that predate AVX2.
+        assert rp.missing_native_cpu_features(
+            platform="win32",
+            machine="AMD64",
+            feature_probe=lambda item: item in no_avx2,
+            environ={"K3_ASSUME_FMA3": "1"},
+        ) == ()
+        assert rp.missing_native_cpu_features(
+            platform="win32",
+            machine="AMD64",
+            feature_probe=lambda _item: False,
+            environ={},
+        ) == ("avx", "fma", "sse3", "ssse3")
+        # A non-x86 host is never gated on x86 baseline features.
+        assert rp.missing_native_cpu_features(
+            platform="win32",
+            machine="ARM64",
+            feature_probe=lambda _item: False,
+            environ={},
+        ) == ()
         with mock.patch.dict(os.environ, {"TEST_NATIVE_LIB": path}):
             try:
                 rp.load_native_library(
@@ -333,6 +377,9 @@ def _device_checks():
     assert rp.default_gemv_threads("darwin", 10) == 4
     assert rp.default_gemv_threads("linux", 32) == 8
     assert rp.default_gemv_threads("linux", 6) == 6
+    # Windows shares the x86-64 default rather than the Apple Silicon one.
+    assert rp.default_gemv_threads("win32", 32) == 8
+    assert rp.default_gemv_threads("win32", 3) == 3
     assert rp.default_gemv_threads("freebsd", 2) == 2
     assert rp.choose_device_spec(
         None, mps_available=True, cuda_available=True, cuda_device_count=2
@@ -638,10 +685,28 @@ def _memory_checks():
     assert 14 * gib < cap < 16 * gib
 
 
+def _patchable_fcntl(module):
+    """Give a fcntl-less host something to patch in place of the module.
+
+    Windows has no fcntl.  The assertions below are worth running there anyway:
+    what they check is that a non-Darwin host never issues a Darwin command
+    number, which is exactly what a fcntl-less host has to get right.
+    """
+    if getattr(module, "fcntl", None) is not None:
+        return contextlib.nullcontext()
+    return mock.patch.object(module, "fcntl", SimpleNamespace(fcntl=None))
+
+
 def _file_hint_checks():
     assert rp.darwin_file_hints_enabled(True, "darwin")
     assert not rp.darwin_file_hints_enabled(True, "linux")
 
+    with _patchable_fcntl(spine_io):
+        _spine_io_hint_checks()
+    _fetch_v2_hint_checks()
+
+
+def _spine_io_hint_checks():
     with mock.patch.object(spine_io, "_IS_DARWIN", False), \
             mock.patch.object(spine_io, "NOCACHE", True), \
             mock.patch.object(spine_io.fcntl, "fcntl") as call:
@@ -672,11 +737,19 @@ def _file_hint_checks():
         assert spine_io.rdadvise(path, 4, 12) is True
         call.assert_called_once_with(mock.ANY, 4, 12, 3)
 
+
+def _fetch_v2_hint_checks():
     with tempfile.TemporaryDirectory() as td, \
             mock.patch.dict(os.environ, {"DELTAFIN_ROOT": td}):
         import fetch_v2
     assert fetch_v2._pread_nocache_default("darwin") == "1"
     assert fetch_v2._pread_nocache_default("linux") == "0"
+    with _patchable_fcntl(fetch_v2):
+        _fetch_v2_nocache_checks(fetch_v2)
+    _fetch_v2_read_order_checks(fetch_v2)
+
+
+def _fetch_v2_nocache_checks(fetch_v2):
     with mock.patch.object(fetch_v2, "_IS_DARWIN", False), \
             mock.patch.object(fetch_v2, "PREAD_NOCACHE", True), \
             mock.patch.object(fetch_v2.fcntl, "fcntl") as call:
@@ -699,6 +772,8 @@ def _file_hint_checks():
         assert fetch_v2._drop_linux_pread_cache(9) is True
         call.assert_called_once_with(9, 0, 0, 4)
 
+
+def _fetch_v2_read_order_checks(fetch_v2):
     # The Darwin hint must precede preadv; Linux eviction must follow the last
     # successful read. Exercise the actual _Slot.read control flow with 4 bytes.
     events = []
@@ -714,7 +789,7 @@ def _file_hint_checks():
             mock.patch.object(fetch_v2.os, "close",
                               side_effect=lambda _fd: events.append("close")), \
             mock.patch.object(fetch_v2.os, "preadv",
-                              side_effect=fake_preadv), \
+                              side_effect=fake_preadv, create=True), \
             mock.patch.object(
                 fetch_v2, "_apply_pread_nocache",
                 side_effect=lambda _fd: events.append("darwin-before"),
@@ -727,7 +802,11 @@ def _file_hint_checks():
 
 
 def _spine_cache_linux_checks():
-    assert spine_cache.PAGE == os.sysconf("SC_PAGE_SIZE")
+    if hasattr(os, "sysconf"):
+        assert spine_cache.PAGE == os.sysconf("SC_PAGE_SIZE")
+    else:
+        # Windows has no sysconf; the module must fall back, not raise.
+        assert spine_cache.PAGE == 4096
     with tempfile.TemporaryDirectory() as td:
         meminfo = pathlib.Path(td) / "meminfo"
         vmstat = pathlib.Path(td) / "vmstat"

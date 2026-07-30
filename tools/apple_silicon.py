@@ -66,9 +66,11 @@ def _physical_memory_bytes() -> int | None:
         if parsed is not None:
             return parsed
     try:
+        # Windows has no sysconf at all, which is an AttributeError rather than
+        # the OSError a POSIX host raises for an unknown name.
         pages = os.sysconf("SC_PHYS_PAGES")
         page_size = os.sysconf("SC_PAGE_SIZE")
-    except (OSError, ValueError):
+    except (AttributeError, OSError, ValueError):
         return None
     return _positive_int(pages * page_size)
 

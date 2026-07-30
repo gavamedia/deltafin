@@ -19,11 +19,18 @@
 #include <immintrin.h>
 #include <stdint.h>
 
+// MSVC has no per-feature predefined macros and accepts every intrinsic
+// regardless of /arch, so this baseline cannot be asserted at compile time
+// there.  build_native.py compiles Windows with /arch:AVX for the same VEX
+// baseline, and the loader refuses a CPU without AVX/FMA3/SSSE3 before the
+// library is used.
+#if !defined(_MSC_VER) || defined(__clang__)
 #if !defined(__SSSE3__)
 #error "The x86-64 MXFP4 kernel requires SSSE3 (build with -mssse3 or -march=native)"
 #endif
 #if !defined(__FMA__)
 #error "The x86-64 MXFP4 kernel requires FMA3 (build with -mfma or -march=native)"
+#endif
 #endif
 
 typedef __m128  float32x4_t;

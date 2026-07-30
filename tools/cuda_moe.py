@@ -27,6 +27,11 @@ from typing import Any, Hashable, Iterable, Mapping, Sequence
 import numpy as np
 import torch
 
+try:
+    from runtime_platform import native_library_filename
+except ImportError:  # imported as tools.cuda_moe instead of a top-level module
+    from .runtime_platform import native_library_filename
+
 
 ABI_VERSION = 1
 POINTER_LAYOUT = 1
@@ -39,7 +44,8 @@ DEFAULT_LAYER_STRATA = 92
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _LIBRARY_PATH = os.environ.get(
-    "K3_CUDA_MOE_LIB", os.path.join(_HERE, "libcudamoe.so")
+    "K3_CUDA_MOE_LIB",
+    os.path.join(_HERE, native_library_filename("libcudamoe")),
 )
 _DEFAULT_MODEL_KEY = ("deltafin-default-model",)
 _REQUIRED_SYMBOLS = (

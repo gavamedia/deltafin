@@ -8,9 +8,15 @@ The script is independent of the caller's working directory:
     python tools/build_native.py --cuda=off
 
 Every library is linked to a unique temporary path beside its destination.
-Required CPU/Metal outputs remain one transaction.  On Linux, CUDA is a second,
-optional transaction in the default ``auto`` mode, so an installed CUDA toolkit
-that cannot build Deltafin's optional backend never breaks the CPU install.
+Required CPU/Metal outputs remain one transaction.  On Linux and Windows, CUDA
+is a second, optional transaction in the default ``auto`` mode, so an installed
+CUDA toolkit that cannot build Deltafin's optional backend never breaks the CPU
+install.
+
+Windows builds with MSVC.  When ``cl`` is not already on PATH the script locates
+a Visual Studio installation with ``vswhere`` and captures the environment
+``vcvars64.bat`` sets, so the ordinary command above works from a plain shell
+rather than only from a Developer Command Prompt.
 """
 
 from __future__ import annotations
@@ -38,6 +44,7 @@ CUDA_ABI_VERSION = 1
 CUDA_POINTER_LAYOUT_VERSION = 1
 CUDA_SHAPES = (3584, 3072, 17_547_264, CUDA_POINTER_LAYOUT_VERSION)
 CUDA_MODES = frozenset(("auto", "on", "off"))
+CUDA_PLATFORMS = frozenset(("linux", "windows"))
 CUDA_PORTABLE_ARCH = "75"
 _CUDA_ARCH_TOKEN = re.compile(
     r"(?:(?:sm|compute)_)?(?:(\d{1,2})\.(\d)|(\d{2,3}))\Z",
@@ -54,6 +61,21 @@ X86_64_BASE_FEATURES = {
     "ssse3": frozenset(("ssse3",)),
 }
 
+# IsProcessorFeaturePresent identifiers from winnt.h.  Windows has no query for
+# FMA3, which is why windows_cpu_features() derives it from AVX2.
+PF_SSE3_INSTRUCTIONS_AVAILABLE = 13
+PF_SSSE3_INSTRUCTIONS_AVAILABLE = 36
+PF_AVX_INSTRUCTIONS_AVAILABLE = 39
+PF_AVX2_INSTRUCTIONS_AVAILABLE = 40
+
+# Command-line dialect and library-locking rules follow the machine running the
+# build, which is not necessarily the machine the target describes.
+HOST_IS_WINDOWS = os.name == "nt"
+
+MSVC_VSWHERE_RELATIVE = r"Microsoft Visual Studio\Installer\vswhere.exe"
+MSVC_VCVARS_RELATIVE = r"VC\Auxiliary\Build\vcvars64.bat"
+MSVC_TOOLS_COMPONENT = "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"
+
 
 class BuildError(RuntimeError):
     """A native build was rejected before installation."""
@@ -66,6 +88,10 @@ class Target:
     suffix: str
     c_arch_flags: tuple[str, ...]
     supports_metal: bool
+    # "gnu" spells options the GCC/Clang way, "msvc" the cl.exe way.  Keeping it
+    # on the target rather than deriving it from the platform inside every
+    # command builder keeps the two option dialects in one place.
+    toolchain: str = "gnu"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -185,9 +211,22 @@ def detect_target(
             f"{raw_machine!r}; supported architectures are x86-64 and aarch64"
         )
 
+    if platform_name == "win32":
+        if normalized not in {"amd64", "x86_64"}:
+            raise BuildError(
+                "unsupported Windows architecture "
+                f"{raw_machine!r}; Deltafin's Windows native path requires x86-64"
+            )
+        # /arch:AVX is the exact analogue of the Linux -mavx baseline: it keeps
+        # the compatibility kernel VEX-encoded without promising AVX2, which the
+        # kernel still selects at runtime through its own intrinsics.
+        return Target(
+            "windows", "x86_64", ".dll", ("/arch:AVX",), False, "msvc"
+        )
+
     raise BuildError(
         f"unsupported platform {platform_name!r}; native builds support "
-        "Apple Silicon macOS and x86-64/aarch64 Linux"
+        "Apple Silicon macOS, x86-64/aarch64 Linux and x86-64 Windows"
     )
 
 
@@ -212,26 +251,76 @@ def read_linux_cpu_flags(cpuinfo: Path = Path("/proc/cpuinfo")) -> frozenset[str
     return frozenset(common)
 
 
+def windows_cpu_features(
+    *,
+    feature_probe: Callable[[int], bool] | None = None,
+    assume_fma3: bool = False,
+) -> frozenset[str]:
+    """Report baseline features through Windows' processor-feature API.
+
+    Windows exposes no FMA3 query, so FMA is reported only when AVX2 is present,
+    which every FMA3-and-AVX2 CPU satisfies.  The rare AVX+FMA3 parts that lack
+    AVX2 (AMD Piledriver) are therefore refused unless the caller opts in; that
+    is deliberate, since guessing wrong means an illegal instruction at runtime.
+    """
+    if feature_probe is None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        present = kernel32.IsProcessorFeaturePresent
+        present.argtypes = [ctypes.c_uint32]
+        present.restype = ctypes.c_int
+
+        def feature_probe(identifier: int) -> bool:  # noqa: F811
+            return bool(present(identifier))
+
+    features: set[str] = set()
+    if feature_probe(PF_SSE3_INSTRUCTIONS_AVAILABLE):
+        features.add("sse3")
+    if feature_probe(PF_SSSE3_INSTRUCTIONS_AVAILABLE):
+        features.add("ssse3")
+    if feature_probe(PF_AVX_INSTRUCTIONS_AVAILABLE):
+        features.add("avx")
+    if assume_fma3 or feature_probe(PF_AVX2_INSTRUCTIONS_AVAILABLE):
+        features.add("fma")
+    return frozenset(features)
+
+
 def preflight_target(
     target: Target,
     *,
     cpu_flags: frozenset[str] | set[str] | None = None,
+    environ: Mapping[str, str] = os.environ,
 ) -> None:
     """Reject an x86 host that cannot execute the exact baseline kernel."""
-    if target.platform != "linux" or target.machine != "x86_64":
+    if target.machine != "x86_64" or target.platform not in {"linux", "windows"}:
         return
-    observed = read_linux_cpu_flags() if cpu_flags is None else frozenset(cpu_flags)
+    if cpu_flags is not None:
+        observed = frozenset(cpu_flags)
+    elif target.platform == "windows":
+        observed = windows_cpu_features(
+            assume_fma3=environ.get("K3_ASSUME_FMA3", "").strip() not in {"", "0"}
+        )
+    else:
+        observed = read_linux_cpu_flags()
     missing = sorted(
         name for name, aliases in X86_64_BASE_FEATURES.items()
         if observed.isdisjoint(aliases)
     )
-    if missing:
+    if not missing:
+        return
+    if target.platform == "windows":
         raise BuildError(
-            "this Linux x86-64 CPU cannot run Deltafin's baseline "
-            "AVX/FMA3/SSSE3 kernel; "
-            f"missing CPU flags: {', '.join(missing)} "
-            "(AVX2 is optional and selected at runtime)"
+            "this Windows x86-64 CPU cannot be confirmed to run Deltafin's "
+            "baseline AVX/FMA3/SSSE3 kernel; "
+            f"missing CPU features: {', '.join(missing)}. "
+            "Windows cannot report FMA3 directly, so it is inferred from AVX2; "
+            "set K3_ASSUME_FMA3=1 if this CPU has FMA3 without AVX2"
         )
+    raise BuildError(
+        "this Linux x86-64 CPU cannot run Deltafin's baseline "
+        "AVX/FMA3/SSSE3 kernel; "
+        f"missing CPU flags: {', '.join(missing)} "
+        "(AVX2 is optional and selected at runtime)"
+    )
 
 
 def artifacts_for(
@@ -252,8 +341,10 @@ def artifacts_for(
         raise BuildError(
             f"invalid CUDA mode {cuda_mode!r}; expected auto, on, or off"
         )
-    if cuda_mode == "on" and target.platform != "linux":
-        raise BuildError("the CUDA native backend is supported only on Linux")
+    if cuda_mode == "on" and target.platform not in CUDA_PLATFORMS:
+        raise BuildError(
+            "the CUDA native backend is supported only on Linux and Windows"
+        )
     tools_dir = tools_dir.resolve()
     x86_symbols = X86_AVX2_SYMBOLS if target.machine == "x86_64" else ()
     artifacts = [
@@ -288,7 +379,7 @@ def artifacts_for(
             )
         )
     want_cuda = (
-        target.platform == "linux"
+        target.platform in CUDA_PLATFORMS
         and cuda_mode != "off"
         and (cuda_mode == "on" or nvcc_available)
     )
@@ -297,7 +388,7 @@ def artifacts_for(
             Artifact(
                 "CUDA MoE",
                 tools_dir / "cuda_moe_kernels.cu",
-                tools_dir / "libcudamoe.so",
+                tools_dir / f"libcudamoe{target.suffix}",
                 "cuda",
                 CUDA_SYMBOLS,
                 abi_version=CUDA_ABI_VERSION,
@@ -308,40 +399,192 @@ def artifacts_for(
     return artifacts
 
 
+def split_command(value: str, *, windows: bool = HOST_IS_WINDOWS) -> list[str]:
+    """Split a compiler override into argv without corrupting Windows paths.
+
+    shlex's POSIX mode reads the separators in ``C:\\Tools\\cl.exe`` as escape
+    characters, so Windows uses shlex's non-POSIX mode, which keeps backslashes
+    intact and only needs the surrounding quotes stripped afterwards.
+
+    The dialect follows the *host*, not the target: a CC or NVCC override names
+    an executable this machine has to parse and run, whichever platform the
+    resulting library is for.
+    """
+    if not windows:
+        return shlex.split(value)
+    lexer = shlex.shlex(value, posix=False)
+    lexer.whitespace_split = True
+    return [token.strip('"') for token in lexer if token.strip('"')]
+
+
+def render_command(
+    command: Sequence[str], *, windows: bool = HOST_IS_WINDOWS
+) -> str:
+    """Render argv the way the host shell would accept it, for diagnostics."""
+    if windows:
+        return subprocess.list2cmdline(list(command))
+    return shlex.join(command)
+
+
 def _compiler_argv(
     language: str,
     target: Target,
     environ: Mapping[str, str],
+    *,
+    search_path: str | None = None,
 ) -> list[str]:
     variable = "CC" if language == "c" else "CXX"
-    if target.platform == "darwin":
+    if target.toolchain == "msvc":
+        fallback = "cl"
+    elif target.platform == "darwin":
         fallback = "clang" if language == "c" else "clang++"
     else:
         fallback = "cc" if language == "c" else "c++"
     value = environ.get(variable, fallback).strip()
     try:
-        argv = shlex.split(value)
+        argv = split_command(value)
     except ValueError as exc:
         raise BuildError(f"could not parse {variable}={value!r}: {exc}") from exc
     if not argv:
         raise BuildError(f"{variable} is empty; set it to a compiler executable")
-    if shutil.which(argv[0]) is None:
+    resolved = shutil.which(argv[0], path=search_path)
+    if resolved is None:
+        hint = (
+            "Install the Visual Studio C++ build tools, run this from a "
+            "Developer Command Prompt, or set "
+            if target.toolchain == "msvc"
+            else "Install it or set "
+        )
         raise BuildError(
             f"{variable} compiler not found: {argv[0]!r}. "
-            f"Install it or set {variable} to a compatible compiler"
+            f"{hint}{variable} to a compatible compiler"
         )
-    return argv
+    # Return the resolved path, not the bare name.  Windows resolves a child
+    # process against the *parent's* PATH, so a compiler found only through a
+    # captured MSVC environment would otherwise fail to start.
+    return [resolved, *argv[1:]]
+
+
+def environment_path(environ: Mapping[str, str]) -> str | None:
+    """Read PATH from an environment mapping regardless of its spelling.
+
+    Windows reports its own variables as ``Path``, so a plain lookup would miss
+    exactly the value that makes a captured MSVC environment usable.
+    """
+    for name, value in environ.items():
+        if name.upper() == "PATH":
+            return value
+    return None
+
+
+def find_vswhere(environ: Mapping[str, str]) -> Path | None:
+    """Locate the fixed-path Visual Studio locator, if it is installed."""
+    roots = [
+        environ.get("ProgramFiles(x86)"),
+        environ.get("ProgramFiles"),
+    ]
+    for root in roots:
+        if not root:
+            continue
+        candidate = Path(root) / MSVC_VSWHERE_RELATIVE
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def find_vcvars(
+    environ: Mapping[str, str],
+    *,
+    runner: Callable[..., object] = subprocess.run,
+) -> Path | None:
+    """Return the newest installation's vcvars64.bat, or None if absent."""
+    vswhere = find_vswhere(environ)
+    if vswhere is None:
+        return None
+    output = _probe_output(
+        [
+            str(vswhere),
+            "-latest",
+            "-products", "*",
+            "-requires", MSVC_TOOLS_COMPONENT,
+            "-property", "installationPath",
+        ],
+        runner=runner,
+        timeout=60.0,
+    )
+    if not output:
+        return None
+    for line in output.splitlines():
+        installation = line.strip()
+        if not installation:
+            continue
+        vcvars = Path(installation) / MSVC_VCVARS_RELATIVE
+        if vcvars.is_file():
+            return vcvars
+    return None
+
+
+def msvc_environment(
+    environ: Mapping[str, str] = os.environ,
+    *,
+    runner: Callable[..., object] = subprocess.run,
+    finder: Callable[..., str | None] = shutil.which,
+) -> dict[str, str] | None:
+    """Capture the environment vcvars64.bat exports, when one is needed.
+
+    Returns None when the ambient environment already resolves ``cl``, which is
+    the case inside a Developer Command Prompt, and raises only when no usable
+    toolchain can be found at all.
+    """
+    if finder("cl", path=environ.get("PATH")) is not None:
+        return None
+    vcvars = find_vcvars(environ, runner=runner)
+    if vcvars is None:
+        raise BuildError(
+            "no Visual Studio C++ toolchain found. Install the "
+            '"Desktop development with C++" workload, or run this script from '
+            "a Developer Command Prompt so cl.exe is already on PATH"
+        )
+    # subprocess passes a string command line to CreateProcess unchanged, which
+    # is what lets cmd's own /s quoting rule handle a path containing spaces.
+    command = f'cmd /d /s /c ""{vcvars}" x64 >nul && set"'
+    try:
+        result = runner(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=180.0,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise BuildError(f"could not run {vcvars}: {exc}") from exc
+    if int(getattr(result, "returncode", 1)) != 0:
+        detail = (str(getattr(result, "stderr", "")) or "").strip()
+        raise BuildError(
+            f"{vcvars} failed with exit code {result.returncode}"
+            + (f": {detail}" if detail else "")
+        )
+    captured: dict[str, str] = {}
+    for line in str(getattr(result, "stdout", "") or "").splitlines():
+        name, separator, value = line.partition("=")
+        if separator and name:
+            captured[name] = value
+    if environment_path(captured) is None:
+        raise BuildError(f"{vcvars} produced no PATH; cannot locate cl.exe")
+    return captured
 
 
 def cuda_compiler_argv(
     environ: Mapping[str, str],
     *,
     finder: Callable[[str], str | None] = shutil.which,
+    windows: bool = HOST_IS_WINDOWS,
 ) -> list[str] | None:
     """Resolve ``NVCC`` safely, returning ``None`` when it is unavailable."""
     value = environ.get("NVCC", "nvcc").strip()
     try:
-        argv = shlex.split(value)
+        argv = split_command(value, windows=windows)
     except ValueError as exc:
         raise BuildError(f"could not parse NVCC={value!r}: {exc}") from exc
     if not argv:
@@ -541,6 +784,18 @@ def cuda_gencode_flags(codegen: CudaCodegen) -> list[str]:
     return flags
 
 
+def _scratch_dir(scratch: Path | None, output: Path) -> str:
+    """Return a directory path with the trailing separator MSVC's /Fo needs."""
+    base = scratch if scratch is not None else output.parent
+    return os.path.join(str(base), "")
+
+
+def _scratch_file(scratch: Path | None, output: Path, suffix: str) -> str:
+    """Name one intermediate after its output, inside the scratch directory."""
+    base = scratch if scratch is not None else output.parent
+    return str(Path(base) / (output.stem + suffix))
+
+
 def compile_command(
     artifact: Artifact,
     target: Target,
@@ -549,11 +804,21 @@ def compile_command(
     environ: Mapping[str, str] = os.environ,
     cuda_compiler: Sequence[str] | None = None,
     cuda_codegen: CudaCodegen | None = None,
+    scratch: Path | None = None,
+    search_path: str | None = None,
 ) -> list[str]:
-    """Construct the compiler invocation for one artifact."""
+    """Construct the compiler invocation for one artifact.
+
+    ``scratch`` receives a toolchain's intermediate files.  MSVC writes object
+    files and an import library beside its output unless told otherwise, and
+    those must not land in the repository next to the installed libraries.
+    """
+    windows = target.platform == "windows"
     if artifact.language == "cuda":
-        if target.platform != "linux":
-            raise BuildError("the CUDA native backend is supported only on Linux")
+        if target.platform not in CUDA_PLATFORMS:
+            raise BuildError(
+                "the CUDA native backend is supported only on Linux and Windows"
+            )
         compiler = (
             list(cuda_compiler)
             if cuda_compiler is not None
@@ -578,19 +843,51 @@ def compile_command(
                 ),
                 override is not None and override.strip().lower() != "auto",
             )
+        # Position-independent code is the Linux default requirement; on Windows
+        # the equivalent host requirement is the shared UCRT the interpreter
+        # itself uses, so the DLL and its caller share one heap.
+        host_flag = "-Xcompiler=/MD" if windows else "-Xcompiler=-fPIC"
+        link_flags = (
+            ["-Xlinker", f"/IMPLIB:{_scratch_file(scratch, output, '.lib')}"]
+            if windows
+            else []
+        )
         return [
             *compiler,
             "-O3",
             "-std=c++17",
             "-shared",
-            "-Xcompiler=-fPIC",
+            host_flag,
             *cuda_gencode_flags(cuda_codegen),
+            *link_flags,
             str(artifact.source),
             "-o",
             str(output),
         ]
 
-    compiler = _compiler_argv(artifact.language, target, environ)
+    compiler = _compiler_argv(
+        artifact.language, target, environ, search_path=search_path
+    )
+    if artifact.language == "c" and target.toolchain == "msvc":
+        return [
+            *compiler,
+            "/nologo",
+            "/O2",
+            "/std:c11",
+            # MSVC still gates C11 atomics behind this switch; the kernel's
+            # dispatch counters and worker latches are _Atomic.
+            "/experimental:c11atomics",
+            *target.c_arch_flags,
+            "/DNO_MAIN",
+            "/LD",
+            str(artifact.source),
+            f"/Fe:{output}",
+            f"/Fo:{_scratch_dir(scratch, output)}",
+            "/link",
+            "/INCREMENTAL:NO",
+            f"/IMPLIB:{_scratch_file(scratch, output, '.lib')}",
+        ]
+
     if artifact.language == "c":
         common = [
             "-O3",
@@ -635,12 +932,18 @@ def compile_command(
     )
 
 
-def run_command(command: Sequence[str], *, cwd: Path) -> None:
+def run_command(
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str] | None = None,
+) -> None:
     """Run one compiler and turn its diagnostics into a concise BuildError."""
     try:
         result = subprocess.run(
             list(command),
             cwd=cwd,
+            env=dict(env) if env is not None else None,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -650,7 +953,7 @@ def run_command(command: Sequence[str], *, cwd: Path) -> None:
         raise BuildError(f"could not start compiler {command[0]!r}: {exc}") from exc
     if result.returncode == 0:
         return
-    rendered = shlex.join(command)
+    rendered = render_command(command)
     diagnostics = (result.stderr or result.stdout).strip()
     if not diagnostics:
         diagnostics = "(compiler produced no diagnostics)"
@@ -658,6 +961,24 @@ def run_command(command: Sequence[str], *, cwd: Path) -> None:
         f"compiler failed with exit code {result.returncode}\n"
         f"command: {rendered}\n{diagnostics}"
     )
+
+
+def release_library(library: object) -> None:
+    """Drop a validated library's handle.
+
+    Windows keeps a loaded module's file locked, which would make the atomic
+    replace and the temporary-file cleanup that follow validation fail.  On
+    other platforms the loader has no such restriction and this is a no-op.
+    """
+    if not HOST_IS_WINDOWS:
+        return
+    handle = getattr(library, "_handle", None)
+    if handle is None:
+        return
+    free_library = ctypes.WinDLL("kernel32", use_last_error=True).FreeLibrary
+    free_library.argtypes = [ctypes.c_void_p]
+    free_library.restype = ctypes.c_int
+    free_library(ctypes.c_void_p(handle))
 
 
 def validate_artifact(
@@ -675,7 +996,14 @@ def validate_artifact(
         raise BuildError(
             f"{artifact.label} built but could not be loaded: {exc}"
         ) from exc
+    try:
+        _validate_loaded(library, artifact)
+    finally:
+        release_library(library)
 
+
+def _validate_loaded(library: object, artifact: Artifact) -> None:
+    """Check one loaded library's symbols, ABI and shape handshakes."""
     symbols = list(artifact.required_symbols)
     abi_symbol = artifact.abi_symbol
     if artifact.abi_version is not None:
@@ -869,6 +1197,7 @@ def build_native(
     reporter: Reporter = _default_reporter,
     replace: Callable[[str | os.PathLike[str], str | os.PathLike[str]], None]
     = os.replace,
+    toolchain_env: Mapping[str, str] | None = None,
 ) -> list[Path]:
     """Compile, validate, and atomically install target libraries.
 
@@ -876,10 +1205,20 @@ def build_native(
     of that transaction only when explicitly required with ``cuda_mode="on"``.
     In the default ``auto`` mode its build and install are independent and any
     failure is reported as a warning after the required transaction succeeds.
+
+    ``toolchain_env`` overrides the environment compilers run in.  It exists for
+    MSVC, whose compiler is only usable once vcvars has populated PATH, INCLUDE
+    and LIB; passing it explicitly keeps that discovery out of the build loop.
     """
     target = detect_target() if target is None else target
-    preflight_target(target, cpu_flags=cpu_flags)
+    preflight_target(target, cpu_flags=cpu_flags, environ=environ)
     tools_dir = tools_dir.resolve()
+
+    build_env: Mapping[str, str] | None = toolchain_env
+    if build_env is None and target.toolchain == "msvc":
+        build_env = msvc_environment(environ)
+    # Compiler lookups must search the same PATH the compiler will run with.
+    search_path = environment_path(build_env) if build_env is not None else None
     required_artifacts = artifacts_for(
         target,
         tools_dir=tools_dir,
@@ -895,13 +1234,13 @@ def build_native(
         raise BuildError(
             f"invalid CUDA mode {cuda_mode!r}; expected auto, on, or off"
         )
-    if cuda_mode == "on" and target.platform != "linux":
-        raise BuildError("the CUDA native backend is supported only on Linux")
-    if target.platform == "linux" and cuda_mode != "off":
+    if cuda_mode == "on" and target.platform not in CUDA_PLATFORMS:
+        raise BuildError(
+            "the CUDA native backend is supported only on Linux and Windows"
+        )
+    if target.platform in CUDA_PLATFORMS and cuda_mode != "off":
         try:
-            cuda_compiler = cuda_compiler_argv(
-                environ, finder=nvcc_finder
-            )
+            cuda_compiler = cuda_compiler_argv(environ, finder=nvcc_finder)
         except BuildError as exc:
             if cuda_mode == "on":
                 raise
@@ -953,7 +1292,7 @@ def build_native(
 
     if runner is None:
         def invoke(command: Sequence[str], cwd: Path) -> None:
-            run_command(command, cwd=cwd)
+            run_command(command, cwd=cwd, env=build_env)
         runner = invoke
     if validator is None:
         def check(path: Path, artifact: Artifact) -> None:
@@ -968,6 +1307,7 @@ def build_native(
         artifacts: Sequence[Artifact],
         prepared: list[tuple[Artifact, Path]],
         *,
+        scratch: Path,
         codegen: CudaCodegen | None = None,
     ) -> None:
         for artifact in artifacts:
@@ -987,19 +1327,25 @@ def build_native(
                 environ=environ,
                 cuda_compiler=cuda_compiler,
                 cuda_codegen=codegen,
+                scratch=scratch,
+                search_path=search_path,
             )
             runner(command, tools_dir.parent)
             validator(temporary, artifact)
             temporary.chmod(0o755)
             prepared.append((artifact, temporary))
 
+    # One scratch directory per build holds every toolchain intermediate, so
+    # nothing lands in tools/ beside the libraries it installs.
+    scratch = Path(tempfile.mkdtemp(prefix="deltafin-native-build-"))
     try:
-        prepare(required_artifacts, required_prepared)
+        prepare(required_artifacts, required_prepared, scratch=scratch)
         if cuda_artifacts:
             try:
                 prepare(
                     cuda_artifacts,
                     cuda_prepared,
+                    scratch=scratch,
                     codegen=resolved_cuda_codegen,
                 )
             except Exception as exc:
@@ -1026,6 +1372,7 @@ def build_native(
                         prepare(
                             cuda_artifacts,
                             cuda_prepared,
+                            scratch=scratch,
                             codegen=portable_codegen,
                         )
                     except Exception as portable_exc:
@@ -1073,6 +1420,7 @@ def build_native(
     finally:
         for temporary in temporaries:
             temporary.unlink(missing_ok=True)
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -1091,9 +1439,9 @@ def _parser() -> argparse.ArgumentParser:
         choices=sorted(CUDA_MODES),
         default="auto",
         help=(
-            "Linux CUDA backend: auto builds it when NVCC is available "
-            "without blocking CPU installation; on requires it; off never probes "
-            "(default: auto)"
+            "Linux and Windows CUDA backend: auto builds it when NVCC is "
+            "available without blocking CPU installation; on requires it; off "
+            "never probes (default: auto)"
         ),
     )
     return parser

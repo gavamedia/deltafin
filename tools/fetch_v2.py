@@ -20,7 +20,6 @@ experts occupy ONE shard, back-to-back with zero gaps, sorted by str(eid).
 """
 import atexit
 import collections
-import fcntl
 import http.client
 import json
 import mmap
@@ -29,6 +28,12 @@ import re
 import ssl
 import sys
 import threading
+
+try:
+    # Only ever called behind a Darwin guard, for F_NOCACHE.
+    import fcntl
+except ImportError:  # Windows has no fcntl module
+    fcntl = None
 import time
 import urllib.parse
 import concurrent.futures

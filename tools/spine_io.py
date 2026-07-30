@@ -36,11 +36,16 @@ Flags (all default to the pre-existing behaviour):
 """
 import ctypes
 import ctypes.util
-import fcntl
 import os
 import struct
 import sys
 import threading
+
+try:
+    # Only ever called behind a Darwin guard, for F_NOCACHE and F_RDADVISE.
+    import fcntl
+except ImportError:  # Windows has no fcntl module
+    fcntl = None
 
 try:
     from runtime_platform import darwin_file_hints_enabled

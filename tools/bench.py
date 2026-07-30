@@ -401,8 +401,10 @@ def lightweight_state(path: pathlib.Path = ROOT) -> dict[str, Any]:
         },
     }
     try:
+        # Windows has no load average at all, which is an AttributeError rather
+        # than the OSError a POSIX host raises when it cannot sample one.
         out["load_average_1m_5m_15m"] = list(os.getloadavg())
-    except OSError:
+    except (AttributeError, OSError):
         pass
     # Per-run VM counters are cheap enough to sample around every child and
     # make memory experiments auditable.  In particular, a faster cache arm

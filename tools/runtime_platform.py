@@ -14,8 +14,9 @@ import os
 import platform as host_platform
 import re
 import shlex
+import subprocess
 import sys
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 
 NATIVE_ABI_VERSION = 1
@@ -31,15 +32,23 @@ def native_build_command(
     *,
     executable: str | None = None,
 ) -> str:
-    """Return a copy/paste-safe command that builds this checkout's libraries."""
+    """Return a copy/paste-safe command that builds this checkout's libraries.
+
+    The quoting follows the host shell.  POSIX quoting of a Windows path would
+    turn its separators into escapes, producing guidance that cannot be pasted
+    on the very platform that most often needs it.
+    """
     script = os.path.join(os.path.abspath(tools_directory), "build_native.py")
-    return shlex.join((executable or sys.executable, script))
+    parts = (executable or sys.executable, script)
+    if os.name == "nt":
+        return subprocess.list2cmdline(parts)
+    return shlex.join(parts)
 
 
 def native_library_filename(stem: str, platform: str | None = None) -> str:
     """Return the native filename for a bare library stem.
 
-    Deltafin currently supports Darwin Mach-O and Linux ELF builds.  Refusing
+    Deltafin supports Darwin Mach-O, Linux ELF and Windows PE builds.  Refusing
     unknown platforms is safer than guessing a suffix and later reporting an
     opaque dynamic-loader error.
     """
@@ -48,9 +57,11 @@ def native_library_filename(stem: str, platform: str | None = None) -> str:
         return f"{stem}.dylib"
     if platform.startswith("linux"):
         return f"{stem}.so"
+    if platform == "win32":
+        return f"{stem}.dll"
     raise NativeLibraryError(
         f"unsupported platform {platform!r}; Deltafin native kernels support "
-        "macOS and Linux"
+        "macOS, Linux and Windows"
     )
 
 
@@ -91,11 +102,21 @@ def load_native_library(
         cpuinfo_path=cpuinfo_path,
     )
     if missing_features:
+        resolved_platform = sys.platform if platform is None else platform
+        host = "Windows" if resolved_platform == "win32" else "Linux"
+        # Windows cannot report FMA3, so it is inferred from AVX2 there.
+        caveat = (
+            " Windows reports FMA3 only through AVX2; set K3_ASSUME_FMA3=1 if "
+            "this CPU has FMA3 without AVX2."
+            if resolved_platform == "win32"
+            else ""
+        )
         raise NativeLibraryError(
-            "this Linux x86-64 CPU is missing native-kernel requirements "
+            f"this {host} x86-64 CPU is missing native-kernel requirements "
             f"{', '.join(missing_features)}. The current library targets "
             "an AVX/FMA3/SSSE3 baseline and selects AVX2 only at runtime; "
-            "use compatible hardware or rebuild a safe kernel for this CPU"
+            "use compatible hardware or rebuild a safe kernel for this CPU."
+            f"{caveat}"
         )
 
     factory = ctypes.CDLL if cdll_factory is None else cdll_factory
@@ -403,12 +424,15 @@ def default_gemv_threads(
 
     Four remains the measured macOS default. Linux uses up to eight available
     CPUs: the contributor's real EPYC sweep peaked at eight threads, while
-    larger widths were already memory-bandwidth limited. K3_GEMV_THREADS always
-    overrides this heuristic, and the native entry points retain hard bounds.
+    larger widths were already memory-bandwidth limited. Windows inherits that
+    x86-64 default because it runs the same kernel on the same class of
+    hardware, though no Windows sweep has been recorded yet. K3_GEMV_THREADS
+    always overrides this heuristic, and the native entry points retain hard
+    bounds.
     """
     platform = sys.platform if platform is None else platform
     cpus = available_cpu_count() if cpu_count is None else max(1, cpu_count)
-    target = 8 if platform.startswith("linux") else 4
+    target = 8 if platform.startswith("linux") or platform == "win32" else 4
     return min(target, cpus)
 
 
@@ -447,19 +471,68 @@ def linux_cpu_flags(cpuinfo_path: str = "/proc/cpuinfo") -> frozenset[str]:
     return frozenset(common)
 
 
+# IsProcessorFeaturePresent identifiers from winnt.h.
+_PF_SSE3_INSTRUCTIONS_AVAILABLE = 13
+_PF_SSSE3_INSTRUCTIONS_AVAILABLE = 36
+_PF_AVX_INSTRUCTIONS_AVAILABLE = 39
+_PF_AVX2_INSTRUCTIONS_AVAILABLE = 40
+
+
+def windows_cpu_features(
+    *,
+    feature_probe: Callable[[int], bool] | None = None,
+    assume_fma3: bool = False,
+) -> frozenset[str]:
+    """Report baseline features through Windows' processor-feature API.
+
+    Windows publishes no FMA3 query, so FMA is inferred from AVX2, which every
+    AVX2 part also implements.  Refusing the rare AVX+FMA3 CPU without AVX2 is
+    deliberate: guessing wrong costs an illegal instruction in the kernel.
+    """
+    if feature_probe is None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        present = kernel32.IsProcessorFeaturePresent
+        present.argtypes = [ctypes.c_uint32]
+        present.restype = ctypes.c_int
+
+        def feature_probe(identifier: int) -> bool:  # noqa: F811
+            return bool(present(identifier))
+
+    features: set[str] = set()
+    if feature_probe(_PF_SSE3_INSTRUCTIONS_AVAILABLE):
+        features.add("sse3")
+    if feature_probe(_PF_SSSE3_INSTRUCTIONS_AVAILABLE):
+        features.add("ssse3")
+    if feature_probe(_PF_AVX_INSTRUCTIONS_AVAILABLE):
+        features.add("avx")
+    if assume_fma3 or feature_probe(_PF_AVX2_INSTRUCTIONS_AVAILABLE):
+        features.add("fma")
+    return frozenset(features)
+
+
 def missing_native_cpu_features(
     *,
     platform: str | None = None,
     machine: str | None = None,
     cpuinfo_path: str = "/proc/cpuinfo",
+    feature_probe: Callable[[int], bool] | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> tuple[str, ...]:
-    """Return required x86 baseline features absent on this Linux host."""
+    """Return required x86 baseline features absent on this host."""
     platform = sys.platform if platform is None else platform
     machine = host_platform.machine() if machine is None else machine
-    if (not platform.startswith("linux")
-            or machine.strip().lower() not in ("x86_64", "amd64")):
+    if machine.strip().lower() not in ("x86_64", "amd64"):
         return ()
-    flags = linux_cpu_flags(cpuinfo_path)
+    if platform.startswith("linux"):
+        flags = linux_cpu_flags(cpuinfo_path)
+    elif platform == "win32":
+        values = os.environ if environ is None else environ
+        flags = windows_cpu_features(
+            feature_probe=feature_probe,
+            assume_fma3=values.get("K3_ASSUME_FMA3", "").strip() not in ("", "0"),
+        )
+    else:
+        return ()
     return tuple(sorted(
         name for name, aliases in _X86_64_BASE_FEATURES.items()
         if flags.isdisjoint(aliases)
