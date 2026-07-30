@@ -61,6 +61,122 @@ The status labels used below are important:
 | **Opt-in** | Implemented and correctness-gated, but off by default while its complete-token speed or wider hardware coverage is still being established. |
 | **Structural evidence** | Exact byte, allocation, call, or synchronization work was removed, but we do not yet publish a tokens-per-second gain for that change alone. |
 
+## Idle-warmed request-batched server tokenization
+
+**Status: Default-auto for OpenAI-compatible server chats; exact whole-call
+fallback.**
+
+An OpenAI-compatible client normally sends the complete message history on
+every turn. Deltafin must tokenize that history again before it can prefill
+K3. The ordinary Kimi tokenizer first renders the chat into many independent
+segments—ordinary user text, structural special tokens, template punctuation
+and generation markers—and historically encoded those pieces one at a time.
+The calls are individually small, but a growing chat can contain thousands of
+them.
+
+The server can now batch that segmented work through
+[GigaToken](https://github.com/marcelroed/gigatoken), an in-process native CPU
+tokenizer. It does not replace the authoritative K3 tokenizer or concatenate
+text across boundaries:
+
+1. K3's unchanged chat template still creates every segment and decides
+   whether registered special-token spellings are structural at that position.
+2. Each segment is split at the same 400,000-character and
+   25,000-non-whitespace-character boundaries as the baseline tokenizer.
+3. Ordinary pieces and structural pieces are submitted as two separate native
+   batches. A small tape records every original segment, policy and piece
+   count.
+4. The encoded rows are reassembled in the original tape order. Adjacent
+   segments are never merged, because doing so could change BPE boundaries.
+5. If ordinary user or tool text literally contains a registered special
+   spelling that the native compatibility layer declines, the complete native
+   result is discarded and the whole chat tokenization is rerun through K3.
+   Any unexpected native error does the same and disables that backend for the
+   rest of the server process.
+
+Only a shallow private tokenizer proxy owns the batched segment hook. The live
+K3 tokenizer used for decoding and universal drafting is never mutated.
+Prompt-token IDs therefore retain one authority just as generated tokens do.
+
+### Why initialization happens after a response
+
+The first valid server chat is already on the warm side of the measured
+request-batching crossover, but importing, constructing and fully qualifying a
+native backend takes roughly a quarter second on the reference machine. The
+default `auto` lifecycle moves that one-time work past the first response:
+
+1. The first chat uses K3's ordinary tokenizer.
+2. Only after its response bytes have been sent and flushed does the server
+   qualify the backend. It retains target-generation admission during this
+   short post-response step, so initialization cannot overlap a K3 pass.
+3. A separate chat-tokenizer gate spans the final response flush and
+   qualification. A client that submits its next turn immediately cannot slip
+   a baseline encode into the interval; it waits for qualification and then
+   receives the warm path. A qualification failure takes the exact baseline
+   instead.
+4. The backend is published only after all compatibility checks pass.
+
+`--gigatoken on` performs those checks synchronously and fails server startup
+if they do not pass. `--gigatoken off` never inspects or imports the package.
+`K3_SERVER_GIGATOKEN=auto|on|off` provides the equivalent startup setting.
+There is no tokenizer daemon, internal HTTP connection, runtime installer,
+download, or network access.
+
+Initialization, encoding and shutdown cross one native-call barrier. This
+prevents a queued request from using a stale backend after another request has
+disabled it and prevents native qualification from racing native encoding.
+Shutdown first marks the controller as closing; any in-flight native result is
+discarded rather than published afterward. Expected exceptions and PyO3
+panic-style non-control-flow `BaseException` failures discard native output
+and retain the baseline; process-control exceptions are not swallowed.
+
+### Qualification and artifact boundary
+
+Construction uses only the absolute local `k3-meta/tiktoken.model` rank file,
+the explicit `kimi` pretokenizer and K3's complete 256-entry special-token map.
+Before publication, the runtime checks:
+
+- the exact 0.10.0 package and a reviewed platform artifact;
+- the installed package-tree and native-library SHA-256, preventing a
+  same-version rebuild or `sys.path` shadow from silently taking over;
+- the complete special-token mapping and vocabulary size;
+- multilingual, Unicode, whitespace and special-policy canaries; and
+- `decode_single_token_bytes` for all 163,840 token IDs.
+
+The wheel archives themselves are SHA-256-pinned in `requirements.txt`, so pip
+cannot substitute a later artifact with the same version or fall back to the
+foreign source distribution. Reviewed wheels cover macOS arm64 and
+manylinux2014/glibc Linux on x86-64 and aarch64. The Linux packages were
+unpacked and statically audited, including their ELF architecture,
+dependencies, Python-file identity and RECORD hashes; physical performance was
+measured only on macOS arm64. Unsupported runtime artifacts fail to tiktoken in
+`auto` and fail closed in explicit `on`.
+
+Before timing, parity probes compared 559,513 output token IDs across growing
+multilingual chats, ordinary literal special spellings and the exact
+400k/25k boundaries. The following numbers isolate only the already-rendered,
+warm segment-encoding step on the reference M1 Max:
+
+| Fixture | Rendered chars | Segments | Tokens | K3 segment loop | Native batch | Speedup |
+|---|---:|---:|---:|---:|---:|---:|
+| Smallest server chat | 453 | 38 | 90 | 0.438 ms | 0.155 ms | 2.83× |
+| 100 completed turns + next user message | 124,086 | 3,650 | 38,009 | 67.225 ms | 9.735 ms | 6.91× |
+| 1,000 completed turns + next user message | 1,235,586 | 36,050 | 379,109 | 664.987 ms | 95.986 ms | 6.93× |
+
+The template has already built its segments before these timers start, and the
+one-time qualification is excluded. This is a modest once-per-request CPU
+saving, not a 6–7× model or tokens-per-second claim. Deltafin still creates a
+fresh target cache and fully prefills the supplied history on every API
+request; that much larger K3 work is unchanged. The path matters increasingly
+as clients resend longer histories, while a rolling target KV cache remains
+the more consequential future optimization.
+
+Implementation:
+[`tools/server_tokenizer.py`](tools/server_tokenizer.py),
+[`tools/serve_openai.py`](tools/serve_openai.py),
+[`tools/test_server_tokenizer.py`](tools/test_server_tokenizer.py), and
+[`tools/test_serve_openai.py`](tools/test_serve_openai.py).
+
 ## Cross-tokenizer universal drafting
 
 **Status: Default when the pinned local assistants are installed on the

@@ -10,7 +10,7 @@ router_trace.jsonl with K3_TRACE=buffered (or K3_TRACE=sync for debugging).
 The published baseline is a 64 GB M1 Max; tunable choices are not dispatched
 from that product name.
 """
-import argparse, atexit, codecs, functools, gc, json, math, os, sys, time
+import argparse, atexit, codecs, contextlib, functools, gc, json, math, os, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))    # fla shim, k3loader, mxfp4
@@ -2315,6 +2315,7 @@ def generate(
     verbose_prefill=False,
     log=None,
     universal_drafter=None,
+    on_notice=None,
 ):
     """Greedy generation (+ certified-lossless n-gram speculation).
 
@@ -2326,6 +2327,13 @@ def generate(
     if max_new <= 0:
         return []
     generated = []
+
+    def notice(message):
+        if on_notice is not None:
+            on_notice(message)
+        else:
+            print(message, flush=True)
+
     # Speculation needs the complete prompt+output history. Keep one private
     # rolling list instead of rebuilding ``ids + generated`` every pass, but
     # do not add even this one copy to the ordinary non-speculative path.
@@ -2418,11 +2426,10 @@ def generate(
             except Exception as exc:
                 universal_drafter.failures += 1
                 uag_active = False
-                print(
+                notice(
                     f"[uag] proposal failed safely "
                     f"({type(exc).__name__}: {exc}); using target-only decode "
-                    "for the rest of this request",
-                    flush=True,
+                    "for the rest of this request"
                 )
                 logits = forward_pass(
                     layers,
@@ -2465,11 +2472,10 @@ def generate(
                     except Exception as exc:
                         universal_drafter.failures += 1
                         uag_active = False
-                        print(
+                        notice(
                             f"[uag] verifier failed safely "
                             f"({type(exc).__name__}: {exc}); restored target "
-                            "state and disabled drafts for this request",
-                            flush=True,
+                            "state and disabled drafts for this request"
                         )
                         logits = forward_pass(
                             layers,
@@ -2524,11 +2530,10 @@ def generate(
                             universal_drafter.failures += 1
                             uag_active = False
                             tag += " bookkeeping-off"
-                            print(
+                            notice(
                                 f"[uag] post-verifier bookkeeping failed "
                                 f"({type(exc).__name__}: {exc}); keeping "
-                                "certified tokens and disabling future drafts",
-                                flush=True,
+                                "certified tokens and disabling future drafts"
                             )
         elif uag_active:
             # There is no room for a draft plus a verifier bonus. Finish with
@@ -2643,10 +2648,83 @@ def _build_cli_parser():
     return ap
 
 
+def _clean_chat_output(args):
+    """Whether stdout should be a normal uninterrupted chat response."""
+    # K3_PROFILE explicitly requests per-pass diagnostics, so it behaves like
+    # --stats rather than silently buffering the requested live profiler.
+    return bool(args.chat and not args.stats and not PROFILE)
+
+
+class _CleanChatDisplay:
+    """Write decoded chat fragments contiguously, without diagnostic framing."""
+
+    def __init__(self, enabled, stream=None):
+        self.enabled = bool(enabled)
+        self.stream = stream if stream is not None else sys.stdout
+        self.started = False
+        self.finished = False
+        self.pending = []
+
+    def queue(self, text):
+        if not self.enabled or self.finished:
+            return
+        self.pending.append(text)
+
+    def flush(self):
+        if not self.enabled or self.finished or not self.pending:
+            return
+        if not self.started:
+            self.stream.write("\n=== RESPONSE ===\n")
+            self.started = True
+        self.stream.write("".join(self.pending))
+        self.pending.clear()
+        self.stream.flush()
+
+    def finish(self, tail=""):
+        if not self.enabled or self.finished:
+            return
+        if tail:
+            self.queue(tail)
+        if not self.pending and not self.started:
+            self.queue("")
+        self.flush()
+        self.stream.write("\n")
+        self.stream.flush()
+        self.finished = True
+
+
+class _CleanRuntimeStdout:
+    """Pass prefill logs through, then hold diagnostics until chat is complete."""
+
+    def __init__(self, display, stream=None):
+        self.display = display
+        self.stream = stream if stream is not None else sys.stdout
+        self.pending = []
+
+    def write(self, text):
+        if self.display.started:
+            self.pending.append(text)
+            return len(text)
+        return self.stream.write(text)
+
+    def flush(self):
+        if not self.display.started:
+            self.stream.flush()
+
+    def drain(self):
+        text = "".join(self.pending)
+        self.pending.clear()
+        return text
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
 def main():
     ap = _build_cli_parser()
     args = ap.parse_args()
     events = EventLog(args.events_jsonl)
+    clean_chat = _clean_chat_output(args)
 
     from transformers import AutoTokenizer
     import universal_draft
@@ -2738,14 +2816,28 @@ def main():
     generated = []   # mirrored via on_token so Ctrl-C still has the text
     stream_decoder = IncrementalTokenDecoder(tok)
     step_deltas = []
+    clean_display = _CleanChatDisplay(clean_chat)
+    runtime_stdout = _CleanRuntimeStdout(clean_display)
+    track_step_deltas = not clean_chat or events.enabled
     # Keep the ordinary benchmark path free of formatter calls and status
     # snapshots; the display is strictly opt-in.
     live_stats = LiveDecodeStats(True) if args.stats else None
 
     def on_token(t):
         generated.append(t)
-        delta = stream_decoder.append(t)
-        step_deltas.append(delta)
+        # The chat stop marker controls generation but is not assistant text.
+        # Preserve the established diagnostic rendering in raw/stats modes.
+        delta = (
+            ""
+            if clean_chat and t == EOS_ID
+            else stream_decoder.append(t)
+        )
+        if clean_chat:
+            # Queue before timing, token formatting, or evidence writes so a
+            # later interruption cannot hide text K3 already emitted.
+            clean_display.queue(delta)
+        if track_step_deltas:
+            step_deltas.append(delta)
         if state["first"]:
             state["first"] = False
             state["logged_count"] = 1
@@ -2753,14 +2845,21 @@ def main():
             text = tok.decode([t])
             events.emit("prefill_done", duration_ns=duration_ns,
                         emitted_token_ids=[t], emitted_token_text=[text])
-            print(f"[prefill done in {duration_ns/1e9:.6f}s] "
-                  f"first token: {t!r} = {delta!r}", flush=True)
-            if live_stats is not None:
-                print(
-                    live_stats.record_prefill(duration_ns, len(ids)),
-                    flush=True,
-                )
+            if not clean_chat:
+                print(f"[prefill done in {duration_ns/1e9:.6f}s] "
+                      f"first token: {t!r} = {delta!r}", flush=True)
+                if live_stats is not None:
+                    print(
+                        live_stats.record_prefill(duration_ns, len(ids)),
+                        flush=True,
+                    )
             step_deltas.clear()
+            if clean_chat:
+                clean_display.flush()
+        elif clean_chat and not events.enabled:
+            # With no evidence logger there is no decode timestamp to protect;
+            # stream each token immediately and avoid enabling per-pass clocks.
+            clean_display.flush()
 
     def log(s, tag, t0, gen):
         duration_ns = time.perf_counter_ns() - t0
@@ -2776,6 +2875,11 @@ def main():
                         emitted_token_ids=emitted,
                         emitted_token_text=[tok.decode([t]) for t in emitted],
                         cumulative_token_ids=gen, cumulative_text=tok.decode(gen))
+        if clean_chat:
+            # duration_ns and the JSONL event are complete before terminal I/O,
+            # preserving the benchmark timing contract.
+            clean_display.flush()
+            return
         print(f"[token {s}: {duration_ns/1e9:.6f}s{tag}] "
               f"+{delta!r}", flush=True)
         if live_stats is not None:
@@ -2793,88 +2897,129 @@ def main():
         print("   ", k3loader.cache_report(), flush=True)
 
     status = "ok"
+    interrupted = False
     try:
-        generate(
-            layers,
-            cache,
-            embed,
-            ids,
-            max_new,
-            on_token=on_token,
-            verbose_prefill=True,
-            log=log,
-            universal_drafter=universal_drafter,
+        stdout_context = (
+            contextlib.redirect_stdout(runtime_stdout)
+            if clean_chat else contextlib.nullcontext()
         )
+        with stdout_context:
+            generate(
+                layers,
+                cache,
+                embed,
+                ids,
+                max_new,
+                on_token=on_token,
+                verbose_prefill=True,
+                log=log if (not clean_chat or events.enabled) else None,
+                universal_drafter=universal_drafter,
+            )
     except KeyboardInterrupt:
         status = "interrupted"
-        print("\n[stopped by Ctrl-C]", flush=True)
+        interrupted = True
+        if not clean_chat:
+            print("\n[stopped by Ctrl-C]", flush=True)
     except BaseException as exc:
-        events.emit("run_error", error_type=type(exc).__name__, message=str(exc),
-                    duration_ns=time.perf_counter_ns() - run_started_ns,
-                    emitted_token_ids=generated,
-                    runtime={
-                        "int8_kda_qkv": _int8_kda_qkv_runtime_status(),
-                        "int8_lm_head": _lm_head_runtime_status(),
-                        "mla_cpu_sdpa": attn_fast.cpu_sdpa_status(),
-                    })
-        events.close()
+        if clean_chat:
+            try:
+                clean_display.finish(stream_decoder.finish())
+            except Exception:
+                pass
+            diagnostics = runtime_stdout.drain().strip()
+            if diagnostics:
+                try:
+                    print(diagnostics, file=sys.stderr, flush=True)
+                except Exception:
+                    pass
+        try:
+            events.emit(
+                "run_error",
+                error_type=type(exc).__name__,
+                message=str(exc),
+                duration_ns=time.perf_counter_ns() - run_started_ns,
+                emitted_token_ids=generated,
+                runtime={
+                    "int8_kda_qkv": _int8_kda_qkv_runtime_status(),
+                    "int8_lm_head": _lm_head_runtime_status(),
+                    "mla_cpu_sdpa": attn_fast.cpu_sdpa_status(),
+                },
+            )
+        except Exception:
+            pass
+        try:
+            events.close()
+        except Exception:
+            pass
         raise
     decoder_tail = stream_decoder.finish()
-    if decoder_tail:
+    if clean_chat:
+        clean_display.finish(decoder_tail)
+        diagnostics = runtime_stdout.drain().strip()
+        if diagnostics:
+            print(diagnostics, file=sys.stderr, flush=True)
+        if interrupted:
+            print("[stopped by Ctrl-C]", flush=True)
+    elif decoder_tail:
         print(f"[decoder tail] +{decoder_tail!r}", flush=True)
     emitted_with_eos = list(generated)
     if EOS_ID in generated:
         generated = generated[:generated.index(EOS_ID)]
 
-    print("\n=== RESULT ===")
-    print("completion:", tok.decode(generated))
-    print("token ids:", generated)
-    rep = spec_decode.report()
-    if rep:
-        print(rep)
-    if universal_drafter is not None:
-        uag = universal_drafter.status()
-        draft_rate = (
-            uag["accepted_drafts"] / uag["target_drafts"]
-            if uag["target_drafts"]
-            else 0.0
-        )
-        print(
-            f"[uag] proposals {uag['proposals']} | "
-            f"tokens {uag['emitted_tokens']} | drafts "
-            f"{uag['accepted_drafts']}/{uag['target_drafts']} accepted "
-            f"({draft_rate*100:.0f}%) | assistant "
-            f"{uag['assistant_tokens']} tokens in {uag['seconds']:.2f}s | "
-            f"failures {uag['failures']}"
-        )
-    es = EXPERT_SEL
-    if es["layer_calls"]:
-        tk = config.num_experts_per_token
-        print(f"[experts] decode: {es['uniq']/es['layer_calls']:.1f} unique/layer "
-              f"over T={es['pos']/es['layer_calls']:.2f} positions "
-              f"= {es['uniq']/(es['layer_calls']*tk):.2f}x a single-token "
-              f"(top-{tk}) read")
+    if not clean_chat:
+        print("\n=== RESULT ===")
+        print("completion:", tok.decode(generated))
+        print("token ids:", generated)
+        rep = spec_decode.report()
+        if rep:
+            print(rep)
+        if universal_drafter is not None:
+            uag = universal_drafter.status()
+            draft_rate = (
+                uag["accepted_drafts"] / uag["target_drafts"]
+                if uag["target_drafts"]
+                else 0.0
+            )
+            print(
+                f"[uag] proposals {uag['proposals']} | "
+                f"tokens {uag['emitted_tokens']} | drafts "
+                f"{uag['accepted_drafts']}/{uag['target_drafts']} accepted "
+                f"({draft_rate*100:.0f}%) | assistant "
+                f"{uag['assistant_tokens']} tokens in {uag['seconds']:.2f}s | "
+                f"failures {uag['failures']}"
+            )
+        es = EXPERT_SEL
+        if es["layer_calls"]:
+            tk = config.num_experts_per_token
+            print(f"[experts] decode: "
+                  f"{es['uniq']/es['layer_calls']:.1f} unique/layer "
+                  f"over T={es['pos']/es['layer_calls']:.2f} positions "
+                  f"= {es['uniq']/(es['layer_calls']*tk):.2f}x a single-token "
+                  f"(top-{tk}) read")
     duration_ns = time.perf_counter_ns() - prefill_started_ns
     completion = tok.decode(generated)
-    events.emit("run_end", status=status, duration_ns=duration_ns,
-                emitted_token_ids=emitted_with_eos,
-                completion_token_ids=generated, completion_text=completion,
-                phase_seconds=TIMES,
-                runtime={
-                    "int8_kda_qkv": _int8_kda_qkv_runtime_status(),
-                    "int8_lm_head": _lm_head_runtime_status(),
-                    "universal_draft": (
-                        universal_drafter.status()
-                        if universal_drafter is not None
-                        else None
-                    ),
-                    "mla_cpu_sdpa": attn_fast.cpu_sdpa_status(),
-                })
-    events.close()
-    print(f"total {duration_ns/1e9:.6f}s | times {TIMES}")
-    if live_stats is not None:
-        print(live_stats.final_line(duration_ns), flush=True)
-    print(k3loader.cache_report())
+    try:
+        events.emit("run_end", status=status, duration_ns=duration_ns,
+                    emitted_token_ids=emitted_with_eos,
+                    completion_token_ids=generated, completion_text=completion,
+                    phase_seconds=TIMES,
+                    runtime={
+                        "int8_kda_qkv": _int8_kda_qkv_runtime_status(),
+                        "int8_lm_head": _lm_head_runtime_status(),
+                        "universal_draft": (
+                            universal_drafter.status()
+                            if universal_drafter is not None
+                            else None
+                        ),
+                        "mla_cpu_sdpa": attn_fast.cpu_sdpa_status(),
+                    })
+    finally:
+        events.close()
+    if not clean_chat:
+        print(f"total {duration_ns/1e9:.6f}s | times {TIMES}")
+        if live_stats is not None:
+            print(live_stats.final_line(duration_ns), flush=True)
+        print(k3loader.cache_report())
     TRACE.close()
 
 

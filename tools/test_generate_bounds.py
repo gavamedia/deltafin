@@ -792,6 +792,7 @@ class UniversalDraftGeneratePolicyTests(unittest.TestCase):
 
     def test_failed_proposal_disables_only_this_request(self):
         drafter = self.Drafter(fail=True)
+        notices = []
         with (
             mock.patch.object(
                 kr,
@@ -808,11 +809,14 @@ class UniversalDraftGeneratePolicyTests(unittest.TestCase):
                 [41],
                 max_new=3,
                 spec=True,
+                on_notice=notices.append,
                 universal_drafter=drafter,
             )
         self.assertEqual(generated, [1, 2, 3])
         self.assertEqual(drafter.widths, [1])
         self.assertEqual(drafter.failures, 1)
+        self.assertEqual(len(notices), 1)
+        self.assertIn("proposal failed safely", notices[0])
 
     def test_bookkeeping_failure_keeps_already_certified_tokens(self):
         drafter = self.Drafter(bookkeeping_fail=True)

@@ -209,9 +209,10 @@ minutes:
 ./venv/bin/python tools/kimi_run.py --prompt "The largest planet in our solar system is" --max-new 17 --stats
 ```
 
-Tokens print as they are generated, so you always see the text as it comes.
-Ctrl-C stops cleanly at any point and prints the result so far; `--max-new N`
-caps the length. Add `--stats` to show prefill time and live steady-decode
+In chat mode, the answer streams as uninterrupted text unless `--stats` or
+`K3_PROFILE=1` requests diagnostic output. Ctrl-C stops cleanly at any point
+and keeps the answer generated so far; `--max-new N` caps the length. Add
+`--stats` to show token-level diagnostics, prefill time and live steady-decode
 throughput. Its decode rate excludes prefill and the first output token,
 matching the benchmark convention, and updates after each target pass (which
 may certify several tokens).
@@ -255,6 +256,44 @@ print(r.choices[0].message.reasoning_content)  # K3's thinking, when present
 streaming (`"stream": true`) works. Most tools that read `OPENAI_BASE_URL` and
 `OPENAI_API_KEY` will work by pointing those at the server.
 
+### Automatic chat tokenization
+
+Server chats have an exact, in-process native tokenization fast path. In the
+default `--gigatoken auto` mode, the first chat uses K3's ordinary tokenizer.
+Only after its response has been sent and flushed does the server qualify
+GigaToken during the idle gap, without overlapping a K3 model pass. If the
+next request arrives during that short qualification, a tokenizer gate holds
+it until qualification finishes; the very next chat therefore gets the warm
+path. An unavailable or rejected backend simply retains K3's tokenizer.
+
+Use `--gigatoken on` to require qualification at server startup, or
+`--gigatoken off` to keep tiktoken only and never import GigaToken:
+
+```bash
+./venv/bin/python tools/serve_openai.py --gigatoken auto
+./venv/bin/python tools/serve_openai.py --gigatoken on
+./venv/bin/python tools/serve_openai.py --gigatoken off
+```
+
+This is CPU preprocessing, independent of MPS or CUDA. It runs inside the same
+process—there is no second service, internal HTTP hop, runtime download, or
+install. Initialization failure in `auto` stays on tiktoken; `on` instead
+fails startup. If a native encode rejects an input or fails, its entire result
+is discarded and that complete chat tokenization is rerun through K3's exact
+path.
+
+On the reference M1 Max, the isolated warm segment-encoding step fell from
+0.438 to 0.155 ms for the smallest valid server-chat fixture (453 rendered
+characters, 38 segments and 90 tokens). For synthetic growing histories, it
+fell from 67.225 to 9.735 ms at 100 turns and from 664.987 to 95.986 ms at
+1,000 turns. The one-time roughly quarter-second qualification is excluded and
+placed after the preceding response. These are once-per-request preprocessing
+measurements, not end-to-end server results or a claim that prefill or token
+generation is 6–7× faster. The compatibility gates and whole-call fallback
+preserve K3's prompt-token IDs; model weights, all 16 experts, prefill,
+decoding, and K3's authority over emitted tokens are untouched. The detailed
+contract is in [the optimization guide](OPTIMIZATIONS.md#idle-warmed-request-batched-server-tokenization).
+
 Please read these caveats before pointing anything automated at it:
 
 - **Time.** Answers arrive when they arrive — set your client's timeouts to
@@ -268,6 +307,11 @@ Please read these caveats before pointing anything automated at it:
   you're in streaming mode.
 - **Greedy only.** `temperature` and `top_p` are accepted and ignored, and one
   request runs at a time (a second concurrent request gets a 429).
+- **Growing chats are resubmitted.** OpenAI-compatible clients normally send
+  the complete message history each turn. Deltafin tokenizes that full history
+  and currently creates a fresh model cache and prefills it again. The
+  automatic tokenizer removes part of the CPU text-processing overhead; it
+  does not remove the much larger full-model prefill.
 - **Agents are a curiosity, not a workflow.** Coding assistants work in
   principle, but their long system prompts make prefill expensive.
 
@@ -325,6 +369,7 @@ startup. These variables exist for overriding that:
 | `K3_HF_HOST` / `K3_HF_PATH` | Hugging Face | point expert fetching at a mirror |
 | `K3_SERVER_MAX_TOKENS` | unlimited | optional hard ceiling on server generations |
 | `K3_REASONING_EFFORT` | `max` | controls K3's thinking depth in chat mode; `low`, `high`, or `max` (maps to the API's `reasoning_effort` / template `thinking_effort`) |
+| `K3_SERVER_GIGATOKEN` | `auto` | exact server-chat tokenization: `auto` initializes after the first completed chat response, `on` requires it at startup, and `off` never imports it; the `--gigatoken` flag overrides this |
 | `K3_RESPONSE_MEMO_ENTRIES` | `32` | exact in-process replay cache for identical deterministic API requests; `0` disables |
 
 Less commonly needed experimental controls, including packed-KDA storage and
@@ -334,8 +379,10 @@ not promoted as general defaults here.
 
 ### Requirements
 
-- Apple Silicon macOS, or x86-64/aarch64 Linux. Linux x86-64 requires
-  AVX, FMA3, SSE3 and SSSE3; AVX2 is detected and selected at runtime.
+- Apple Silicon macOS, or glibc-based x86-64/aarch64 Linux. Linux x86-64
+  requires AVX, FMA3, SSE3 and SSSE3; AVX2 is detected and selected at
+  runtime. The hash-pinned optional tokenizer wheels use the manylinux2014
+  ABI, so Alpine/musl is not currently an installation target.
 - A C/C++ compiler: Xcode Command Line Tools on macOS, or GCC/Clang on Linux.
   Building the optional native CUDA expert path also requires NVCC; inference
   retains the native CPU expert path when it is absent.
@@ -667,7 +714,9 @@ influence:
 - **[PyTorch](https://github.com/pytorch/pytorch)**,
   **[Transformers](https://github.com/huggingface/transformers)**,
   **[ml_dtypes](https://github.com/jax-ml/ml_dtypes)** (our bit-exactness
-  reference for e2m1) and **[tiktoken](https://github.com/openai/tiktoken)**.
+  reference for e2m1), **[tiktoken](https://github.com/openai/tiktoken)**, and
+  **[GigaToken](https://github.com/marcelroed/gigatoken)** (Marcel Rød, MIT)
+  for the native batch-tokenization backend.
 
 ### License
 
