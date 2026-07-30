@@ -7,6 +7,11 @@ Always downloads the small stuff from huggingface.co/moonshotai/Kimi-K3:
 plus k3-meta/tensor_inventory_offsets.json, built by reading only the 96 shard
 HEADERS via range requests. Idempotent; safe to re-run.
 
+Unless ``--no-draft`` is supplied, setup also invokes ``setup_draft.py`` to
+install the pinned, hash-verified 0.6B + 1.7B universal assistants (~4.63 GB
+total). They only schedule proposed text; K3 derives and verifies every output
+token.
+
 Then it installs the weights, in one of two modes:
 
   --full    (default when the disk allows it, and STRONGLY recommended)
@@ -24,51 +29,343 @@ With no flag, setup picks --full if there is room and falls back to --stream
 with a warning if there isn't.
 """
 import concurrent.futures
+import hashlib
 import json
 import os
 import shutil
+import stat
 import struct
 import sys
+import tempfile
 import urllib.request
+
+try:
+    import model_source
+except ImportError:  # imported as tools.setup_k3
+    from . import model_source
+try:
+    import inventory_meta
+except ImportError:  # imported as tools.setup_k3
+    from . import inventory_meta
 
 ROOT = os.environ.get("DELTAFIN_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 META = os.path.join(ROOT, "k3-meta")
 PKG = os.path.join(ROOT, "tools", "k3pkg")
-BASE = "https://huggingface.co/moonshotai/Kimi-K3/resolve/main/"
+BASE = model_source.base_url()
 
-FILES = [
-    "config.json", "generation_config.json", "tokenizer_config.json",
-    "tokenization_kimi.py", "encoding_k3.py", "tiktoken.model",
-    "modeling_kimi_linear.py", "modeling_kimi_k3.py", "configuration_kimi_k3.py",
-]
+FILE_SPECS = model_source.PINNED_FILES
+FILES = tuple(FILE_SPECS)
 PKG_FILES = ["modeling_kimi_linear.py", "modeling_kimi_k3.py", "configuration_kimi_k3.py"]
+HASH_CHUNK = 1 << 20
+
+
+def _file_sha256(filename):
+    digest = hashlib.sha256()
+    with open(filename, "rb") as source:
+        while block := source.read(HASH_CHUNK):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _validate_regular_file(filename, expected_size, expected_sha256):
+    """Return ``(valid, reason)`` without following a path-level symlink."""
+    try:
+        info = os.lstat(filename)
+    except FileNotFoundError:
+        return False, "missing"
+    if stat.S_ISLNK(info.st_mode):
+        return False, "is a symbolic link"
+    if not stat.S_ISREG(info.st_mode):
+        return False, "is not a regular file"
+    if info.st_size != expected_size:
+        return (
+            False,
+            f"has {info.st_size} bytes; expected {expected_size}",
+        )
+    actual = _file_sha256(filename)
+    if actual != expected_sha256:
+        return (
+            False,
+            f"SHA-256 is {actual}; expected {expected_sha256}",
+        )
+    return True, None
 
 
 def fetch(name):
+    try:
+        expected_size, expected_sha256 = FILE_SPECS[name]
+    except KeyError as exc:
+        raise ValueError(f"{name!r} is not in the pinned file manifest") from exc
     dst = os.path.join(META, name)
-    if os.path.exists(dst) and os.path.getsize(dst) > 0:
-        return f"  {name}: already present"
+    valid, reason = _validate_regular_file(
+        dst, expected_size, expected_sha256
+    )
+    if valid:
+        return f"  {name}: already present and verified"
+    if reason != "missing":
+        raise RuntimeError(
+            f"refusing to replace {dst}: {reason}. Move that path aside "
+            "and retry setup."
+        )
+
     req = urllib.request.Request(BASE + name, headers={"User-Agent": "deltafin-setup"})
-    with urllib.request.urlopen(req, timeout=120) as r, open(dst + ".part", "wb") as f:
-        shutil.copyfileobj(r, f)
-    os.replace(dst + ".part", dst)
-    return f"  {name}: downloaded"
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{name}.", suffix=".part", dir=META
+    )
+    digest = hashlib.sha256()
+    received = 0
+    try:
+        with (
+            urllib.request.urlopen(req, timeout=120) as response,
+            os.fdopen(fd, "wb") as target,
+        ):
+            fd = -1
+            while block := response.read(HASH_CHUNK):
+                target.write(block)
+                digest.update(block)
+                received += len(block)
+            target.flush()
+            os.fsync(target.fileno())
+        actual = digest.hexdigest()
+        if received != expected_size:
+            raise RuntimeError(
+                f"{name} download has {received} bytes; "
+                f"expected {expected_size}"
+            )
+        if actual != expected_sha256:
+            raise RuntimeError(
+                f"{name} download SHA-256 is {actual}; "
+                f"expected {expected_sha256}"
+            )
+
+        # Do not silently overwrite a path created while the download was in
+        # flight. A matching concurrent install is harmless; anything else is
+        # preserved for inspection.
+        valid, reason = _validate_regular_file(
+            dst, expected_size, expected_sha256
+        )
+        if valid:
+            return f"  {name}: concurrently installed and verified"
+        if reason != "missing":
+            raise RuntimeError(
+                f"refusing to replace {dst}: it appeared during download "
+                f"and {reason}"
+            )
+        os.replace(temporary, dst)
+        temporary = ""
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+    valid, reason = _validate_regular_file(
+        dst, expected_size, expected_sha256
+    )
+    if not valid:
+        raise RuntimeError(f"published {name} failed verification: {reason}")
+    return f"  {name}: downloaded and verified"
+
+
+def _copy_verified_package_file(name):
+    expected_size, expected_sha256 = FILE_SPECS[name]
+    source = os.path.join(META, name)
+    valid, reason = _validate_regular_file(
+        source, expected_size, expected_sha256
+    )
+    if not valid:
+        raise RuntimeError(f"refusing to copy unverified {source}: {reason}")
+
+    destination = os.path.join(PKG, name)
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{name}.", suffix=".part", dir=PKG
+    )
+    try:
+        with open(source, "rb") as src, os.fdopen(fd, "wb") as target:
+            fd = -1
+            shutil.copyfileobj(src, target, length=HASH_CHUNK)
+            target.flush()
+            os.fsync(target.fileno())
+        valid, reason = _validate_regular_file(
+            temporary, expected_size, expected_sha256
+        )
+        if not valid:
+            raise RuntimeError(
+                f"temporary package copy for {name} is invalid: {reason}"
+            )
+        os.replace(temporary, destination)
+        temporary = ""
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
 
 
 def shard_header(i):
     shard = f"model-{i:05d}-of-000096.safetensors"
 
     def rng(start, end):
+        expected = end - start + 1
         req = urllib.request.Request(
             BASE + shard, headers={"Range": f"bytes={start}-{end}",
                                    "User-Agent": "deltafin-setup"})
         with urllib.request.urlopen(req, timeout=120) as r:
-            return r.read()
+            payload = r.read(expected + 1)
+        if len(payload) != expected:
+            raise RuntimeError(
+                f"{shard} range {start}-{end} returned "
+                f"{len(payload)} bytes; expected {expected}"
+            )
+        return payload
 
     n = struct.unpack("<Q", rng(0, 7))[0]
-    h = json.loads(rng(8, 8 + n - 1))
+    if not 0 < n <= inventory_meta.MAX_HEADER_BYTES:
+        raise RuntimeError(f"{shard} has invalid header length {n}")
+    try:
+        h = json.loads(rng(8, 8 + n - 1))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"{shard} has an invalid JSON header: {exc}") from exc
+    if not isinstance(h, dict):
+        raise RuntimeError(f"{shard} header must be a JSON object")
     h.pop("__metadata__", None)
     return shard, n, h
+
+
+def _fsync_directory(directory):
+    """Persist a completed atomic rename where the platform supports it."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    try:
+        fd = os.open(directory, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _build_inventory():
+    print("  building tensor inventory from 96 shard headers "
+          "(range requests)...")
+    document = {}
+    with concurrent.futures.ThreadPoolExecutor(12) as ex:
+        for shard, hlen, header in ex.map(
+            shard_header, range(1, inventory_meta.SHARD_COUNT + 1)
+        ):
+            for name, info in header.items():
+                if name in document:
+                    raise RuntimeError(
+                        f"duplicate tensor {name!r} found in {shard}"
+                    )
+                if not isinstance(info, dict):
+                    raise RuntimeError(
+                        f"tensor {name!r} in {shard} has invalid metadata"
+                    )
+                try:
+                    document[name] = {
+                        "dtype": info["dtype"],
+                        "shape": info["shape"],
+                        "offsets": info["data_offsets"],
+                        "shard": shard,
+                        "hlen": hlen,
+                    }
+                except KeyError as exc:
+                    raise RuntimeError(
+                        f"tensor {name!r} in {shard} is missing "
+                        f"{exc.args[0]!r}"
+                    ) from exc
+            sys.stderr.write(".")
+    sys.stderr.write("\n")
+    inventory_meta.validate_inventory(document)
+    return document
+
+
+def _publish_inventory(inv_path, document):
+    """Fsync and atomically publish the exact pinned inventory."""
+    inventory_meta.validate_inventory(document)
+    fd, temporary = tempfile.mkstemp(
+        prefix=".tensor_inventory_offsets.",
+        suffix=".part",
+        dir=os.path.dirname(inv_path),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as target:
+            fd = -1
+            # Keep the deterministic serialization used to derive the pinned
+            # exact size and SHA-256 in model_source.py.
+            json.dump(document, target)
+            target.flush()
+            os.fsync(target.fileno())
+
+        size, sha256 = inventory_meta.file_identity(temporary)
+        if size != model_source.PINNED_INVENTORY_SIZE:
+            raise RuntimeError(
+                f"generated tensor inventory has {size} bytes; pinned "
+                f"revision requires {model_source.PINNED_INVENTORY_SIZE}"
+            )
+        if sha256 != model_source.PINNED_INVENTORY_SHA256:
+            raise RuntimeError(
+                f"generated tensor inventory SHA-256 is {sha256}; pinned "
+                f"revision requires {model_source.PINNED_INVENTORY_SHA256}"
+            )
+
+        # Never overwrite a path that appeared while the 96 headers were
+        # being fetched.  A matching concurrent setup is harmless.
+        if os.path.lexists(inv_path):
+            try:
+                inventory_meta.load_verified_inventory(
+                    os.path.dirname(inv_path)
+                )
+            except inventory_meta.InventoryValidationError as exc:
+                raise RuntimeError(
+                    f"refusing to replace {inv_path}: it appeared while "
+                    f"the inventory was being built and is invalid: {exc}"
+                ) from exc
+            return
+        os.replace(temporary, inv_path)
+        temporary = ""
+        _fsync_directory(os.path.dirname(inv_path))
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    # Verify the published path rather than relying only on the temporary.
+    inventory_meta.load_verified_inventory(os.path.dirname(inv_path))
+
+
+def ensure_inventory():
+    """Verify an existing pinned inventory or build it transactionally."""
+    inv_path = os.path.join(META, inventory_meta.INVENTORY_FILENAME)
+    if os.path.lexists(inv_path):
+        try:
+            document = inventory_meta.load_verified_inventory(META)
+        except inventory_meta.InventoryValidationError as exc:
+            raise RuntimeError(
+                f"refusing to use or replace {inv_path}: {exc}. Move that "
+                "path aside and retry setup."
+            ) from exc
+        print(
+            f"  tensor inventory: {len(document)} tensors, pinned and verified"
+        )
+        return document
+
+    document = _build_inventory()
+    _publish_inventory(inv_path, document)
+    print(f"  tensor inventory: {len(document)} tensors indexed and verified")
+    return document
 
 
 SPINE_BYTES = 114e9
@@ -106,7 +403,7 @@ def _exclude_from_spotlight():
             open(os.path.join(p, ".metadata_never_index"), "a").close()
 
 
-def install_weights(mode):
+def install_weights(mode, install_draft=True):
     import shutil as _sh
     import subprocess
     free = _sh.disk_usage(ROOT).free
@@ -147,6 +444,11 @@ def install_weights(mode):
         print("Reminder: experts are fetched over the network on demand, so most")
         print("prompts will be several times slower than a full install. When you")
         print("have ~1.45 TB free:  python tools/fetch_experts_all.py")
+    if install_draft:
+        print("\n== installing exact speculative assistant ==", flush=True)
+        subprocess.check_call(
+            [py, os.path.join(ROOT, "tools", "setup_draft.py")]
+        )
     print("Optional next step (halves per-token I/O):")
     print("  python tools/convert_spine_int8.py")
 
@@ -158,40 +460,21 @@ def main():
     elif "--stream" in sys.argv:
         ap_mode = "stream"
     meta_only = "--meta-only" in sys.argv
+    install_draft = "--no-draft" not in sys.argv
 
     os.makedirs(META, exist_ok=True)
     print(f"Deltafin setup -> {META}")
     for name in FILES:
         print(fetch(name))
     for name in PKG_FILES:
-        shutil.copy2(os.path.join(META, name), os.path.join(PKG, name))
-    print(f"  modeling files copied into tools/k3pkg/")
+        _copy_verified_package_file(name)
+    print("  verified modeling files copied into tools/k3pkg/")
 
-    inv_path = os.path.join(META, "tensor_inventory_offsets.json")
-    if os.path.exists(inv_path):
-        print("  tensor inventory: already present")
-        if meta_only:
-            return
-        install_weights(ap_mode)
-        return
-    print("  building tensor inventory from 96 shard headers (range requests)...")
-    inv = {}
-    with concurrent.futures.ThreadPoolExecutor(12) as ex:
-        for shard, hlen, h in ex.map(shard_header, range(1, 97)):
-            for name, info in h.items():
-                inv[name] = {"dtype": info["dtype"], "shape": info["shape"],
-                             "offsets": info["data_offsets"], "shard": shard,
-                             "hlen": hlen}
-            sys.stderr.write(".")
-    sys.stderr.write("\n")
-    with open(inv_path + ".part", "w") as f:
-        json.dump(inv, f)
-    os.replace(inv_path + ".part", inv_path)
-    print(f"  tensor inventory: {len(inv)} tensors indexed")
+    ensure_inventory()
     if meta_only:
         print("Done (--meta-only). Weights not installed.")
         return
-    install_weights(ap_mode)
+    install_weights(ap_mode, install_draft=install_draft)
 
 
 if __name__ == "__main__":

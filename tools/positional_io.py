@@ -30,6 +30,20 @@ IS_WINDOWS = os.name == "nt"
 MAX_SINGLE_READ = 1 << 30
 
 
+class ShortRead(OSError):
+    """The file ended before the destination was filled.
+
+    Distinct from the OSError a failing read raises, so a caller can tell
+    "this file is shorter than I expected" from "the I/O failed" and keep the
+    original exception intact in the second case.
+    """
+
+    def __init__(self, message: str, *, completed: int, requested: int):
+        super().__init__(message)
+        self.completed = completed
+        self.requested = requested
+
+
 class PositionalFile:
     """A read-only file supporting concurrent positional reads.
 
@@ -91,8 +105,10 @@ class _PosixPositionalFile(PositionalFile):
         while got < total:
             read = os.preadv(self._fd, [view[got:]], offset + got)
             if read <= 0:
-                raise OSError(
-                    f"short read: {got}/{total} @{offset} from {self._path}"
+                raise ShortRead(
+                    f"short read: {got}/{total} @{offset} from {self._path}",
+                    completed=got,
+                    requested=total,
                 )
             got += read
         return got
@@ -247,9 +263,11 @@ if IS_WINDOWS:
                         ctypes.byref(buffer, got), count, offset + got
                     )
                     if read <= 0:
-                        raise OSError(
+                        raise ShortRead(
                             f"short read: {got}/{total} @{offset} "
-                            f"from {self._path}"
+                            f"from {self._path}",
+                            completed=got,
+                            requested=total,
                         )
                     got += read
                 return got

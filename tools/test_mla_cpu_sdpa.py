@@ -21,8 +21,10 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import attn_fast  # noqa: E402
+import kv_cache  # noqa: E402
 from k3pkg import modeling_kimi_linear as ml  # noqa: E402
 
+kv_cache.install(ml)
 torch.set_grad_enabled(False)
 
 

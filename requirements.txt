@@ -12,3 +12,10 @@ transformers==4.56.2
 einops
 tokenizers
 packaging
+
+# Exact reviewed GigaToken 0.10.0 wheels for server-only lazy chat encoding.
+# Direct references prevent an unsupported host from compiling the foreign
+# source distribution during an ordinary install or safe upgrade.
+gigatoken @ https://files.pythonhosted.org/packages/05/8c/89091815057ea41a1e81061704266de52ac12e5411bc66d5f1b33a3f85a8/gigatoken-0.10.0-cp310-abi3-macosx_11_0_arm64.whl#sha256=dff87a1da97d69718e4a0c2c00a7f29a509dfdaf69a9f8d8bb96829513c516c8 ; sys_platform == "darwin" and platform_machine == "arm64"
+gigatoken @ https://files.pythonhosted.org/packages/35/6f/d393a7735cbf775f612da4d0674f7ecc8900e0be4989fd46cbe23f650965/gigatoken-0.10.0-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl#sha256=46f726b77e4132914f64ed42c7b81d82bdc40e9302138fcaca0b394eed62fc47 ; sys_platform == "linux" and platform_machine == "aarch64"
+gigatoken @ https://files.pythonhosted.org/packages/e7/32/a0b3af6db26b3704224d3ad856ebadfdb6ed5d50210ab16ab9ad27b30673/gigatoken-0.10.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl#sha256=2f3481d0c067beacf1c0a7640d956edbc8973014ba8cfa3e18bfafb02f78e53b ; sys_platform == "linux" and platform_machine == "x86_64"

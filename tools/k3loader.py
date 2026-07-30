@@ -4,9 +4,17 @@ import numpy as np
 import torch
 from mxfp4 import dequant_mxfp4
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+try:
+    import model_source
+except ImportError:  # imported as tools.k3loader
+    from . import model_source
+
+ROOT = (
+    os.environ.get("DELTAFIN_ROOT")
+    or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 INV = json.load(open(os.path.join(ROOT, "k3-meta/tensor_inventory_offsets.json")))
-BASE = "https://huggingface.co/moonshotai/Kimi-K3/resolve/main/"
+BASE = model_source.base_url()
 RES = os.path.join(ROOT, "k3-resident/tensors")
 ECACHE = os.path.join(ROOT, "k3-experts")
 os.makedirs(ECACHE, exist_ok=True)

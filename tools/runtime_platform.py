@@ -436,6 +436,90 @@ def default_gemv_threads(
     return min(target, cpus)
 
 
+def gemv_autotune_candidates(
+    effective_cpus: int,
+    configured_default: int,
+    *,
+    native_limit: int = 32,
+) -> tuple[int, ...]:
+    """Return a small, capability-bounded CPU GEMV worker-width sweep.
+
+    The points deliberately match the offline C23 experiment: one width below
+    the conservative default, the default itself, two modest scale-up points,
+    and the effective CPU ceiling.  This is a candidate set, not a claim that
+    visible CPU count predicts the best memory-bandwidth width.
+    """
+    if effective_cpus < 1 or configured_default < 1 or native_limit < 1:
+        raise ValueError(
+            "effective CPUs, configured default, and native limit must be "
+            "positive"
+        )
+    ceiling = min(effective_cpus, native_limit)
+    default = min(configured_default, ceiling)
+    values = {
+        max(1, default // 2),
+        default,
+        min(ceiling, (3 * default + 1) // 2),
+        min(ceiling, 2 * default),
+        ceiling,
+    }
+    return tuple(sorted(value for value in values if 1 <= value <= ceiling))
+
+
+def choose_gemv_autotune_width(
+    samples_ns: dict[int, list[int] | tuple[int, ...]],
+    configured_default: int,
+    *,
+    minimum_speedup: float = 1.05,
+) -> tuple[int | None, str]:
+    """Choose a worker width only when two or more trials agree.
+
+    Each trial must name the same fastest width, and that width must beat the
+    configured default by ``minimum_speedup`` in every trial.  Returning
+    ``None`` is an intentional fail-closed decision; the caller retains the
+    configured default.
+    """
+    if configured_default not in samples_ns:
+        return None, "configured default has no timing samples"
+    if minimum_speedup <= 1.0:
+        raise ValueError("minimum speedup must be greater than one")
+    if not samples_ns:
+        return None, "no timing samples"
+    counts = {len(values) for values in samples_ns.values()}
+    if len(counts) != 1 or next(iter(counts), 0) < 2:
+        return None, "candidate trial counts differ or are fewer than two"
+    if any(
+        not isinstance(value, int) or value <= 0
+        for values in samples_ns.values()
+        for value in values
+    ):
+        return None, "timing samples must be positive integer nanoseconds"
+
+    trials = next(iter(counts))
+    winners = [
+        min(samples_ns, key=lambda width: samples_ns[width][trial])
+        for trial in range(trials)
+    ]
+    if any(width != winners[0] for width in winners[1:]):
+        return None, "trial winners disagree"
+    winner = winners[0]
+    if winner == configured_default:
+        return configured_default, "configured default remains fastest"
+
+    default_samples = samples_ns[configured_default]
+    winner_samples = samples_ns[winner]
+    speedups = [
+        default_samples[trial] / winner_samples[trial]
+        for trial in range(trials)
+    ]
+    if any(speedup < minimum_speedup for speedup in speedups):
+        return None, (
+            f"winner does not beat the configured default by "
+            f"{minimum_speedup:.3f}x in every trial"
+        )
+    return winner, "stable measured winner"
+
+
 def darwin_file_hints_enabled(
     requested: bool, platform: str | None = None
 ) -> bool:

@@ -7,10 +7,11 @@ original reader does, per layer, `open(path); f.readinto(view)` for each of the
 K3_SPINE_READ_THREADS worker threads with one work item per FILE.  Two things
 are wrong with that shape:
 
-  * ~2,500 open()/close() pairs per token.  The paths never change, the files
-    are read-only for the life of the process, and macOS gives this process
-    245,760 fds (kern.maxfilesperproc) against a soft RLIMIT_NOFILE already at
-    1,048,576 -- so all 2,506 spine blobs can be opened once and kept.
+  * ~2,500 open()/close() pairs per token. The paths never change and are
+    read-only for the life of the process. When the live RLIMIT_NOFILE leaves
+    room for the complete cyclic set plus a safety reserve, all blobs can be
+    opened once and kept. Lower-limit processes automatically retain transient
+    opens rather than risking EMFILE midway through inference.
 
   * ONE WORK ITEM PER FILE MEANS THE BIGGEST FILE IS THE CRITICAL PATH.  A KDA
     layer is 5 x 88.1 MB + 3 x 44.0 MB + 2 x 25.7 MB + 6.4 MB + change = 634 MB
@@ -48,16 +49,122 @@ except ImportError:  # Windows has no fcntl module
     fcntl = None
 
 try:
+    import resource
+except ImportError:  # Windows/import-only tooling; native readers are Unix.
+    resource = None
+
+try:
     import positional_io
     from runtime_platform import darwin_file_hints_enabled
 except ImportError:  # imported as tools.spine_io instead of a top-level module
     from . import positional_io
     from .runtime_platform import darwin_file_hints_enabled
 
+# ------------------------------------------------------ descriptor budget ----
+# The current packed K3 int8 spine uses 3,706 descriptors: 2 files for each
+# quantized matrix and 1 for each small bf16 tail. The exact installed count is
+# supplied by kimi_run. This conservative fallback protects direct users of the
+# module that cannot supply an inventory. A partial LRU would churn once per
+# cyclic pass and could close a descriptor still in use by another reader.
+FDCACHE_DEFAULT_REQUIRED = 4_096
+FDCACHE_RESERVE = 1_024
+
+
+# Windows has no RLIMIT_NOFILE, and these readers are kernel handles from
+# CreateFileW rather than CRT descriptors, so the limit this budget polices does
+# not exist there.  Reporting it as effectively unbounded is the accurate
+# answer; reporting zero would read as "no descriptors available" and refuse a
+# cache the caller explicitly asked for.
+FDCACHE_UNPOLICED_LIMIT = 1 << 24
+
+
+def _fd_limits():
+    if resource is None:
+        return FDCACHE_UNPOLICED_LIMIT, FDCACHE_UNPOLICED_LIMIT
+    try:
+        return resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (OSError, ValueError):
+        return 0, 0
+
+
+def _numeric_limit(value):
+    if resource is not None and value == resource.RLIM_INFINITY:
+        return 1 << 60
+    return max(0, int(value))
+
+
+def _open_fd_count():
+    for directory in ("/dev/fd", "/proc/self/fd"):
+        try:
+            return len(os.listdir(directory))
+        except OSError:
+            continue
+    # Unknown accounting must not spend the entire soft limit.
+    return 32
+
+
+def _fdcache_decision(requested, required_fds=None):
+    if not requested:
+        return False, "not requested"
+    required = (
+        FDCACHE_DEFAULT_REQUIRED
+        if required_fds is None else max(0, int(required_fds))
+    )
+    raw_soft, raw_hard = _fd_limits()
+    soft = _numeric_limit(raw_soft)
+    hard = _numeric_limit(raw_hard)
+    opened = _open_fd_count()
+    minimum = opened + FDCACHE_RESERVE + required
+    raised_from = None
+
+    # A normal macOS shell can inherit a soft limit of only 256 even when its
+    # hard limit is ample. Raising this process's *soft* limit is safe,
+    # process-local, requires no privilege when the hard limit permits it, and
+    # preserves the measured descriptor-cache speedup. Round to a conventional
+    # power-of-two limit so diagnostics and manual reproduction are simple.
+    if soft < minimum and resource is not None:
+        desired = 1 << max(12, (minimum - 1).bit_length())
+        desired = min(desired, hard)
+        if desired > soft:
+            try:
+                resource.setrlimit(
+                    resource.RLIMIT_NOFILE, (desired, raw_hard)
+                )
+                raised_from = soft
+                raw_soft, _ = _fd_limits()
+                soft = _numeric_limit(raw_soft)
+            except (OSError, ValueError):
+                pass
+
+    available = max(0, soft - opened - FDCACHE_RESERVE)
+    if available < required:
+        suggested = 1 << max(12, (minimum - 1).bit_length())
+        return (
+            False,
+            f"soft RLIMIT_NOFILE={soft} leaves {available} safe descriptors; "
+            f"the complete cache needs {required} "
+            f"(raise `ulimit -n {suggested}` or leave caching disabled)",
+        )
+    raised = (
+        f", raised automatically from {raised_from}"
+        if raised_from is not None else ""
+    )
+    unpoliced = (
+        "" if resource is not None
+        else " (Windows: handles are not subject to RLIMIT_NOFILE)"
+    )
+    return (
+        True,
+        f"soft RLIMIT_NOFILE={soft} leaves {available} safe descriptors"
+        f"{raised}{unpoliced}",
+    )
+
+
 # ---------------------------------------------------------------- flags -----
 _IS_DARWIN = sys.platform == "darwin"
 _IS_LINUX = sys.platform.startswith("linux")
-FDCACHE = os.environ.get("K3_SPINE_FDCACHE", "0") == "1"
+_FDCACHE_ENV_REQUESTED = os.environ.get("K3_SPINE_FDCACHE", "0") == "1"
+FDCACHE, FDCACHE_REASON = _fdcache_decision(_FDCACHE_ENV_REQUESTED)
 CHUNK_MB = float(os.environ.get("K3_SPINE_CHUNK_MB", "0") or 0)
 CHUNK = int(CHUNK_MB * (1 << 20))
 RDADVISE = os.environ.get("K3_SPINE_RDADVISE", "0") == "1"
@@ -69,6 +176,62 @@ STREAM_TIER = os.environ.get("K3_SPINE_STREAM_NOCACHE", "0") == "1"
 
 ENABLED = (FDCACHE or CHUNK > 0 or RDADVISE or NOCACHE
            or STREAM_TIER)
+
+
+def _refresh_enabled():
+    global ENABLED
+    ENABLED = (FDCACHE or CHUNK > 0 or RDADVISE or NOCACHE
+               or STREAM_TIER)
+
+
+_TIER_UNSET = object()
+
+
+def configure_stream_tier(
+    enabled, *, spine_mode=None, resident_prefixes=_TIER_UNSET
+):
+    """Select the two-tier policy after runtime memory capabilities are known.
+
+    ``kimi_run`` cannot make the automatic cache-fit decision until it has
+    inspected the installed spine and the live host.  The read path consults
+    these module flags at dispatch time, so changing them before the first
+    layer read is deterministic and avoids an import-order environment hack.
+
+    Passing ``resident_prefixes`` activates the tier boundary atomically with
+    the policy. An empty iterable intentionally means every layer streams.
+    Explicit mixed spines default to that all-streaming boundary because their
+    tensors span multiple codec trees and no int8-only resident budget applies;
+    other omitted boundaries preserve fail-closed behavior.
+    """
+    global STREAM_TIER, _RESIDENT_ACTIVE
+    STREAM_TIER = bool(enabled)
+    if not STREAM_TIER:
+        _RESIDENT_ACTIVE = False
+    elif spine_mode == "mixed" and (
+        resident_prefixes is _TIER_UNSET
+    ):
+        resident_prefixes = ()
+    if resident_prefixes is not _TIER_UNSET:
+        set_resident_tier(resident_prefixes)
+    _refresh_enabled()
+
+
+def configure_reader_shape(
+    *, fdcache=None, chunk_bytes=None, required_fds=None
+):
+    """Configure read-only descriptor reuse/chunking before the first read."""
+    global FDCACHE, FDCACHE_REASON, CHUNK, CHUNK_MB
+    if fdcache is not None:
+        FDCACHE, FDCACHE_REASON = _fdcache_decision(
+            bool(fdcache), required_fds=required_fds
+        )
+    if chunk_bytes is not None:
+        chunk = int(chunk_bytes)
+        if chunk < 0:
+            raise ValueError("chunk_bytes must be non-negative")
+        CHUNK = chunk
+        CHUNK_MB = chunk / float(1 << 20)
+    _refresh_enabled()
 
 # ------------------------------------------------------- darwin constants ---
 F_NOCACHE = 48

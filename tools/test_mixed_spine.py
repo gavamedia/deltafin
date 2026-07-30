@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Validation for the mixed-precision spine (K3_SPINE=mixed).
+"""Low-level validation for the retired mixed-precision spine artifacts.
 
-Three levels, cheapest first — no forward pass, ~1 GB of reads:
+These codecs remain available for format research, but the supported Deltafin
+runtime rejects them because they change target weights. Two low-level checks
+remain useful without enabling the inference path:
 
   1. KERNEL     every Metal dequant kernel is bit-identical to the numpy oracle
                 in tools/spine_codec.py (mixed_spine._check).
@@ -9,20 +11,15 @@ Three levels, cheapest first — no forward pass, ~1 GB of reads:
                 the band its codec predicts (i4 ~0.108, i6 ~0.024, i8 exactly 0).
                 A mis-indexed slice inside the packed layer buffer would show up
                 here as ~1.4 (two unrelated tensors), not as a plausible error.
-  3. LAYER      one real decoder layer materialized through the packed
-                read_pack/apply_pack path, parameter by parameter, against the
-                same layer materialized from the int8 spine. This is what the
-                model actually executes.
 
-  K3_SPINE=mixed python tools/test_mixed_spine.py
-  K3_SPINE=mixed K3_MIXED_DIR=... python tools/test_mixed_spine.py --layer 40
+  python tools/test_mixed_spine.py
+  K3_MIXED_DIR=... python tools/test_mixed_spine.py
 """
 import argparse, json, os, sys
 import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-os.environ.setdefault("K3_SPINE", "mixed")
 
 import spine_codec          # noqa: E402
 import mixed_spine          # noqa: E402

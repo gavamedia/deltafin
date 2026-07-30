@@ -200,6 +200,446 @@ def _native_module_manifest_checks():
         "mxfp4_pool_shutdown",
     }.issubset(calls[0][2]["required_symbols"])
     assert batch._LIB_PATH == "/fake/libmxfp4batch"
+    with mock.patch.dict(
+        os.environ, {"K3_GEMV_AUTOTUNE": "1"}, clear=True
+    ):
+        assert batch.configure_autotune(False)["state"] == "disabled"
+        assert "not the selected backend" in batch.autotune_status()["reason"]
+        assert batch.configure_autotune(True)["state"] == "pending"
+    with mock.patch.dict(
+        os.environ,
+        {"K3_GEMV_AUTOTUNE": "1", "K3_GEMV_THREADS": "7"},
+        clear=True,
+    ):
+        assert batch.configure_autotune(True)["state"] == "disabled"
+        assert "explicit" in batch.autotune_status()["reason"]
+    with mock.patch.dict(
+        os.environ,
+        {"K3_GEMV_AUTOTUNE": "not-a-mode", "K3_GEMV_THREADS": "7"},
+        clear=True,
+    ):
+        assert batch.configure_autotune(True)["state"] == "disabled"
+    with mock.patch.dict(
+        os.environ, {"K3_GEMV_AUTOTUNE": "not-a-mode"}, clear=True
+    ):
+        assert batch.configure_autotune(False)["state"] == "disabled"
+        try:
+            batch.configure_autotune(True)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid active autotune mode was accepted")
+    with mock.patch.dict(os.environ, {}, clear=True):
+        assert batch.configure_autotune(True)["state"] == "disabled"
+
+    # Weight-free C23 state-machine gates. The fake phases model the exact
+    # overwrite contract without calling the fake native library.
+    np = batch.np
+    raw = {
+        "w1": (np.empty((2, 2), np.uint8), np.empty((2, 1), np.uint8)),
+        "w2": (np.empty((3, 1), np.uint8), np.empty((3, 1), np.uint8)),
+        "w3": (np.empty((2, 2), np.uint8), np.empty((2, 1), np.uint8)),
+    }
+    raws = [raw, raw]
+    activation = np.zeros(3, dtype=np.float32)
+
+    def arm_autotune():
+        batch.THREADS = 4
+        batch._ACTIVE_THREADS = 4
+        with mock.patch.dict(
+            os.environ, {"K3_GEMV_AUTOTUNE": "1"}, clear=True
+        ):
+            assert batch.configure_autotune(True)["state"] == "pending"
+
+    def exact_phase_a(_raws, _x, gu, _width):
+        gu.fill(np.float32(1.0))
+
+    def exact_phase_b(_raws, _h, yb, _width):
+        yb.fill(np.float32(7.0))
+
+    # The first incompatible CPU shape terminates the one-shot tuner and then
+    # runs the ordinary exact path; it must not retry on every later layer.
+    arm_autotune()
+    incompatible_fallbacks = []
+
+    def incompatible_output(_raws, _x, nthreads):
+        incompatible_fallbacks.append(nthreads)
+        return np.full((2, 3), 7.0, np.float32)
+
+    with mock.patch.object(batch, "_autotune_eligible", return_value=False), \
+            mock.patch.object(
+                batch, "pool_init",
+                side_effect=lambda width=None: (
+                    batch._ACTIVE_THREADS if width is None else width
+                ),
+            ), mock.patch.object(
+                batch, "_expert_set_ffn_fixed", incompatible_output
+            ), mock.patch.object(batch, "_report_autotune"):
+        output = batch.expert_set_ffn(raws, activation)
+    assert np.array_equal(output, np.full((2, 3), 7.0, np.float32))
+    assert incompatible_fallbacks == [None]
+    assert batch.autotune_status()["state"] == "disabled"
+    assert "not the distinct top-16" in batch.autotune_status()["reason"]
+
+    messages = []
+    arm_autotune()
+    with mock.patch.object(batch, "_autotune_eligible", return_value=True), \
+            mock.patch.object(batch, "_normalized_load", return_value=0.0), \
+            mock.patch.object(batch, "available_cpu_count", return_value=8), \
+            mock.patch.object(
+                batch, "gemv_autotune_candidates", return_value=(4, 8)
+            ), mock.patch.object(
+                batch, "choose_gemv_autotune_width",
+                return_value=(8, "stable measured winner"),
+            ), mock.patch.object(
+                batch, "pool_init",
+                side_effect=lambda width=None: (
+                    batch._ACTIVE_THREADS if width is None else width
+                ),
+            ), mock.patch.object(batch, "_phase_a", exact_phase_a), \
+            mock.patch.object(batch, "_phase_b", exact_phase_b), \
+            mock.patch.object(batch, "_report_autotune", messages.append):
+        output = batch._maybe_autotune_expert_set(raws, activation)
+    assert np.array_equal(output, np.full((2, 3), 7.0, np.float32))
+    assert batch.autotune_status()["state"] == "selected"
+    assert batch.autotune_status()["active_threads"] == 8
+    assert len(batch.autotune_status()["samples_ms"]["4"]) == 2
+    assert len(batch.autotune_status()["samples_ms"]["8"]) == 2
+    assert len(messages) == 1
+
+    # A differing phase never escapes: return the completed default reference
+    # and restore its active width.
+    arm_autotune()
+
+    def drifting_phase_a(_raws, _x, gu, width):
+        gu.fill(np.float32(width))
+
+    with mock.patch.object(batch, "_autotune_eligible", return_value=True), \
+            mock.patch.object(batch, "_normalized_load", return_value=0.0), \
+            mock.patch.object(batch, "available_cpu_count", return_value=8), \
+            mock.patch.object(
+                batch, "gemv_autotune_candidates", return_value=(4, 8)
+            ), mock.patch.object(
+                batch, "pool_init",
+                side_effect=lambda width=None: (
+                    batch._ACTIVE_THREADS if width is None else width
+                ),
+            ), mock.patch.object(batch, "_phase_a", drifting_phase_a), \
+            mock.patch.object(batch, "_phase_b", exact_phase_b), \
+            mock.patch.object(batch, "_report_autotune"):
+        output = batch._maybe_autotune_expert_set(raws, activation)
+    assert np.array_equal(output, np.full((2, 3), 7.0, np.float32))
+    assert batch.autotune_status()["state"] == "disabled"
+    assert batch.autotune_status()["active_threads"] == 4
+    assert "phase-A output differs" in batch.autotune_status()["reason"]
+
+    # Phase-B drift occurs after the live destination has been overwritten.
+    # The returned value must still be the copied configured-width reference.
+    arm_autotune()
+
+    def drifting_phase_b(_raws, _h, yb, width):
+        yb.fill(np.float32(width))
+
+    with mock.patch.object(batch, "_autotune_eligible", return_value=True), \
+            mock.patch.object(batch, "_normalized_load", return_value=0.0), \
+            mock.patch.object(batch, "available_cpu_count", return_value=8), \
+            mock.patch.object(
+                batch, "gemv_autotune_candidates", return_value=(4, 8)
+            ), mock.patch.object(
+                batch, "pool_init",
+                side_effect=lambda width=None: (
+                    batch._ACTIVE_THREADS if width is None else width
+                ),
+            ), mock.patch.object(batch, "_phase_a", exact_phase_a), \
+            mock.patch.object(batch, "_phase_b", drifting_phase_b), \
+            mock.patch.object(batch, "_report_autotune"):
+        output = batch._maybe_autotune_expert_set(raws, activation)
+    assert np.array_equal(output, np.full((2, 3), 4.0, np.float32))
+    assert batch.autotune_status()["state"] == "disabled"
+    assert batch.autotune_status()["active_threads"] == 4
+    assert "phase-B output differs" in batch.autotune_status()["reason"]
+
+    # A short native pool and an exhausted cooperative deadline fail the same
+    # way, after preserving the already-computed configured-width output.
+    for failure in ("short_pool", "deadline"):
+        arm_autotune()
+
+        def fake_pool(width=None):
+            requested = batch._ACTIVE_THREADS if width is None else width
+            return 4 if failure == "short_pool" and requested == 8 else requested
+
+        deadline = 0 if failure == "deadline" else 350_000_000
+        with mock.patch.object(
+                batch, "_AUTOTUNE_DEADLINE_NS", deadline
+            ), mock.patch.object(
+                batch, "_autotune_eligible", return_value=True
+            ), mock.patch.object(
+                batch, "_normalized_load", return_value=0.0
+            ), mock.patch.object(
+                batch, "available_cpu_count", return_value=8
+            ), mock.patch.object(
+                batch, "gemv_autotune_candidates", return_value=(4, 8)
+            ), mock.patch.object(batch, "pool_init", side_effect=fake_pool), \
+                mock.patch.object(batch, "_phase_a", exact_phase_a), \
+                mock.patch.object(batch, "_phase_b", exact_phase_b), \
+                mock.patch.object(batch, "_report_autotune"):
+            output = batch._maybe_autotune_expert_set(raws, activation)
+        assert np.array_equal(output, np.full((2, 3), 7.0, np.float32))
+        assert batch.autotune_status()["state"] == "disabled"
+        assert batch.autotune_status()["active_threads"] == 4
+
+    # Even after exact calibration, failure to install the winning pool cannot
+    # publish the winner. The final call restores the configured width.
+    arm_autotune()
+    pool_calls = []
+    winner_pool_calls = 0
+
+    def fail_winner_install(width=None):
+        nonlocal winner_pool_calls
+        requested = batch._ACTIVE_THREADS if width is None else width
+        pool_calls.append(requested)
+        if requested == 8:
+            winner_pool_calls += 1
+            if winner_pool_calls == 3:
+                return 4
+        return requested
+
+    with mock.patch.object(batch, "_autotune_eligible", return_value=True), \
+            mock.patch.object(batch, "_normalized_load", return_value=0.0), \
+            mock.patch.object(batch, "available_cpu_count", return_value=8), \
+            mock.patch.object(
+                batch, "gemv_autotune_candidates", return_value=(4, 8)
+            ), mock.patch.object(
+                batch, "choose_gemv_autotune_width",
+                return_value=(8, "stable measured winner"),
+            ), mock.patch.object(
+                batch, "pool_init", side_effect=fail_winner_install
+            ), mock.patch.object(batch, "_phase_a", exact_phase_a), \
+            mock.patch.object(batch, "_phase_b", exact_phase_b), \
+            mock.patch.object(batch, "_report_autotune"):
+        output = batch._maybe_autotune_expert_set(raws, activation)
+    assert np.array_equal(output, np.full((2, 3), 7.0, np.float32))
+    assert batch.autotune_status()["state"] == "disabled"
+    assert batch.autotune_status()["active_threads"] == 4
+    assert pool_calls[-1] == 4
+    assert "winning pool requested 8" in batch.autotune_status()["reason"]
+
+    # The load gate is checked again after all trials and winner installation.
+    # A busy transition restores the default and returns the copied reference.
+    arm_autotune()
+    with mock.patch.object(batch, "_autotune_eligible", return_value=True), \
+            mock.patch.object(
+                batch, "_normalized_load", side_effect=(0.0, 0.9)
+            ), mock.patch.object(
+                batch, "available_cpu_count", return_value=8
+            ), mock.patch.object(
+                batch, "gemv_autotune_candidates", return_value=(4, 8)
+            ), mock.patch.object(
+                batch, "choose_gemv_autotune_width",
+                return_value=(8, "stable measured winner"),
+            ), mock.patch.object(
+                batch, "pool_init",
+                side_effect=lambda width=None: (
+                    batch._ACTIVE_THREADS if width is None else width
+                ),
+            ), mock.patch.object(batch, "_phase_a", exact_phase_a), \
+            mock.patch.object(batch, "_phase_b", exact_phase_b), \
+            mock.patch.object(batch, "_report_autotune"):
+        output = batch._maybe_autotune_expert_set(raws, activation)
+    assert np.array_equal(output, np.full((2, 3), 7.0, np.float32))
+    assert batch.autotune_status()["state"] == "disabled"
+    assert batch.autotune_status()["active_threads"] == 4
+    assert "post-calibration host load" in batch.autotune_status()["reason"]
+
+    # If the configured width becomes unavailable during rollback, retain the
+    # real positive pool width instead of requesting an impossible width on
+    # every later dispatch.
+    arm_autotune()
+    restore_four_calls = 0
+
+    def short_restore(width=None):
+        nonlocal restore_four_calls
+        requested = batch._ACTIVE_THREADS if width is None else width
+        if requested == 4:
+            restore_four_calls += 1
+            return 3 if restore_four_calls >= 2 else 4
+        return requested
+
+    with mock.patch.object(batch, "_autotune_eligible", return_value=True), \
+            mock.patch.object(batch, "_normalized_load", return_value=0.0), \
+            mock.patch.object(batch, "available_cpu_count", return_value=8), \
+            mock.patch.object(
+                batch, "gemv_autotune_candidates", return_value=(4, 8)
+            ), mock.patch.object(batch, "pool_init", side_effect=short_restore), \
+            mock.patch.object(batch, "_phase_a", exact_phase_a), \
+            mock.patch.object(batch, "_phase_b", drifting_phase_b), \
+            mock.patch.object(batch, "_report_autotune"):
+        output = batch._maybe_autotune_expert_set(raws, activation)
+    status = batch.autotune_status()
+    assert np.array_equal(output, np.full((2, 3), 4.0, np.float32))
+    assert status["state"] == "disabled"
+    assert status["active_threads"] == 3
+    assert status["configured_pool_restore_succeeded"] is False
+    assert status["restored_pool_threads"] == 3
+
+    p = np.empty((1, 1), np.uint8)
+    s = np.empty((1, 1), np.uint8)
+    xv = np.empty(2, np.float32)
+    yv = np.empty(1, np.float32)
+    native_widths = []
+    with mock.patch.object(
+        batch._LIB,
+        "mxfp4_gemv_batch",
+        side_effect=lambda *_args: native_widths.append(_args[-1]),
+    ):
+        batch.gemv_batch([(p, s, xv, yv)])
+    assert native_widths == [3]
+
+    # An exception while restoring must never adopt the stale candidate pool.
+    # Rebuild a one-worker/inline fallback and use that request thereafter.
+    arm_autotune()
+    restore_four_calls = 0
+    recovery_calls = []
+
+    def failed_restore(width=None):
+        nonlocal restore_four_calls
+        requested = batch._ACTIVE_THREADS if width is None else width
+        recovery_calls.append(requested)
+        if requested == 4:
+            restore_four_calls += 1
+            if restore_four_calls >= 2:
+                raise RuntimeError("synthetic restore failure")
+        return requested
+
+    with mock.patch.object(batch, "_autotune_eligible", return_value=True), \
+            mock.patch.object(batch, "_normalized_load", return_value=0.0), \
+            mock.patch.object(batch, "available_cpu_count", return_value=8), \
+            mock.patch.object(
+                batch, "gemv_autotune_candidates", return_value=(4, 8)
+            ), mock.patch.object(batch, "pool_init", side_effect=failed_restore), \
+            mock.patch.object(batch, "pool_shutdown"), \
+            mock.patch.object(batch, "_phase_a", exact_phase_a), \
+            mock.patch.object(batch, "_phase_b", drifting_phase_b), \
+            mock.patch.object(batch, "_report_autotune"):
+        output = batch._maybe_autotune_expert_set(raws, activation)
+    status = batch.autotune_status()
+    assert np.array_equal(output, np.full((2, 3), 4.0, np.float32))
+    assert status["active_threads"] == 1
+    assert status["configured_pool_restore_succeeded"] is False
+    assert status["restored_pool_threads"] == 1
+    assert recovery_calls[-2:] == [4, 1]
+
+    native_widths = []
+    with mock.patch.object(
+        batch._LIB,
+        "mxfp4_gemv_batch",
+        side_effect=lambda *_args: native_widths.append(_args[-1]),
+    ):
+        batch.gemv_batch([(p, s, xv, yv)])
+    assert native_widths == [1]
+
+    # A live affinity/cgroup ceiling lower than the import-time default cannot
+    # enter a candidate order that lacks its reference width.
+    arm_autotune()
+    with mock.patch.object(batch, "_autotune_eligible", return_value=True), \
+            mock.patch.object(batch, "_normalized_load", return_value=0.0), \
+            mock.patch.object(batch, "available_cpu_count", return_value=3), \
+            mock.patch.object(
+                batch, "gemv_autotune_candidates", return_value=(1, 3)
+            ), mock.patch.object(
+                batch, "pool_init",
+                side_effect=lambda width=None: (
+                    batch._ACTIVE_THREADS if width is None else width
+                ),
+            ), mock.patch.object(batch, "_report_autotune"):
+        output = batch._maybe_autotune_expert_set(raws, activation)
+    assert output is None
+    assert batch.autotune_status()["state"] == "disabled"
+    assert "changed after startup" in batch.autotune_status()["reason"]
+
+    # Discovery can fail before a reference output exists. The public entry
+    # point must then execute the ordinary configured-width path exactly once.
+    arm_autotune()
+    fallback_calls = []
+
+    def fallback_output(_raws, _x, nthreads):
+        fallback_calls.append(nthreads)
+        return np.full((2, 3), 7.0, np.float32)
+
+    with mock.patch.object(batch, "_autotune_eligible", return_value=True), \
+            mock.patch.object(batch, "_normalized_load", return_value=0.0), \
+            mock.patch.object(
+                batch, "available_cpu_count",
+                side_effect=RuntimeError("CPU discovery failed"),
+            ), mock.patch.object(
+                batch, "pool_init",
+                side_effect=lambda width=None: (
+                    batch._ACTIVE_THREADS if width is None else width
+                ),
+            ), mock.patch.object(
+                batch, "_expert_set_ffn_fixed", fallback_output
+            ), mock.patch.object(batch, "_report_autotune"):
+        output = batch.expert_set_ffn(raws, activation)
+    assert np.array_equal(output, np.full((2, 3), 7.0, np.float32))
+    assert fallback_calls == [None]
+    assert batch.autotune_status()["state"] == "disabled"
+    assert batch.autotune_status()["active_threads"] == 4
+    assert "CPU discovery failed" in batch.autotune_status()["reason"]
+
+    # Two simultaneous first callers cannot both calibrate. The outer call
+    # lock admits one selector; the follower observes the retained width.
+    arm_autotune()
+    phase_a_calls = []
+    fixed_calls = []
+    outputs = []
+    start = threading.Event()
+
+    def counted_phase_a(_raws, _x, gu, width):
+        phase_a_calls.append(width)
+        gu.fill(np.float32(1.0))
+
+    def fixed_output(_raws, _x, _nthreads):
+        with batch._CALL_LOCK:
+            fixed_calls.append(batch._ACTIVE_THREADS)
+            return np.full((2, 3), 7.0, np.float32)
+
+    def concurrent_call():
+        start.wait()
+        outputs.append(batch.expert_set_ffn(raws, activation))
+
+    with mock.patch.object(batch, "_autotune_eligible", return_value=True), \
+            mock.patch.object(batch, "_normalized_load", return_value=0.0), \
+            mock.patch.object(batch, "available_cpu_count", return_value=8), \
+            mock.patch.object(
+                batch, "gemv_autotune_candidates", return_value=(4, 8)
+            ), mock.patch.object(
+                batch, "choose_gemv_autotune_width",
+                return_value=(8, "stable measured winner"),
+            ), mock.patch.object(
+                batch, "pool_init",
+                side_effect=lambda width=None: (
+                    batch._ACTIVE_THREADS if width is None else width
+                ),
+            ), mock.patch.object(batch, "_phase_a", counted_phase_a), \
+            mock.patch.object(batch, "_phase_b", exact_phase_b), \
+            mock.patch.object(batch, "_expert_set_ffn_fixed", fixed_output), \
+            mock.patch.object(batch, "_report_autotune"):
+        threads = [
+            threading.Thread(target=concurrent_call) for _ in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        start.set()
+        for thread in threads:
+            thread.join()
+    assert len(phase_a_calls) == 9
+    assert len(fixed_calls) == 1 and fixed_calls[0] == 8
+    assert len(outputs) == 2
+    assert all(
+        np.array_equal(output, np.full((2, 3), 7.0, np.float32))
+        for output in outputs
+    )
+    assert batch.autotune_status()["active_threads"] == 8
 
     imported = []
     assert rp.import_when_enabled(
@@ -226,6 +666,10 @@ def _native_module_manifest_checks():
     assert "spine_fast.effective_dequant_backend(DEV)" in source
     assert 'DEV.type == "mps" and _SPINE_DEQ == "metal"' in source
     assert "spine_fast.describe(DEV)" in source
+    assert (
+        'fast_moe_batch.configure_autotune(MOE_BACKEND == "cpu")'
+        in source
+    )
     # Definition + two CUDA-MoE profile gates + two whole-pass profile gates.
     # Normal decode must not add an unconditional accelerator synchronization.
     assert source.count("_device_synchronize()") == 5
@@ -381,6 +825,33 @@ def _device_checks():
     assert rp.default_gemv_threads("win32", 32) == 8
     assert rp.default_gemv_threads("win32", 3) == 3
     assert rp.default_gemv_threads("freebsd", 2) == 2
+    assert rp.gemv_autotune_candidates(10, 4) == (2, 4, 6, 8, 10)
+    assert rp.gemv_autotune_candidates(3, 4) == (1, 3)
+    assert rp.gemv_autotune_candidates(128, 8) == (4, 8, 12, 16, 32)
+    for bad in ((0, 4), (8, 0)):
+        try:
+            rp.gemv_autotune_candidates(*bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid autotune bounds {bad} accepted")
+
+    stable = {4: [120, 125], 6: [100, 102], 8: [80, 82]}
+    assert rp.choose_gemv_autotune_width(stable, 4) == (
+        8, "stable measured winner"
+    )
+    assert rp.choose_gemv_autotune_width(
+        {4: [100, 100], 8: [96, 94]}, 4
+    )[0] is None
+    assert rp.choose_gemv_autotune_width(
+        {4: [100, 100], 8: [90, 110]}, 4
+    ) == (None, "trial winners disagree")
+    assert rp.choose_gemv_autotune_width(
+        {4: [80, 81], 8: [100, 99]}, 4
+    ) == (4, "configured default remains fastest")
+    assert rp.choose_gemv_autotune_width(
+        {4: [100], 8: [80, 81]}, 4
+    )[0] is None
     assert rp.choose_device_spec(
         None, mps_available=True, cuda_available=True, cuda_device_count=2
     ) == "mps"

@@ -22,6 +22,32 @@ def _exact_test_operator(hidden, qweight, scale):
 
 
 class PackedQ8CapabilityTests(unittest.TestCase):
+    def test_measured_automatic_token_limits_are_backend_specific(self):
+        self.assertEqual(
+            packed_q8._parse_max_tokens(
+                "auto", device_type="mps", torch_threads=8
+            ),
+            9,
+        )
+        self.assertEqual(
+            packed_q8._parse_max_tokens(
+                None, device_type="cpu", torch_threads=1
+            ),
+            1,
+        )
+        self.assertEqual(
+            packed_q8._parse_max_tokens(
+                None, device_type="cpu", torch_threads=4
+            ),
+            2,
+        )
+        self.assertEqual(
+            packed_q8._parse_max_tokens(
+                None, device_type="cuda", torch_threads=8
+            ),
+            1,
+        )
+
     def test_operator_resolution_accepts_aten_overload(self):
         sentinel = object()
 
@@ -139,6 +165,38 @@ class PackedQ8CapabilityTests(unittest.TestCase):
         )
         self.assertFalse(disabled.available)
         self.assertIn("disabled", disabled.reason)
+
+    def test_transposed_output_shape_requires_its_own_canary(self):
+        seen_shapes = []
+
+        def recording_operator(hidden, qweight, scale):
+            seen_shapes.append(tuple(qweight.shape))
+            return _exact_test_operator(hidden, qweight, scale)
+
+        first_stage = packed_q8.discover(
+            torch,
+            torch.device("cpu"),
+            torch.float32,
+            (96, 64),
+            fusion_mode="off",
+            operator=recording_operator,
+            dispatch_query=lambda _schema, _key: True,
+        )
+        output_stage = packed_q8.discover(
+            torch,
+            torch.device("cpu"),
+            torch.float32,
+            (64, 96),
+            fusion_mode="off",
+            operator=recording_operator,
+            dispatch_query=lambda _schema, _key: True,
+        )
+
+        self.assertTrue(first_stage.available, first_stage.reason)
+        self.assertTrue(output_stage.available, output_stage.reason)
+        self.assertEqual(first_stage.canary["shape"], [96, 64])
+        self.assertEqual(output_stage.canary["shape"], [64, 96])
+        self.assertEqual(seen_shapes, [(96, 64), (64, 96)])
 
     def test_inexact_fused_rows_disable_only_fusion(self):
         def shape_sensitive_operator(hidden, qweight, scale):

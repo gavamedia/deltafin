@@ -5,15 +5,52 @@ bytes at the right time, and declining an optimization when the running
 machine has not proved that it can execute it safely. Kimi K3 is a 2.8-trillion
 parameter Mixture-of-Experts model, but one token selects only 16 of 896 routed
 experts at each MoE layer. That makes the model runnable on one workstation;
-it does not make the remaining I/O small. A local decode still touches roughly
-25.8 GB of routed-expert data and, with the int8 resident spine, about 53 GB of
-non-expert weights per pass.
+it does not make the remaining I/O small. A single-position local target pass
+touches roughly 25.8 GB of routed-expert data and, with the int8 resident spine,
+about 53 GB of non-expert weights. Multi-position verification shares the
+spine scan but reads the union of experts selected across its positions.
 
 This document describes the paths retained in the runtime. It is deliberately
 not a catalogue of every experiment we tried. We do not mean to suggest that
 the underlying ideas are all new; the interesting part here is often the
 particular ownership, fallback, or data-layout contract needed to make an idea
 work with K3.
+
+## Quality is the invariant
+
+Deltafin treats output quality as a hard boundary, not another benchmark
+column. A faster result does not qualify if it uses fewer routed experts,
+changes the target decoding policy, lets an assistant author output, or enables
+an approximate numerical shortcut. Storing and running the full model would
+make little sense if inference quietly substituted a smaller or lower-quality
+model at the last moment.
+
+The full K3 target therefore remains the sole authority for every emitted
+token:
+
+1. Every MoE layer retains K3's complete top-16 routed-expert computation.
+2. Greedy target decoding and its output limits remain unchanged.
+3. The 0.6B and 1.7B assistants can propose candidate text only. Their
+   confidence scores may shorten a proposal or decide which proposal is worth
+   checking, but they cannot approve a token.
+4. Candidate text is re-tokenized with K3's tokenizer and passed through the
+   full K3 target. Only tokens derived and certified by that target pass can be
+   emitted.
+5. A mismatch, exception, or incomplete verification restores the last
+   committed target state and falls back safely. A bad guess may waste time; it
+   cannot gain authority over the answer.
+
+The supported runtime enforces the same boundary at startup. It requires all
+16 experts and fp32 activation numerics, and rejects the former reduced-expert,
+fp16/approximate, and 4/6-bit mixed-spine settings. Representation and scheduling
+optimizations—such as packed storage, native kernels, shared buffers, prefetch,
+and multi-token verification—must pass their applicable correctness and token
+parity gates while retaining a safe fallback. Confidence is used to avoid
+wasteful verification, never as a substitute for verification.
+
+This is also the benchmark rule: any measurement that crosses the quality
+boundary is excluded, regardless of how impressive its tokens-per-second
+number appears.
 
 The status labels used below are important:
 
@@ -23,6 +60,264 @@ The status labels used below are important:
 | **Capability-gated** | Used only after the live runtime or native library proves the required operator, shape, and device behavior. |
 | **Opt-in** | Implemented and correctness-gated, but off by default while its complete-token speed or wider hardware coverage is still being established. |
 | **Structural evidence** | Exact byte, allocation, call, or synchronization work was removed, but we do not yet publish a tokens-per-second gain for that change alone. |
+
+## Idle-warmed request-batched server tokenization
+
+**Status: Default-auto for OpenAI-compatible server chats; exact whole-call
+fallback.**
+
+An OpenAI-compatible client normally sends the complete message history on
+every turn. Deltafin must tokenize that history again before it can prefill
+K3. The ordinary Kimi tokenizer first renders the chat into many independent
+segments—ordinary user text, structural special tokens, template punctuation
+and generation markers—and historically encoded those pieces one at a time.
+The calls are individually small, but a growing chat can contain thousands of
+them.
+
+The server can now batch that segmented work through
+[GigaToken](https://github.com/marcelroed/gigatoken), an in-process native CPU
+tokenizer. It does not replace the authoritative K3 tokenizer or concatenate
+text across boundaries:
+
+1. K3's unchanged chat template still creates every segment and decides
+   whether registered special-token spellings are structural at that position.
+2. Each segment is split at the same 400,000-character and
+   25,000-non-whitespace-character boundaries as the baseline tokenizer.
+3. Ordinary pieces and structural pieces are submitted as two separate native
+   batches. A small tape records every original segment, policy and piece
+   count.
+4. The encoded rows are reassembled in the original tape order. Adjacent
+   segments are never merged, because doing so could change BPE boundaries.
+5. If ordinary user or tool text literally contains a registered special
+   spelling that the native compatibility layer declines, the complete native
+   result is discarded and the whole chat tokenization is rerun through K3.
+   Any unexpected native error does the same and disables that backend for the
+   rest of the server process.
+
+Only a shallow private tokenizer proxy owns the batched segment hook. The live
+K3 tokenizer used for decoding and universal drafting is never mutated.
+Prompt-token IDs therefore retain one authority just as generated tokens do.
+
+### Why initialization happens after a response
+
+The first valid server chat is already on the warm side of the measured
+request-batching crossover, but importing, constructing and fully qualifying a
+native backend takes roughly a quarter second on the reference machine. The
+default `auto` lifecycle moves that one-time work past the first response:
+
+1. The first chat uses K3's ordinary tokenizer.
+2. Only after its response bytes have been sent and flushed does the server
+   qualify the backend. It retains target-generation admission during this
+   short post-response step, so initialization cannot overlap a K3 pass.
+3. A separate chat-tokenizer gate spans the final response flush and
+   qualification. A client that submits its next turn immediately cannot slip
+   a baseline encode into the interval; it waits for qualification and then
+   receives the warm path. A qualification failure takes the exact baseline
+   instead.
+4. The backend is published only after all compatibility checks pass.
+
+`--gigatoken on` performs those checks synchronously and fails server startup
+if they do not pass. `--gigatoken off` never inspects or imports the package.
+`K3_SERVER_GIGATOKEN=auto|on|off` provides the equivalent startup setting.
+There is no tokenizer daemon, internal HTTP connection, runtime installer,
+download, or network access.
+
+Initialization, encoding and shutdown cross one native-call barrier. This
+prevents a queued request from using a stale backend after another request has
+disabled it and prevents native qualification from racing native encoding.
+Shutdown first marks the controller as closing; any in-flight native result is
+discarded rather than published afterward. Expected exceptions and PyO3
+panic-style non-control-flow `BaseException` failures discard native output
+and retain the baseline; process-control exceptions are not swallowed.
+
+### Qualification and artifact boundary
+
+Construction uses only the absolute local `k3-meta/tiktoken.model` rank file,
+the explicit `kimi` pretokenizer and K3's complete 256-entry special-token map.
+Before publication, the runtime checks:
+
+- the exact 0.10.0 package and a reviewed platform artifact;
+- the installed package-tree and native-library SHA-256, preventing a
+  same-version rebuild or `sys.path` shadow from silently taking over;
+- the complete special-token mapping and vocabulary size;
+- multilingual, Unicode, whitespace and special-policy canaries; and
+- `decode_single_token_bytes` for all 163,840 token IDs.
+
+The wheel archives themselves are SHA-256-pinned in `requirements.txt`, so pip
+cannot substitute a later artifact with the same version or fall back to the
+foreign source distribution. Reviewed wheels cover macOS arm64 and
+manylinux2014/glibc Linux on x86-64 and aarch64. The Linux packages were
+unpacked and statically audited, including their ELF architecture,
+dependencies, Python-file identity and RECORD hashes; physical performance was
+measured only on macOS arm64. Unsupported runtime artifacts fail to tiktoken in
+`auto` and fail closed in explicit `on`.
+
+Before timing, parity probes compared 559,513 output token IDs across growing
+multilingual chats, ordinary literal special spellings and the exact
+400k/25k boundaries. The following numbers isolate only the already-rendered,
+warm segment-encoding step on the reference M1 Max:
+
+| Fixture | Rendered chars | Segments | Tokens | K3 segment loop | Native batch | Speedup |
+|---|---:|---:|---:|---:|---:|---:|
+| Smallest server chat | 453 | 38 | 90 | 0.438 ms | 0.155 ms | 2.83× |
+| 100 completed turns + next user message | 124,086 | 3,650 | 38,009 | 67.225 ms | 9.735 ms | 6.91× |
+| 1,000 completed turns + next user message | 1,235,586 | 36,050 | 379,109 | 664.987 ms | 95.986 ms | 6.93× |
+
+The template has already built its segments before these timers start, and the
+one-time qualification is excluded. This is a modest once-per-request CPU
+saving, not a 6–7× model or tokens-per-second claim. Deltafin still creates a
+fresh target cache and fully prefills the supplied history on every API
+request; that much larger K3 work is unchanged. The path matters increasingly
+as clients resend longer histories, while a rolling target KV cache remains
+the more consequential future optimization.
+
+Implementation:
+[`tools/server_tokenizer.py`](tools/server_tokenizer.py),
+[`tools/serve_openai.py`](tools/serve_openai.py),
+[`tools/test_server_tokenizer.py`](tools/test_server_tokenizer.py), and
+[`tools/test_serve_openai.py`](tools/test_serve_openai.py).
+
+## Cross-tokenizer universal drafting
+
+**Status: Default when the pinned local assistants are installed on the
+measured MPS path; target-verified and forceable elsewhere, with target-only
+fallback.**
+
+The largest retained speedup comes from doing fewer K3 passes, not from making
+one K3 pass dramatically cheaper. The 53 GB int8 spine is read once per forward
+pass. If one pass can certify several output tokens, those tokens share the
+same spine sweep, expert scheduling and layer traversal.
+
+This deliberately spends roughly 4.63 GB of assistant residency—about 7.2% of
+the reference machine's memory—to avoid repeated sweeps of a roughly 53 GB
+target spine. It is the aggressive RAM-for-I/O trade that produced the largest
+retained gain. New installs pair a 0.6B/1.19 GB model with a 1.7B/3.44 GB model;
+either remains usable alone for older installations. The spine scan is shared
+across verifier positions, but expert traffic is not free: a multi-position
+pass reads the union selected by those positions. Wide drafts help only when
+accepted tokens outweigh that larger union and its batched compute.
+
+Deltafin uses the
+[0.6B](https://huggingface.co/Qwen/Qwen3-0.6B-Base) and
+[1.7B](https://huggingface.co/Qwen/Qwen3-1.7B-Base) base forms of Qwen3 as
+small local proposal models. This follows the broad idea of
+[universal assisted generation](https://huggingface.co/docs/transformers/assisted_decoding):
+the assistant and target do not need to share a tokenizer. The implementation
+is deliberately conservative:
+
+1. Decode the complete, already-certified K3 history to its canonical text and
+   require that K3 tokenizes it back to the identical token IDs.
+2. Ask the local assistant for a short greedy continuation. The first version
+   rebuilds its small context on each proposal rather than maintaining a
+   difficult cross-tokenizer KV boundary.
+3. Decode the assistant's complete text and tokenize it with K3. If the exact
+   K3 history is no longer a prefix, reject the proposal before touching the
+   target.
+4. Feed `[pending token, proposed K3 tokens...]` through the ordinary K3 model.
+   Only the longest target-matching prefix plus K3's own first
+   mismatch/bonus token may be emitted.
+5. Retain exactly one target-cache row per emitted token. The final emitted
+   token remains uncached as the next pending token. A fully accepted proposal
+   keeps its target state directly. A partial universal proposal restores the
+   pre-verifier snapshot and reruns only the certified narrow prefix; this
+   avoids retaining numerically different state from a wider failed batch.
+
+The assistant therefore cannot emit a token directly. A bad suggestion costs
+time, and a partial suggestion pays for a conservative narrow rerun before its
+state is committed. Proposal, verifier, rollback, EOS and output-budget
+failures restore the pristine target state before a T=1 fallback. A failure in
+optional post-verifier assistant bookkeeping keeps the tokens K3 already
+certified and disables later proposals instead of re-feeding the old pending
+token.
+
+### Request-local admission and width
+
+Wide verification is valuable only when drafts match. Each request starts with
+two tokens proposed by the inexpensive 0.6B model. A full two-of-two acceptance
+qualifies an eight-draft fast lane; a partial wide acceptance contracts the
+next width, and a miss returns to the probe width or target-only decoding. The
+hard ceiling is eight drafts, hence nine K3 input rows, because that is the
+measured/capability-tested packed-int8 range on the reference backend. The
+output budget can only lower the width.
+
+At a qualified wide position, both assistants generate independently. If their
+complete K3-tokenized proposals agree, that shared proposal is submitted. If
+they differ, the larger model is selected only when its weakest generated-token
+probability exceeds the smaller model's by more than 0.02; otherwise the 0.6B
+proposal wins. This is scheduling, not model arbitration: the selected text is
+still untrusted, and the full K3 pass still derives every emitted token. The
+pair exists because the 0.6B model proved stronger on the France admission and
+tail while the 1.7B model found the long planet continuation.
+
+For proposals wider than the two-draft admission probe, the assistant's own
+selected-token probabilities can shorten a proposal at the first value below
+0.30. The narrow probe is always verified directly: a confidence
+false-negative there can prevent a useful fast lane, while avoiding one T=3
+pass saves little. If a wide proposal is shortened to no K3 tokens, Deltafin
+runs one ordinary target token and tries the assistant again at the next
+position. It does not treat a low-confidence guess as a request failure or
+permanently discard a previously qualified width. The probability therefore
+controls only how much untrusted work K3 is asked to verify; it can never admit
+a token. This follows the useful principle behind dynamic speculation
+lookahead, applied conservatively around Deltafin's cross-tokenizer and
+exact-cache constraints.
+
+This policy is based on work per accepted token rather than a machine name.
+The assistant is selected automatically only when it is installed and the
+chosen device is MPS. CUDA and CPU remain forceable for measurement, but are
+not assumed to have the same crossover without end-to-end evidence.
+`K3_SPEC=0` is the master target-only parity control, and
+`K3_UAG_DRAFT=off` disables only the universal assistant.
+
+### Exact M1 Max result
+
+Three fresh-process runs on the maintainer's 64 GB M1 Max used the five-token
+prompt `The capital of France is` and checked all 17 expected output token IDs.
+Metadata-only setup first restored the pinned pristine Moonshot modeling files,
+so the campaign exercised the tracked runtime cache shim used by a fresh clone.
+No speculative pass was omitted as warm-up. In every run the assistant
+proposed 13 of the 16 post-prefill tokens, K3 accepted all 13, and the decode
+needed exactly three target passes:
+
+| Target pass | Drafts accepted | Tokens emitted |
+|---|---:|---:|
+| T=3 admission probe | 2 / 2 | 3 |
+| T=9 qualified pass | 8 / 8 | 9 |
+| T=4 bounded tail | 3 / 3 | 4 |
+
+The pooled median was **0.2660 token/s, or 3.76 seconds/token**. Individual
+runs ranged from 0.2640 to 0.2718 token/s (3.79 to 3.68 seconds/token). The
+assistant generated 19 tokens per run and took about 0.50 seconds total. This
+is a real exact-oracle completion result, but not a universal acceptance rate:
+unrelated prose, code and chat histories can accept fewer drafts and therefore
+run more slowly.
+
+A deliberately different prompt exposed that limitation. On
+`The largest planet in our solar system is`, the earlier 0.6B path accepted
+10/26 drafts and needed 10.515 seconds/token. A 1.7B-only confidence-gated path
+reached 4.770 and 4.692 seconds/token, but did worse on the France prompt.
+
+The final hybrid policy preserved both cases. On the planet prompt it rejected
+one uncertain wide proposal before target verification, accepted 12/12
+submitted drafts, and reached **4.682 seconds/token**. The four post-prefill
+passes emitted 3, 1, 9, and 3 tokens. A speculation-disabled K3 control took
+**12.530 seconds/token** and produced the identical 17 token IDs, a **2.68×**
+same-build improvement for that completion. On France, a fresh hybrid run
+accepted 13/13 submitted drafts, reproduced the established 17 IDs, and reached
+**3.826 seconds/token**. We report these as small robustness checks rather than
+as universal acceptance rates or speed guarantees.
+
+`tools/setup_draft.py` downloads only fixed file allowlists from two pinned
+official revisions, checks every SHA-256, and publishes each directory
+atomically. Runtime loading is local-only, safetensors-only, uses Transformers'
+built-in `qwen3` implementation, rejects `auto_map`, and sets
+`trust_remote_code=False`.
+
+Implementation:
+[`tools/universal_draft.py`](tools/universal_draft.py),
+[`tools/setup_draft.py`](tools/setup_draft.py),
+[`tools/kimi_run.py`](tools/kimi_run.py), and
+[`tools/spec_decode.py`](tools/spec_decode.py).
 
 ## Reference-only speculative snapshots
 
@@ -86,10 +381,11 @@ it fails, Deltafin materializes the dense head *before* releasing the packed
 representation, then uses the established dense calculation from that point
 onward.
 
-On the maintainer's M1 Max, balanced full-model runs measured **+17.3% median
-steady decode**, **+23.1% prefill**, and **+26.8% fresh-process wall
-throughput**. These numbers describe that MPS configuration, not CPU, CUDA, or
-every future PyTorch build.
+On the maintainer's M1 Max, a fresh six-vs-six balanced full-model rerun
+measured **+14.7% median steady decode**, **+2.3% prefill throughput**, and
+**+9.2% fresh-process wall throughput**. Every run matched the same exact
+three-token oracle. These numbers describe that MPS configuration, not CPU,
+CUDA, or every future PyTorch build.
 
 Implementation:
 [`tools/packed_q8.py`](tools/packed_q8.py) and
@@ -580,6 +876,57 @@ Implementation:
 [`tools/fast_moe_batch.py`](tools/fast_moe_batch.py), and
 [`tools/runtime_platform.py`](tools/runtime_platform.py).
 
+## Live CPU worker-width calibration
+
+**Status: Exact opt-in; default off pending quiet validation on more hosts.**
+
+A fixed native worker count is a poor universal rule for a bandwidth-bound
+MXFP4 kernel. Core types, memory channels, process affinity, container quotas,
+other traffic, and the particular CPU implementation can all move the
+crossover. `K3_GEMV_AUTOTUNE=1` lets the persistent CPU backend measure its
+first real, fully fetched top-16 expert set instead.
+
+The candidate widths come from the process's effective affinity and Linux
+cgroup quota, are capped by the native pool limit, and include the conservative
+default plus a few widths below and above it. Pool construction is outside the
+kernel score, and an unscored gate/up dispatch primes each newly rebuilt pool
+before timing. Two reversed trials then time the existing gate/up and down
+GEMV phases, and every candidate's fp32 phase output must be bit-identical.
+The winner must be the same in both trials and beat the configured default by
+at least 5% in each. The finally installed winning pool is primed and checked
+once more before it is published for later layers.
+
+The calibration is deliberately narrow:
+
+- an explicit `K3_GEMV_THREADS` always wins;
+- Metal and CUDA never enter it, including CUDA's emergency CPU replay;
+- unknown or high host load, an unsupported shape, a pool-width mismatch,
+  output drift, disagreement, insufficient margin, exception, or the
+  cooperative 350 ms deadline retains the configured default (or the positive
+  worker count the native pool actually created if that default is no longer
+  available); and
+- the result is process-local. It is not copied from an M1 to an M5, from ARM
+  to x86, or into another process. If affinity or a cgroup limit changes after
+  startup, restart the process or use an explicit `K3_GEMV_THREADS`.
+
+The final measured phase-B output is already the exact first-call result, so a
+successful calibration does not replay the GEMV merely to install its winner.
+The deadline includes installing the winning pool; a failure may still require
+one cooperative fallback rebuild before normal inference resumes.
+
+Existing exploratory real-expert campaigns repeatedly selected eight or ten
+workers instead of four and found sizeable held-out layer gains. A current-code
+campaign selected eight and produced a 1.240x held-out geometric mean with all
+outputs exact, but normalized host load reached 1.108 against the 0.40 gate.
+Those numbers motivate the opt-in; they are not an accepted tokens-per-second
+claim. The default stays off until a complete run remains quiet and Linux
+x86-64, Linux aarch64, and newer Apple hardware receive the same treatment.
+
+Implementation:
+[`tools/fast_moe_batch.py`](tools/fast_moe_batch.py),
+[`tools/runtime_platform.py`](tools/runtime_platform.py), and
+[`tools/test_python_portability.py`](tools/test_python_portability.py).
+
 ## Packed spine reads and Metal dequantization
 
 **Status: Packed reads are default; the custom dequantizer is
@@ -715,14 +1062,15 @@ Implementation:
 
 ## Lossless n-gram speculative decoding
 
-**Status: Default, exact-token gated.**
+**Status: Default zero-model fallback, exact-token gated.**
 
 Deltafin searches the generated token history for the longest matching suffix
 and uses the following historical token as a free draft. A two-position
 forward pass verifies that draft with K3 itself. If it matches, the pass emits
-the draft and the next verified token. If it does not, the reference-only
-snapshot restores the pre-pass state and the runtime performs the ordinary
-one-token step.
+the draft and the next verified token. If it does not, the shared exact
+verifier replays the captured KDA inputs for the one committed position and
+truncates MLA to the same boundary. The whole-reference restore plus narrow
+rerun remains the conservative alternative.
 
 This is especially useful in Deltafin because one forward pass rereads the
 resident spine once. A verified T=2 pass can share that fixed work across two
@@ -731,8 +1079,8 @@ the union of experts selected by both positions.
 
 Every emitted token is chosen by K3's greedy verifier. Rollback tests poison
 drafts deliberately, restore each cache family, and compare future logits and
-tokens. Deeper drafts and recurrence-input replay are available separately;
-their batch/union crossover is not assumed from the default T=2 path.
+tokens. Deeper n-gram drafts remain forceable, but their batch/union crossover
+is not inferred from the successful universal-assistant result.
 
 Implementation:
 [`tools/kimi_run.py`](tools/kimi_run.py),
@@ -795,12 +1143,27 @@ headline:
 - A successful two-position speculative verification transfers both argmax
   IDs to the host together. This avoids a second accelerator synchronization
   before emitting the already-verified next token.
+- The common local one-token embedding lookup uses positional vector I/O to
+  fill the final mutable `torch.frombuffer` owner directly. On macOS and Linux
+  this avoids an intermediate immutable allocation and one 14,336-byte
+  userspace copy. Multi-token/coalesced reads, remote rows, unsupported
+  platforms, partial reads, and errors retain exact guarded paths.
+- Speculative decoding keeps one private prompt-plus-output history instead of
+  rebuilding `ids + generated` on every pass. Non-speculative requests create
+  no history copy. The prefetch setting is snapshotted once before decode, and
+  the default threaded-`pread` path skips a whole-token prefetch helper that is
+  guaranteed to return immediately.
+- When no step logger is requested, generation skips both the per-pass clock
+  read and cumulative-token snapshot. The API server also installs no token
+  callback for non-streaming requests, and streaming keeps only the
+  incremental decoder state rather than an unused second token list.
 
 These changes remove host overhead and allocation noise; they do not carry
 separate tokens-per-second claims.
 
 Implementation:
 [`tools/kimi_run.py`](tools/kimi_run.py),
+[`tools/serve_openai.py`](tools/serve_openai.py),
 [`tools/fetch_v2.py`](tools/fetch_v2.py), and
 [`tools/fast_moe_batch.py`](tools/fast_moe_batch.py).
 

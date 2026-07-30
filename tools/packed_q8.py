@@ -144,10 +144,12 @@ def _parse_max_tokens(
         if parsed <= 0:
             raise ValueError("packed-q8 max tokens must be positive")
         return parsed
-    # Measured safe ranges, not architecture claims.  CPU is opt-in and stays
+    # Measured safe ranges, not architecture claims. CPU is opt-in and stays
     # conservative because the raw GEMV wins decisively at T=1, at T=2 only
     # with multiple worker threads, and can lose to an already-resident dense
-    # GEMM at larger T.  MPS remained ahead through the measured T=9 ceiling.
+    # GEMM at larger T. MPS remained ahead through the exact-sequence-tested
+    # T=9 ceiling. A T=13 whole-model probe changed a greedy token even though
+    # its isolated packed-head argmax probe passed, so wider batches stay out.
     if device_type == "cpu":
         return 2 if torch_threads >= 2 else 1
     if device_type == "mps":

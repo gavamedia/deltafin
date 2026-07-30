@@ -229,13 +229,19 @@ def test_grouped_order_lifetime_and_failure():
     take, made = fake_take_factory(calls, fail_eids={12})
     reader._take = take
     reader._retire = lambda slots: retired.extend(slots)
+    old_raw_file_valid = fetch_v2._raw_file_valid
+    fetch_v2._raw_file_valid = lambda layer, eid: layer == 49 and eid == 12
     try:
         try:
             list(reader.read_layer_groups(49, [11, 12, 13, 14], 1))
-        except fetch_v2.GroupReadError as exc:
+        except fetch_v2.LocalExpertReadError as exc:
             check("failure names exact expert", "L49-E12" in str(exc))
+            check("valid local failure is fail-closed",
+                  "refusing HTTP fallback" in str(exc))
         else:
-            raise AssertionError("ring read failure must become GroupReadError")
+            raise AssertionError(
+                "valid local ring failure must fail closed"
+            )
         check("all failure-path slots retired", retired == made)
         check("failed ring job recorded",
               fetch_v2.stats["pread_ring_failures"] - before_failures == 1)
@@ -243,6 +249,7 @@ def test_grouped_order_lifetime_and_failure():
               set(calls).issubset({11, 12, 13, 14})
               and {11, 12}.issubset(calls))
     finally:
+        fetch_v2._raw_file_valid = old_raw_file_valid
         reader.shutdown()
 
 

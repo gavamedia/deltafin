@@ -7,6 +7,8 @@
 # Every resident conversion starts with this prefix (int4/int8/i6/mixed/etc.).
 # Keep the wildcard rooted so an unrelated nested source directory cannot match.
 /k3-resident*/
+/k3-draft*/
+/.k3-draft*/
 /k3-experts/
 /k3-model/
 /k3-cache*/
@@ -70,6 +72,7 @@ tools/libmxfp4gemv.dylib
 
 # --- environments & tooling ---------------------------------
 venv/
+.venv/
 __pycache__/
 *.pyc
 .claude/

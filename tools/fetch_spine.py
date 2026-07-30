@@ -1,22 +1,52 @@
 #!/usr/bin/env python3
 """Download Kimi-K3's resident (non-routed-expert) tensors via HTTP Range requests.
 Writes one raw .bin per tensor under k3-resident/tensors/ (name = tensor name).
-Resumable: existing files with the right size are skipped."""
-import json, os, sys, time, urllib.request, concurrent.futures, threading
+Resumable: existing regular files with the right size are skipped."""
+import concurrent.futures
+import os
+import stat
+import tempfile
+import threading
+import time
+import urllib.request
 
-BASE = "https://huggingface.co/moonshotai/Kimi-K3/resolve/main/"
+try:
+    import model_source
+except ImportError:  # imported as tools.fetch_spine
+    from . import model_source
+try:
+    import inventory_meta
+except ImportError:  # imported as tools.fetch_spine
+    from . import inventory_meta
+
+BASE = model_source.base_url()
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-INV = json.load(open(os.path.join(ROOT, "k3-meta/tensor_inventory_offsets.json")))
+INV = inventory_meta.load_verified_inventory(os.path.join(ROOT, "k3-meta"))
 OUT = os.path.join(ROOT, "k3-resident/tensors")
 os.makedirs(OUT, exist_ok=True)
+
+
+def _existing_tensor_complete(path, expected_size):
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(info.st_mode):
+        raise RuntimeError(f"refusing tensor destination symlink: {path}")
+    if not stat.S_ISREG(info.st_mode):
+        raise RuntimeError(
+            f"refusing non-regular tensor destination: {path}"
+        )
+    return info.st_size == expected_size
+
 
 work = []
 for name, t in INV.items():
     if ".experts." in name:
         continue
     size = t["offsets"][1] - t["offsets"][0]
-    path = os.path.join(OUT, name)
-    if os.path.exists(path) and os.path.getsize(path) == size:
+    path = inventory_meta.safe_tensor_output_path(OUT, name)
+    if _existing_tensor_complete(path, size):
         continue
     work.append((name, t, size, path))
 work.sort(key=lambda w: (w[1]["shard"], w[1]["offsets"][0]))
@@ -32,24 +62,56 @@ def fetch(item):
     name, t, size, path = item
     start = 8 + t["hlen"] + t["offsets"][0]
     req = urllib.request.Request(BASE + t["shard"],
-                                 headers={"Range": f"bytes={start}-{start+size-1}"})
+                                 headers={
+                                     "Range": f"bytes={start}-{start+size-1}",
+                                     "User-Agent": "deltafin-setup",
+                                 })
     for attempt in range(6):
+        fd = -1
+        temporary = ""
         try:
-            with urllib.request.urlopen(req, timeout=120) as r, open(path + ".part", "wb") as f:
-                while True:
-                    chunk = r.read(1 << 22)
+            fd, temporary = tempfile.mkstemp(
+                prefix=".tensor.",
+                suffix=".part",
+                dir=OUT,
+            )
+            received = 0
+            with (
+                urllib.request.urlopen(req, timeout=120) as response,
+                os.fdopen(fd, "wb") as target,
+            ):
+                fd = -1
+                while received < size:
+                    chunk = response.read(min(1 << 22, size - received))
                     if not chunk:
                         break
-                    f.write(chunk)
-            if os.path.getsize(path + ".part") != size:
-                raise IOError("short read")
-            os.replace(path + ".part", path)
+                    target.write(chunk)
+                    received += len(chunk)
+                if received == size and response.read(1):
+                    raise IOError("range response exceeded requested size")
+            if received != size:
+                raise IOError(
+                    f"short read: received {received} of {size} bytes"
+                )
+            os.replace(temporary, path)
+            temporary = ""
             with lock:
                 done_b += size
             return
         except Exception as e:
+            if attempt == 5:
+                raise RuntimeError(
+                    f"FAILED {name} after 6 attempts: {e}"
+                ) from e
             time.sleep(2 * (attempt + 1))
-    print(f"FAILED {name}: giving up", flush=True)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            if temporary:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
 
 with concurrent.futures.ThreadPoolExecutor(10) as ex:
     futs = [ex.submit(fetch, w) for w in work]

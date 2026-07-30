@@ -261,6 +261,7 @@ def _is_preserved_data_path(raw_path: str) -> bool:
     if (
         root in _PRESERVED_ROOTS
         or root.startswith("k3-resident")
+        or root.startswith("k3-draft")
         or root.startswith("k3-cache")
         or root.startswith("k3-experts")
         or root.startswith("k3-model")

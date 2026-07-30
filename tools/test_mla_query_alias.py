@@ -441,28 +441,31 @@ assert attn_fast._MLA_QUERY_ALIAS_REASON == (
                 )
                 self.assertFalse(same_storage(query, raw))
 
-        training = module().train()
-        source = hidden(1, 1, 1910).requires_grad_(True)
-        with capture_query_and_projection(training) as captured:
-            output = training(source)
-        raw = captured["raw"][0]
-        query = captured["query"][0]
-        self.assertFalse(same_storage(query, raw))
-        output.sum().backward()
-        self.assertIsNotNone(source.grad)
-        self.assertTrue(torch.isfinite(source.grad).all())
+        # kimi_run intentionally disables global grad tracking at import.
+        # Keep this fallback contract independent of test/import ordering.
+        with torch.enable_grad():
+            training = module().train()
+            source = hidden(1, 1, 1910).requires_grad_(True)
+            with capture_query_and_projection(training) as captured:
+                output = training(source)
+            raw = captured["raw"][0]
+            query = captured["query"][0]
+            self.assertFalse(same_storage(query, raw))
+            output.sum().backward()
+            self.assertIsNotNone(source.grad)
+            self.assertTrue(torch.isfinite(source.grad).all())
 
-        eval_grad = module().eval()
-        source = hidden(1, 1, 1911).requires_grad_(True)
-        with capture_query_and_projection(eval_grad) as captured:
-            output = eval_grad(source)
-        self.assertFalse(same_storage(
-            captured["query"][0],
-            captured["raw"][0],
-        ))
-        output.sum().backward()
-        self.assertIsNotNone(source.grad)
-        self.assertTrue(torch.isfinite(source.grad).all())
+            eval_grad = module().eval()
+            source = hidden(1, 1, 1911).requires_grad_(True)
+            with capture_query_and_projection(eval_grad) as captured:
+                output = eval_grad(source)
+            self.assertFalse(same_storage(
+                captured["query"][0],
+                captured["raw"][0],
+            ))
+            output.sum().backward()
+            self.assertIsNotNone(source.grad)
+            self.assertTrue(torch.isfinite(source.grad).all())
 
         provider_name = "k3_alias_mutating_provider_fixture"
         provider_query = []

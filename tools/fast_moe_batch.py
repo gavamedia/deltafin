@@ -20,6 +20,7 @@ import ctypes
 import os
 import platform
 import threading
+import time
 
 import numpy as np
 import torch
@@ -27,15 +28,21 @@ import torch
 try:
     import routing_record as routing_records
     from runtime_platform import (
+        available_cpu_count,
+        choose_gemv_autotune_width,
         configured_cpu_workers,
         default_gemv_threads,
+        gemv_autotune_candidates,
         load_native_library,
     )
 except ImportError:  # imported as tools.fast_moe_batch instead of top-level
     from . import routing_record as routing_records
     from .runtime_platform import (
+        available_cpu_count,
+        choose_gemv_autotune_width,
         configured_cpu_workers,
         default_gemv_threads,
+        gemv_autotune_candidates,
         load_native_library,
     )
 
@@ -88,6 +95,13 @@ SITU_BETA, SITU_LINEAR_BETA = 4.0, 25.0
 
 _POOL_READY = False
 _CALL_LOCK = threading.RLock()
+_ACTIVE_THREADS = THREADS
+_AUTOTUNE_STATE = "unconfigured"
+_AUTOTUNE_REASON = "runner has not selected the CPU MoE backend"
+_AUTOTUNE_RESULT = {}
+_AUTOTUNE_LOAD_LIMIT = 0.40
+_AUTOTUNE_DEADLINE_NS = 350_000_000
+_AUTOTUNE_MIN_SPEEDUP = 1.05
 
 
 def native_isa():
@@ -102,11 +116,81 @@ def native_isa():
     return machine or "unknown"
 
 
+def _requested_autotune():
+    value = os.environ.get("K3_GEMV_AUTOTUNE", "0").strip().lower()
+    if value in ("0", "off", "false", "no", ""):
+        return False
+    if value in ("1", "on", "true", "yes"):
+        return True
+    raise ValueError(
+        "K3_GEMV_AUTOTUNE must be 0/1, off/on, false/true, or no/yes"
+    )
+
+
+def configure_autotune(cpu_batch_backend):
+    """Arm C23 only when the persistent CPU backend is the selected backend.
+
+    The runner calls this after resolving CPU/Metal/CUDA. An emergency CPU
+    replay after a CUDA failure deliberately keeps the conservative configured
+    width rather than adding calibration work to an error-recovery path.
+    """
+    global _ACTIVE_THREADS, _AUTOTUNE_STATE, _AUTOTUNE_REASON
+    global _AUTOTUNE_RESULT
+    with _CALL_LOCK:
+        try:
+            observed_threads = int(pool_threads())
+        except (TypeError, ValueError, RuntimeError):
+            observed_threads = 0
+        _ACTIVE_THREADS = (
+            observed_threads if observed_threads > 0 else THREADS
+        )
+        _AUTOTUNE_RESULT = {}
+        if "K3_GEMV_THREADS" in os.environ:
+            _AUTOTUNE_STATE = "disabled"
+            _AUTOTUNE_REASON = "K3_GEMV_THREADS is explicit"
+        elif not cpu_batch_backend:
+            _AUTOTUNE_STATE = "disabled"
+            _AUTOTUNE_REASON = "persistent CPU MoE is not the selected backend"
+        elif not _requested_autotune():
+            _AUTOTUNE_STATE = "disabled"
+            _AUTOTUNE_REASON = "K3_GEMV_AUTOTUNE is off"
+        elif observed_threads > 0 and observed_threads != THREADS:
+            _AUTOTUNE_STATE = "disabled"
+            _AUTOTUNE_REASON = (
+                f"configured pool requested {THREADS} workers but created "
+                f"{observed_threads}"
+            )
+        else:
+            _AUTOTUNE_STATE = "pending"
+            _AUTOTUNE_REASON = "waiting for the first complete top-16 expert set"
+        return autotune_status()
+
+
+def autotune_status():
+    with _CALL_LOCK:
+        return {
+            "state": _AUTOTUNE_STATE,
+            "reason": _AUTOTUNE_REASON,
+            "configured_threads": THREADS,
+            "active_threads": _ACTIVE_THREADS,
+            **_AUTOTUNE_RESULT,
+        }
+
+
+def _normalized_load():
+    try:
+        return os.getloadavg()[0] / available_cpu_count()
+    except (AttributeError, OSError):
+        return None
+
+
 def pool_init(nthreads=None):
     """Create the persistent worker pool up front (otherwise done lazily in C)."""
     global _POOL_READY
     with _CALL_LOCK:
-        n = _LIB.mxfp4_pool_init(THREADS if nthreads is None else nthreads)
+        n = _LIB.mxfp4_pool_init(
+            _ACTIVE_THREADS if nthreads is None else nthreads
+        )
         _POOL_READY = True
         return n
 
@@ -175,7 +259,7 @@ def gemv_batch(mats, nthreads=None):
             cols[i] = p.shape[1] * 2
         _LIB.mxfp4_gemv_batch(
             pp, sp, xp, yp, rows, cols, n,
-            THREADS if nthreads is None else nthreads,
+            _ACTIVE_THREADS if nthreads is None else nthreads,
         )
 
 
@@ -212,10 +296,26 @@ def _situ_inplace(gate, up, scratch):
 
 
 # --------------------------------------------------------------- expert set (bit-exact)
-def expert_set_ffn(raws, x, nthreads=None):
-    """raws: list of {w1|w2|w3: (packed, scale)}; x: fp32 [d_model] contiguous.
-    Returns fp32 [n_ex, d_model] — row e is expert raws[e] applied to x.
-    Two dispatches total, regardless of how many experts are in the set."""
+def _phase_a(raws, x, gu, nthreads):
+    mats = []
+    for e, raw in enumerate(raws):
+        packed1, scales1 = raw["w1"]
+        packed3, scales3 = raw["w3"]
+        mats.append((packed1, scales1, x, gu[0, e]))
+        mats.append((packed3, scales3, x, gu[1, e]))
+    gemv_batch(mats, nthreads)
+
+
+def _phase_b(raws, h, yb, nthreads):
+    mats = []
+    for e, raw in enumerate(raws):
+        packed2, scales2 = raw["w2"]
+        mats.append((packed2, scales2, h[e], yb[e]))
+    gemv_batch(mats, nthreads)
+
+
+def _expert_set_ffn_fixed(raws, x, nthreads):
+    """Established two-dispatch path at one explicit or active width."""
     ne = len(raws)
     if ne == 0:
         return np.zeros((0, x.shape[0]), dtype=np.float32)
@@ -225,13 +325,7 @@ def expert_set_ffn(raws, x, nthreads=None):
     # [2, ne, d_ff]: all gates contiguous, all ups contiguous, so the numpy activation
     # takes the same contiguous SIMD path fast_moe._situ does (bit-exactness).
     gu = np.empty((2, ne, d_ff), dtype=np.float32)
-    mats = []
-    for e, r in enumerate(raws):
-        p1, s1 = r["w1"]
-        p3, s3 = r["w3"]
-        mats.append((p1, s1, x, gu[0, e]))
-        mats.append((p3, s3, x, gu[1, e]))
-    gemv_batch(mats, nthreads)
+    _phase_a(raws, x, gu, nthreads)
 
     # Allocate the phase-B destination before activation.  K3's d_model is
     # wider than d_ff, so its unused prefix is a contiguous activation
@@ -245,12 +339,378 @@ def expert_set_ffn(raws, x, nthreads=None):
         scratch = np.empty_like(gate)
     h = _situ_inplace(gate, gu[1], scratch)
 
-    mats = []
-    for e, r in enumerate(raws):
-        p2, s2 = r["w2"]
-        mats.append((p2, s2, h[e], yb[e]))
-    gemv_batch(mats, nthreads)
+    _phase_b(raws, h, yb, nthreads)
     return yb
+
+
+def _autotune_eligible(raws, x):
+    """Restrict calibration to the actual complete K3 top-16 CPU shape."""
+    if (
+        len(raws) != 16
+        or not isinstance(x, np.ndarray)
+        or x.dtype != np.float32
+        or x.ndim != 1
+        or not x.flags.c_contiguous
+    ):
+        return False
+    d_model = x.shape[0]
+    try:
+        d_ff = raws[0]["w1"][0].shape[0]
+        if (
+            d_model != 3584
+            or d_ff != 3072
+            or raws[0]["w2"][0].shape[0] != d_model
+        ):
+            return False
+        owners = set()
+        for raw in raws:
+            p1, _s1 = raw["w1"]
+            p2, _s2 = raw["w2"]
+            p3, _s3 = raw["w3"]
+            if (
+                p1.shape != (d_ff, d_model // 2)
+                or p2.shape != (d_model, d_ff // 2)
+                or p3.shape != (d_ff, d_model // 2)
+            ):
+                return False
+            owners.add(_addr(p1))
+        return len(owners) == len(raws)
+    except (KeyError, TypeError, AttributeError):
+        return False
+
+
+def _report_autotune(message):
+    print(f"[cpu-moe] GEMV autotune {message}", flush=True)
+
+
+def _restore_configured_threads():
+    global _ACTIVE_THREADS
+    actual = None
+    try:
+        actual = int(pool_init(THREADS))
+    except Exception:
+        # Never adopt the last candidate merely because it still appears in
+        # pool_threads(): it may be the width whose output just drifted. Tear
+        # the ring down and qualify the safest possible request instead.
+        try:
+            pool_shutdown()
+        except Exception:
+            pass
+        try:
+            actual = int(pool_init(1))
+        except Exception:
+            actual = None
+    # A short positive pool is still a valid exact backend. Retain what was
+    # actually created instead of requesting the unattainable width on every
+    # later dispatch and repeatedly tearing the pool down. If construction
+    # failed or created no workers, requesting one later makes the C backend
+    # retry and otherwise use its exact inline fallback.
+    _ACTIVE_THREADS = actual if actual is not None and actual > 0 else 1
+    return actual
+
+
+def _disable_autotune(reason, *, result=None, report=True):
+    global _AUTOTUNE_STATE, _AUTOTUNE_REASON, _AUTOTUNE_RESULT
+    _AUTOTUNE_STATE = "disabled"
+    _AUTOTUNE_REASON = reason
+    _AUTOTUNE_RESULT = {} if result is None else result
+    restored_threads = _restore_configured_threads()
+    restored = restored_threads == THREADS
+    if not restored:
+        _AUTOTUNE_RESULT = {
+            **_AUTOTUNE_RESULT,
+            "configured_pool_restore_succeeded": False,
+            "restored_pool_threads": restored_threads,
+        }
+    if report:
+        if restored:
+            suffix = f"using {THREADS} workers"
+        elif restored_threads is not None and restored_threads > 0:
+            suffix = (
+                f"configured width unavailable; using the actual "
+                f"{restored_threads}-worker pool"
+            )
+        else:
+            suffix = (
+                "worker creation unavailable; next dispatch will request the "
+                "exact one-worker/inline fallback"
+            )
+        _report_autotune(f"skipped ({reason}); {suffix}")
+
+
+def _maybe_autotune_expert_set(raws, x):
+    """Run the bounded C23 selector once and return its exact first output."""
+    global _ACTIVE_THREADS, _AUTOTUNE_STATE, _AUTOTUNE_REASON
+    global _AUTOTUNE_RESULT
+    if _AUTOTUNE_STATE != "pending":
+        return None
+    if not _autotune_eligible(raws, x):
+        with _CALL_LOCK:
+            if _AUTOTUNE_STATE == "pending":
+                _disable_autotune(
+                    "first CPU expert set is not the distinct top-16 K3 shape"
+                )
+        return None
+
+    # Hold the same reentrant lock used by every dispatch and pool rebuild.
+    # ctypes releases the GIL, so the outer lock is what makes the complete
+    # multi-width transaction invisible to another inference caller.
+    with _CALL_LOCK:
+        if _AUTOTUNE_STATE != "pending":
+            return None
+        try:
+            load_before = _normalized_load()
+        except Exception as exc:
+            _disable_autotune(f"{type(exc).__name__}: {exc}")
+            return None
+        if load_before is None or load_before > _AUTOTUNE_LOAD_LIMIT:
+            _disable_autotune(
+                "host load is unknown or above "
+                f"{_AUTOTUNE_LOAD_LIMIT:.2f} per effective CPU",
+                result={"normalized_load_before": load_before},
+            )
+            return None
+
+        configured = THREADS
+        try:
+            effective = available_cpu_count()
+            candidates = gemv_autotune_candidates(effective, configured)
+        except Exception as exc:
+            _disable_autotune(
+                f"{type(exc).__name__}: {exc}",
+                result={"normalized_load_before": load_before},
+            )
+            return None
+        if configured not in candidates:
+            _disable_autotune(
+                "effective CPU ceiling changed after startup; restart the "
+                "process or set K3_GEMV_THREADS explicitly",
+                result={
+                    "effective_cpus": effective,
+                    "candidates": list(candidates),
+                    "normalized_load_before": load_before,
+                },
+            )
+            return None
+        if len(candidates) < 2:
+            _disable_autotune(
+                "no alternative worker width is available",
+                result={
+                    "effective_cpus": effective,
+                    "candidates": list(candidates),
+                },
+            )
+            return None
+
+        _AUTOTUNE_STATE = "running"
+        _AUTOTUNE_REASON = "calibration in progress"
+        started = time.perf_counter_ns()
+        samples = {width: [] for width in candidates}
+        phase_a_samples = {width: [] for width in candidates}
+        phase_b_samples = {width: [] for width in candidates}
+        reference_output = None
+
+        try:
+            ne = len(raws)
+            d_ff = raws[0]["w1"][0].shape[0]
+            d_model = raws[0]["w2"][0].shape[0]
+            gu = np.empty((2, ne, d_ff), dtype=np.float32)
+            yb = np.empty((ne, d_model), dtype=np.float32)
+        except Exception as exc:
+            _disable_autotune(
+                f"{type(exc).__name__}: {exc}",
+                result={
+                    "effective_cpus": effective,
+                    "candidates": list(candidates),
+                    "normalized_load_before": load_before,
+                },
+            )
+            return None
+
+        def run_pair(width, reference_gu, reference_yb, h):
+            actual = pool_init(width)
+            if actual != width:
+                raise RuntimeError(
+                    f"requested {width} workers, native pool created {actual}"
+                )
+
+            # Rebuilding the persistent pool changes first-dispatch latency.
+            # Prime it once outside the score so widths are compared in the
+            # steady state in which the selected pool will actually run.
+            _phase_a(raws, x, gu, width)
+            if reference_gu is None:
+                warm_gu = gu.view(np.uint32).copy()
+                scratch = np.empty_like(gu[0])
+                h = _situ_inplace(gu[0], gu[1], scratch).copy()
+            elif not np.array_equal(gu.view(np.uint32), reference_gu):
+                raise RuntimeError(
+                    f"phase-A output differs at {width} workers during warm-up"
+                )
+
+            phase_started = time.perf_counter_ns()
+            _phase_a(raws, x, gu, width)
+            phase_a_ns = time.perf_counter_ns() - phase_started
+            expected_gu = warm_gu if reference_gu is None else reference_gu
+            if not np.array_equal(gu.view(np.uint32), expected_gu):
+                raise RuntimeError(
+                    f"phase-A output differs at {width} workers"
+                )
+            phase_a_bits = (
+                gu.view(np.uint32).copy()
+                if reference_gu is None else None
+            )
+            phase_started = time.perf_counter_ns()
+            _phase_b(raws, h, yb, width)
+            phase_b_ns = time.perf_counter_ns() - phase_started
+            if reference_yb is not None and not np.array_equal(
+                yb.view(np.uint32), reference_yb
+            ):
+                raise RuntimeError(
+                    f"phase-B output differs at {width} workers"
+                )
+            return phase_a_ns, phase_b_ns, h, phase_a_bits
+
+        try:
+            # The configured-width call is both the exact fallback/reference
+            # and trial zero's required default sample.
+            phase_a_ns, phase_b_ns, h, reference_gu = run_pair(
+                configured, None, None, None
+            )
+            reference_yb = yb.view(np.uint32).copy()
+            reference_output = yb.copy()
+            phase_a_samples[configured].append(phase_a_ns)
+            phase_b_samples[configured].append(phase_b_ns)
+            samples[configured].append(phase_a_ns + phase_b_ns)
+
+            base = list(candidates)
+            pivot = base.index(configured)
+            base = base[pivot:] + base[:pivot]
+            orders = (base[1:], list(reversed(base)))
+            for order in orders:
+                for width in order:
+                    if time.perf_counter_ns() - started > _AUTOTUNE_DEADLINE_NS:
+                        raise TimeoutError(
+                            f"{_AUTOTUNE_DEADLINE_NS / 1e6:.0f} ms "
+                            "cooperative calibration deadline expired"
+                        )
+                    phase_a_ns, phase_b_ns, _same_h, _phase_a_bits = run_pair(
+                        width, reference_gu, reference_yb, h
+                    )
+                    phase_a_samples[width].append(phase_a_ns)
+                    phase_b_samples[width].append(phase_b_ns)
+                    samples[width].append(phase_a_ns + phase_b_ns)
+
+            winner, reason = choose_gemv_autotune_width(
+                samples,
+                configured,
+                minimum_speedup=_AUTOTUNE_MIN_SPEEDUP,
+            )
+            if winner is not None:
+                actual = pool_init(winner)
+                if actual != winner:
+                    raise RuntimeError(
+                        f"winning pool requested {winner}, created {actual}"
+                    )
+                # Installation can rebuild the ring once more. Prime and
+                # qualify that exact physical pool before publishing it for
+                # the next layer; this dispatch is charged to the deadline.
+                _phase_a(raws, x, gu, winner)
+                if not np.array_equal(gu.view(np.uint32), reference_gu):
+                    raise RuntimeError(
+                        "phase-A output differs after installing winning "
+                        f"{winner}-worker pool"
+                    )
+
+            load_after = _normalized_load()
+            elapsed_ns = time.perf_counter_ns() - started
+            if elapsed_ns > _AUTOTUNE_DEADLINE_NS:
+                raise TimeoutError(
+                    f"{_AUTOTUNE_DEADLINE_NS / 1e6:.0f} ms cooperative "
+                    "calibration deadline expired"
+                )
+            if load_after is None or load_after > _AUTOTUNE_LOAD_LIMIT:
+                raise RuntimeError(
+                    "post-calibration host load is unknown or above "
+                    f"{_AUTOTUNE_LOAD_LIMIT:.2f} per effective CPU"
+                )
+
+            result = {
+                "effective_cpus": effective,
+                "candidates": list(candidates),
+                "samples_ms": {
+                    str(width): [value / 1e6 for value in values]
+                    for width, values in samples.items()
+                },
+                "phase_a_samples_ms": {
+                    str(width): [value / 1e6 for value in values]
+                    for width, values in phase_a_samples.items()
+                },
+                "phase_b_samples_ms": {
+                    str(width): [value / 1e6 for value in values]
+                    for width, values in phase_b_samples.items()
+                },
+                "normalized_load_before": load_before,
+                "normalized_load_after": load_after,
+                "calibration_wall_ms": elapsed_ns / 1e6,
+                "all_outputs_bit_exact": True,
+                "winner_install_phase_a_bit_exact": winner is not None,
+            }
+            if winner is None:
+                _disable_autotune(reason, result=result)
+                return reference_output
+
+            _ACTIVE_THREADS = winner
+            _AUTOTUNE_STATE = "selected"
+            _AUTOTUNE_REASON = reason
+            _AUTOTUNE_RESULT = {
+                **result,
+                "selected_threads": winner,
+                "trial_speedups_vs_configured": [
+                    samples[configured][trial] / samples[winner][trial]
+                    for trial in range(len(samples[winner]))
+                ],
+            }
+            if winner == configured:
+                _report_autotune(
+                    f"kept {configured} workers ({reason}, "
+                    f"{elapsed_ns / 1e6:.1f} ms)"
+                )
+            else:
+                speedups = _AUTOTUNE_RESULT[
+                    "trial_speedups_vs_configured"
+                ]
+                _report_autotune(
+                    f"selected {winner} workers over {configured} "
+                    f"({speedups[0]:.3f}x/{speedups[1]:.3f}x, "
+                    f"{elapsed_ns / 1e6:.1f} ms)"
+                )
+            # The last phase-B trial is bit-identical to reference_yb, so it is
+            # the real first-call result; no final GEMV replay is needed.
+            return yb
+        except Exception as exc:
+            _disable_autotune(
+                f"{type(exc).__name__}: {exc}",
+                result={
+                    "effective_cpus": effective,
+                    "candidates": list(candidates),
+                    "normalized_load_before": load_before,
+                    "calibration_wall_ms": (
+                        time.perf_counter_ns() - started
+                    ) / 1e6,
+                },
+            )
+            return reference_output
+
+
+def expert_set_ffn(raws, x, nthreads=None):
+    """raws: list of {w1|w2|w3: (packed, scale)}; x: fp32 [d_model] contiguous.
+    Returns fp32 [n_ex, d_model] — row e is expert raws[e] applied to x.
+    Two dispatches total, regardless of how many experts are in the set."""
+    if nthreads is None:
+        tuned = _maybe_autotune_expert_set(raws, x)
+        if tuned is not None:
+            return tuned
+    return _expert_set_ffn_fixed(raws, x, nthreads)
 
 
 def expert_ffn(raw, x, nthreads=None):
@@ -296,7 +756,6 @@ def moe_infer_fused(
     out = np.zeros((N, d_model), dtype=np.float32)
     ids, ws = routing_records.resolve(
         topk_ids, topk_weight, routing_record)
-    nt = THREADS if nthreads is None else nthreads
     for t in range(N):
         xt = np.ascontiguousarray(xnp[t])
         sel = ids[t]
@@ -314,6 +773,7 @@ def moe_infer_fused(
         wts = np.ascontiguousarray(ws[t], dtype=np.float32)
         yt = np.empty(d_model, dtype=np.float32)
         with _CALL_LOCK:
+            nt = _ACTIVE_THREADS if nthreads is None else nthreads
             _LIB.mxfp4_moe_expert_set(
                 p13, s13, p2, s2, xt, wts,
                 ne, d_ff, d_model, None, yt, nt,

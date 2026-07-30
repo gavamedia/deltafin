@@ -364,6 +364,7 @@ class UpgradeTests(unittest.TestCase):
     def test_preserved_path_classifier_covers_weights_and_caches(self) -> None:
         protected = (
             "k3-resident-mix46/tensors/embed.weight.i6",
+            "k3-draft-qwen3-0.6b-base/model.safetensors",
             "k3-cache-raw/expert.npz",
             "models/Kimi-K3/file",
             "nested/expert.safetensors",

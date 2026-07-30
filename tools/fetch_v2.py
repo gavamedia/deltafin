@@ -26,6 +26,7 @@ import mmap
 import os
 import re
 import ssl
+import stat
 import sys
 import threading
 
@@ -42,17 +43,17 @@ import numpy as np
 
 try:
     from cache_writer import AsyncCacheWriter, atomic_publish
+    import model_source
     import positional_io
     import runtime_platform
 except ImportError:  # imported as tools.fetch_v2 instead of a top-level module
     from .cache_writer import AsyncCacheWriter, atomic_publish
-    from . import positional_io
-    from . import runtime_platform
+    from . import model_source, positional_io, runtime_platform
 
 ROOT = os.environ.get("DELTAFIN_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INV_PATH = os.path.join(ROOT, "k3-meta/tensor_inventory_offsets.json")
-BASE_HOST = os.environ.get("K3_HF_HOST", "huggingface.co")
-BASE_PATH = os.environ.get("K3_HF_PATH", "/moonshotai/Kimi-K3/resolve/main/")
+BASE_HOST = model_source.hf_host()
+BASE_PATH = model_source.hf_path()
 ECACHE = os.path.join(ROOT, "k3-experts")
 os.makedirs(ECACHE, exist_ok=True)
 
@@ -134,6 +135,7 @@ stats = {
     "grouped_calls": 0, "grouped_yields": 0, "grouped_fallbacks": 0,
     "pread_ring_batches": 0, "pread_ring_jobs": 0,
     "pread_ring_canceled": 0, "pread_ring_failures": 0,
+    "pread_retries": 0, "pread_local_failures": 0,
     "cache_write_enqueued": 0, "cache_write_sync": 0,
     "cache_write_sync_fallbacks": 0, "cache_write_completed": 0,
     "cache_write_failures": 0, "cache_write_bytes": 0,
@@ -180,7 +182,11 @@ def _initial_raw_presence():
             if not ent.name.endswith(".bin"):
                 continue
             try:
-                if ent.stat(follow_symlinks=False).st_size == EXPERT_SPAN:
+                info = ent.stat(follow_symlinks=False)
+                if (
+                    stat.S_ISREG(info.st_mode)
+                    and info.st_size == EXPERT_SPAN
+                ):
                     present.add(ent.name)
             except OSError:
                 continue
@@ -569,6 +575,10 @@ class GroupReadError(IOError):
     """
 
 
+class LocalExpertReadError(IOError):
+    """A known-valid local expert failed both its pooled read and retry."""
+
+
 _RING_QUEUED = 0
 _RING_RUNNING = 1
 _RING_DONE = 2
@@ -955,13 +965,38 @@ class _PreadReader:
         if want:
             jobs.update(self._submit(layer, want))
         raw, slots = {}, []
+        local_failures = []
         for e, (slot, fut) in jobs.items():
             try:
                 fut.result()
                 raw[e] = slot.raw
-            except Exception:                 # unreadable .bin -> other path
-                _drop_bin(layer, e)
-                missing.append(e)
+            except Exception as first_error:
+                path = _cache_path_bin(layer, e)
+                if _raw_file_valid(layer, e):
+                    # A transient local pread error must not masquerade as a
+                    # network cache miss. Retry once outside the worker pool;
+                    # a complete retry overwrites any partial first read.
+                    started = time.time()
+                    try:
+                        slot.read(path)
+                    except Exception as retry_error:
+                        _bump(pread_local_failures=1)
+                        local_failures.append(
+                            (e, path, first_error, retry_error)
+                        )
+                    else:
+                        _bump(
+                            pread_experts=1,
+                            pread_bytes=EXPERT_SPAN,
+                            pread_s=time.time() - started,
+                            pread_retries=1,
+                        )
+                        raw[e] = slot.raw
+                else:
+                    # The file genuinely disappeared or changed after startup;
+                    # only this case is eligible for legacy/HTTP recovery.
+                    _drop_bin(layer, e)
+                    missing.append(e)
             slots.append(slot)
         self._retire(slots)
         _bump(expert_disk=len(raw))
@@ -974,6 +1009,15 @@ class _PreadReader:
             else:
                 raw[e] = hit
                 _bump(npz_experts=1)
+        if local_failures:
+            e, path, first_error, retry_error = local_failures[0]
+            raise LocalExpertReadError(
+                f"local expert L{layer}-E{e} failed two reads even though "
+                f"{path} remains a regular {EXPERT_SPAN}-byte file; refusing "
+                "to disguise the local I/O failure as an HTTP cache miss "
+                f"(first: {type(first_error).__name__}: {first_error}; "
+                f"retry: {type(retry_error).__name__}: {retry_error})"
+            ) from retry_error
         return raw, missing
 
     def read_layer_groups(self, layer, eids, group_size):
@@ -1017,12 +1061,38 @@ class _PreadReader:
                     slot, fut = jobs[e]
                     try:
                         fut.result()
-                    except Exception as exc:
-                        _drop_bin(layer, e)
-                        settled.add(e)
-                        _bump(grouped_fallbacks=1)
-                        raise GroupReadError(
-                            f"grouped read failed for L{layer}-E{e}") from exc
+                    except Exception as first_error:
+                        path = _cache_path_bin(layer, e)
+                        if _raw_file_valid(layer, e):
+                            started = time.time()
+                            try:
+                                slot.read(path)
+                            except Exception as retry_error:
+                                settled.add(e)
+                                _bump(pread_local_failures=1)
+                                raise LocalExpertReadError(
+                                    f"local expert L{layer}-E{e} failed two "
+                                    f"grouped reads even though {path} remains "
+                                    f"a regular {EXPERT_SPAN}-byte file; "
+                                    "refusing HTTP fallback "
+                                    f"(first: {type(first_error).__name__}: "
+                                    f"{first_error}; retry: "
+                                    f"{type(retry_error).__name__}: "
+                                    f"{retry_error})"
+                                ) from retry_error
+                            _bump(
+                                pread_experts=1,
+                                pread_bytes=EXPERT_SPAN,
+                                pread_s=time.time() - started,
+                                pread_retries=1,
+                            )
+                        else:
+                            _drop_bin(layer, e)
+                            settled.add(e)
+                            _bump(grouped_fallbacks=1)
+                            raise GroupReadError(
+                                f"grouped read failed for L{layer}-E{e}"
+                            ) from first_error
                     settled.add(e)
                     successful.add(e)
                     raw[e] = slot.raw
@@ -1047,7 +1117,11 @@ class _PreadReader:
                     fut.result()
                     successful.add(e)
                 except Exception:
-                    _drop_bin(layer, e)
+                    # Keep a still-valid local file eligible for a fresh local
+                    # retry on the next request. Only a file that actually
+                    # vanished or changed is allowed to become a cache miss.
+                    if not _raw_file_valid(layer, e):
+                        _drop_bin(layer, e)
             self._retire(slots)
             _bump(expert_disk=len(successful))
 
@@ -1134,6 +1208,15 @@ def _has_bin(layer, eid):
     # atomic under CPython; writes still use a lock so alternate runtimes have
     # an uncomplicated synchronization contract.
     return f"L{layer}-E{eid}.bin" in _raw_presence
+
+
+def _raw_file_valid(layer, eid):
+    """Revalidate a raw expert after a local read error without following links."""
+    try:
+        info = os.lstat(_cache_path_bin(layer, eid))
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode) and info.st_size == EXPERT_SPAN
 
 
 def _drop_bin(layer, eid):

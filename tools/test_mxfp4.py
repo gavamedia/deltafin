@@ -1,8 +1,9 @@
 import json, urllib.request, numpy as np, sys
 sys.path.insert(0, 'tools')
 from mxfp4 import dequant_mxfp4, _E2M1
+import model_source
 INV = json.load(open('k3-meta/tensor_inventory_offsets.json'))
-BASE = "https://huggingface.co/moonshotai/Kimi-K3/resolve/main/"
+BASE = model_source.base_url()
 def fetch(name):
     t = INV[name]
     start = 8 + t['hlen'] + t['offsets'][0]; size = t['offsets'][1]-t['offsets'][0]

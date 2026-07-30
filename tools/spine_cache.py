@@ -79,6 +79,121 @@ try:
 except (AttributeError, OSError, ValueError):
     PAGE = 16384 if _IS_DARWIN else 4096
 _libc = None
+GIB = 1 << 30
+
+# The automatic tier is intentionally conservative.  It is enabled only when
+# a Darwin host cannot plausibly retain the complete spine alongside the
+# runtime.  Its resident part is clean file cache, not wired/anonymous memory.
+AUTO_HOST_RESERVE_MIN = 20 * GIB
+AUTO_DEVICE_RESERVE = 12 * GIB
+AUTO_RESIDENT_FRACTION = 0.03
+AUTO_RESIDENT_MAX_BYTES = 2_100_000_000
+AUTO_READER_CHUNK_BYTES = 16 * (1 << 20)
+AUTO_READER_THREADS = 6
+
+
+def automatic_stream_policy(
+    *,
+    system,
+    physical_bytes,
+    recommended_working_set_bytes,
+    spine_bytes,
+):
+    """Return ``(enabled, resident_bytes, reason)`` for the cache-fit policy.
+
+    A cyclic file scan larger than usable memory converges on effectively zero
+    reuse.  On measured low-headroom Macs, bypassing admission for the streaming
+    portion is substantially faster.  Conversely, a machine that can retain
+    the complete spine should keep ordinary caching: that is the higher-memory
+    M5/Ultra path and has a much larger potential payoff.
+
+    Unknown capabilities and every non-Darwin host fail closed.  Linux retains
+    the explicit environment controls until it has its own physical evidence.
+    """
+    if system != "Darwin":
+        return False, 0, "automatic streaming is not qualified on this OS"
+    try:
+        physical = int(physical_bytes or 0)
+        recommended = int(recommended_working_set_bytes or 0)
+        spine = int(spine_bytes or 0)
+    except (TypeError, ValueError):
+        return False, 0, "invalid memory capability"
+    if physical <= 0 or spine <= 0:
+        return False, 0, "physical memory or spine size is unknown"
+
+    host_reserve = max(AUTO_HOST_RESERVE_MIN, physical // 4)
+    usable = max(0, physical - host_reserve)
+    if recommended > 0:
+        usable = min(usable, max(0, recommended - AUTO_DEVICE_RESERVE))
+    if spine <= usable:
+        return (
+            False,
+            0,
+            f"{spine/1e9:.1f} GB spine fits the "
+            f"{usable/1e9:.1f} GB safe cache envelope",
+        )
+
+    resident = min(
+        int(physical * AUTO_RESIDENT_FRACTION),
+        AUTO_RESIDENT_MAX_BYTES,
+    )
+    return (
+        True,
+        resident,
+        f"{spine/1e9:.1f} GB spine exceeds the "
+        f"{usable/1e9:.1f} GB safe cache envelope",
+    )
+
+
+def automatic_reader_policy(
+    *,
+    system,
+    physical_bytes,
+    effective_cpu_count,
+    recommended_working_set_bytes,
+    max_buffer_length_bytes,
+    stream_nocache,
+):
+    """Return the reader shape only for the host class physically measured.
+
+    Descriptor reuse, 16 MiB jobs, and six readers provided a small additional
+    win in the balanced 64 GiB M1 Max campaign.  Reader width and chunk size
+    are storage/controller-sensitive, so a newer Mac must keep the portable
+    defaults until it has its own evidence.  Explicit environment controls in
+    the runner remain authoritative on every host.
+    """
+    disabled = (None, None, None)
+    if not stream_nocache:
+        return (*disabled, "streaming cache bypass is inactive")
+    if system != "Darwin":
+        return (*disabled, "automatic reader tuning is not qualified on this OS")
+    try:
+        physical = int(physical_bytes or 0)
+        cpus = int(effective_cpu_count or 0)
+        recommended = int(recommended_working_set_bytes or 0)
+        max_buffer = int(max_buffer_length_bytes or 0)
+    except (TypeError, ValueError):
+        return (*disabled, "invalid reader capability")
+
+    # Use the complete measured resource tuple, not a product-name or broad
+    # arm64/Darwin assumption. In particular, this intentionally does not copy
+    # one storage queue shape onto a newer GPU/memory generation.
+    physical_slop = 1 * GIB
+    metal_slop = 1 * GIB
+    measured = (
+        abs(physical - 64 * GIB) <= physical_slop
+        and cpus == 10
+        and abs(recommended - 55_662_788_608) <= metal_slop
+        and abs(max_buffer - 41_747_087_360) <= metal_slop
+    )
+    if not measured:
+        return (*disabled, "reader shape has no matching physical evidence")
+    return (
+        AUTO_READER_THREADS,
+        True,
+        AUTO_READER_CHUNK_BYTES,
+        "qualified 64 GiB M1 Max reader campaign",
+    )
 
 
 def _lc():

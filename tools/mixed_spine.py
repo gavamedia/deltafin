@@ -26,6 +26,7 @@ import concurrent.futures as _cf
 import torch
 
 import spine_codec
+import spine_io
 import runtime_platform
 
 ROOT = os.environ.get("DELTAFIN_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -34,6 +35,7 @@ _META_PATH = os.path.join(os.path.dirname(MIXED_DIR.rstrip("/")), "meta.json")
 READ_THREADS = runtime_platform.configured_cpu_workers(
     "K3_SPINE_READ_THREADS", 4
 )
+_READ_THREADS_EXPLICIT = "K3_SPINE_READ_THREADS" in os.environ
 DEQ = os.environ.get("K3_SPINE_DEQ", "metal")        # metal | torch
 ALIGN = 256
 
@@ -81,7 +83,9 @@ def describe(int8_dir=None):
     return (f"policy={m.get('policy')} g={m.get('group')} "
             f"layers={m.get('layers')} sub8_tensors={n} "
             f"spine {m.get('spine_gb_int8')}->{m.get('spine_gb_mixed')} GB "
-            f"deq={DEQ}{'' if metal_available() else ' (metal off: %s)' % _lib_err}")
+            f"deq={DEQ} read_threads={READ_THREADS} "
+            f"io: {spine_io.describe()}"
+            f"{'' if metal_available() else ' (metal off: %s)' % _lib_err}")
 
 
 # --------------------------------------------------------- metal kernels ----
@@ -283,8 +287,48 @@ _readers = None
 _readers_lock = threading.Lock()
 
 
+def configure_read_threads(threads):
+    """Set the reader width before its lazy worker pool is constructed.
+
+    This deliberately matches ``spine_fast.configure_read_threads`` so a
+    runtime selector can configure either packed reader through the same
+    contract. An explicit call remains authoritative over the lazy
+    ``spine_fast`` synchronization below.
+    """
+    global READ_THREADS, _READ_THREADS_EXPLICIT
+    value = int(threads)
+    if value < 1:
+        raise ValueError("reader threads must be positive")
+    if _readers is not None:
+        raise RuntimeError("cannot change reader width after pool construction")
+    READ_THREADS = value
+    _READ_THREADS_EXPLICIT = True
+
+
+def _sync_runtime_read_threads():
+    """Adopt ``spine_fast``'s capability-selected width before first use.
+
+    ``kimi_run`` imports the mixed loader before it imports and tunes
+    ``spine_fast``. Looking up the sibling lazily avoids an import cycle and
+    lets mixed mode inherit the same automatic width without requiring a
+    second runtime-specific branch. ``K3_SPINE_READ_THREADS`` and direct calls
+    to :func:`configure_read_threads` remain authoritative.
+    """
+    global READ_THREADS
+    if _READ_THREADS_EXPLICIT or _readers is not None:
+        return
+    try:
+        import spine_fast
+    except ImportError:
+        return
+    value = int(getattr(spine_fast, "READ_THREADS", READ_THREADS))
+    if value > 0:
+        READ_THREADS = value
+
+
 def _pool_exec():
     global _readers
+    _sync_runtime_read_threads()
     if _readers is None:
         with _readers_lock:
             if _readers is None:
@@ -341,12 +385,123 @@ def plan_layout(module, prefix, int8_dir, res_dir, inv):
     return lay
 
 
+# ---------------------------------------------------- chunked job planning ---
+# Which packed buffer a job writes into. The path/offset plan is immutable for
+# a layer and mirrors spine_fast.plan_jobs; only destination memoryviews are
+# created for each pass.
+_QB, _SCB, _OB = 0, 1, 2
+
+
+def plan_jobs(lay):
+    """Return balanced ``spine_io`` jobs for one mixed packed layer."""
+    jobs = lay.get("jobs")
+    if jobs is not None:
+        return jobs
+    raw = []
+    for _n, _f, codec, base, _sh, qoff, nb, soff, sb in lay["items"]:
+        pe, se = spine_codec.EXT[codec]
+        raw.append((base + pe, _QB, qoff, nb))
+        raw.append((base + se, _SCB, soff * 2, sb))
+    for _n, _f, _dt, _sh, ooff, nb, bp in lay["oplan"]:
+        raw.append((bp, _OB, ooff, nb))
+    chunk = spine_io.CHUNK
+    jobs = []
+    for path, buffer_id, destination_offset, nbytes in raw:
+        if chunk <= 0 or nbytes <= chunk:
+            jobs.append(
+                (path, 0, buffer_id, destination_offset, nbytes)
+            )
+            continue
+        file_offset = 0
+        while file_offset < nbytes:
+            size = min(chunk, nbytes - file_offset)
+            jobs.append(
+                (
+                    path,
+                    file_offset,
+                    buffer_id,
+                    destination_offset + file_offset,
+                    size,
+                )
+            )
+            file_offset += size
+    jobs.sort(key=lambda job: -job[4])
+    lay["jobs"] = jobs
+    return jobs
+
+
+def _rdadvise_next(prefix):
+    """Issue optional readahead for the next already-planned mixed layer."""
+    try:
+        head, _, tail = prefix.rpartition("layers.")
+        index = int(tail.rstrip("."))
+    except (AttributeError, ValueError):
+        return
+    nxt = _layouts.get(f"{head}layers.{index + 1}.")
+    if nxt is None:
+        return
+    seen = set()
+    for path, _file_offset, _buffer_id, _destination_offset, _nbytes in (
+        plan_jobs(nxt)
+    ):
+        if path not in seen:
+            seen.add(path)
+            spine_io.rdadvise(path)
+
+
 # ------------------------------------------------------------- read side ----
 def read_pack(module, prefix, int8_dir, res_dir, inv, spine=None, load_resident=None):
     """Runs in the preloader thread. Signature matches spine_fast.read_pack."""
+    _sync_runtime_read_threads()
     lay = plan_layout(module, prefix, int8_dir, res_dir, inv)
     qbuf = _acquire(lay["qtotal"])
     sbuf = _acquire(lay["stotal"] * 2)
+    obuf = _acquire(max(lay["ototal"], 1))
+
+    if spine_io.ENABLED:
+        t0 = _time.time()
+        try:
+            if spine_io.RDADVISE:
+                _rdadvise_next(prefix)
+            buffers = (
+                memoryview(qbuf),
+                memoryview(sbuf),
+                memoryview(obuf),
+            )
+            jobs = [
+                (
+                    path,
+                    file_offset,
+                    buffers[buffer_id][
+                        destination_offset:destination_offset + nbytes
+                    ],
+                )
+                for (
+                    path,
+                    file_offset,
+                    buffer_id,
+                    destination_offset,
+                    nbytes,
+                ) in plan_jobs(lay)
+            ]
+            spine_io.run_jobs(
+                jobs,
+                _pool_exec(),
+                READ_THREADS,
+                nocache=spine_io.stream_tier(prefix),
+            )
+        except Exception:
+            # A sibling worker may still own a destination view while
+            # ``run_jobs`` propagates its first failure. Do not publish these
+            # buffers back to the reuse pool; their remaining views keep them
+            # alive safely until every worker releases ownership.
+            raise
+        PHASE["read_s"] += _time.time() - t0
+        PHASE["read_bytes"] += lay["qtotal"] + lay["ototal"]
+        for item in lay["items"]:
+            PHASE["bytes_by_codec"][item[2]] += item[6]
+        return {"lay": lay, "q": qbuf, "sc": sbuf, "other": obuf}
+
     qmv, smv = memoryview(qbuf), memoryview(sbuf)
 
     def _one(it):
@@ -364,7 +519,6 @@ def read_pack(module, prefix, int8_dir, res_dir, inv, spine=None, load_resident=
     else:
         for it in items:
             _one(it)
-    obuf = _acquire(max(lay["ototal"], 1))
     omv = memoryview(obuf)
     for _n, _f, _dt, _sh, ooff, nb, bp in lay["oplan"]:
         with open(bp, "rb") as f:

@@ -649,9 +649,11 @@ def _stage_lease_is_current(lease):
 
 
 # ----------------------------------------- dynamic packed-q8 KDA projections ---
-# Every role below consumes the same, unchanged ``hidden_states`` tensor inside
-# KimiDeltaAttention.forward.  The second-stage f_b/g_b projections and o_proj
-# deliberately stay dense because their inputs differ.
+# Every bundled role below consumes the same, unchanged ``hidden_states``
+# tensor inside KimiDeltaAttention.forward. Second-stage f_b/g_b projections
+# still stay dense because their inputs differ. The independently qualified
+# o_proj consumes the attention output, so it can use packed q8 but must never
+# participate in the same-input fusion/cache.
 _CORE_PROJECTION_SPECS = (
     ("q", "q_proj"),
     ("k", "k_proj"),
@@ -686,13 +688,14 @@ class DynamicQ8State:
 
 
 class DynamicPackedQ8QKV:
-    """Capability-gated row-int8 storage for KDA projections.
+    """Capability-gated row-int8 storage for qualified KDA projections.
 
     The default ``arena`` mode copies each current layer out of its recycled
     upload buffer into template-owned storage. Experimental ``stage`` mode
     instead consumes an ordered, generation-checked view of that upload buffer
-    directly and fences asynchronous reuse at the end of attention. Dense
-    parameters remain available as a cold fallback in either mode.
+    directly and fences asynchronous reuse at the end of attention. Same-input
+    first-stage roles may fuse; independently qualified tail roles never do.
+    Dense parameters remain available as a cold fallback in either mode.
     """
 
     _QBUF = "_k3_q8_qkv_weight_arena"
@@ -709,6 +712,7 @@ class DynamicPackedQ8QKV:
         fuse_qkv=None,
         storage_mode="arena",
         stage_sync_mode="event",
+        o_backend=None,
     ):
         dev = torch.device(dev)
         if dev.type == "cuda" and dev.index is None:
@@ -729,6 +733,30 @@ class DynamicPackedQ8QKV:
         )
         resolved_matmul = (
             backend_matmul if resolved_backend is not None else backend
+        )
+        o_backend_matmul = getattr(o_backend, "matmul", None)
+        resolved_o_backend = (
+            o_backend
+            if (
+                o_backend is not None
+                and getattr(o_backend, "available", True) is not False
+                and callable(o_backend_matmul)
+                and callable(getattr(o_backend, "supports_tokens", None))
+            )
+            else None
+        )
+        resolved_o_matmul = (
+            o_backend_matmul
+            if resolved_o_backend is not None
+            else (
+                o_backend
+                if (
+                    o_backend is not None
+                    and getattr(o_backend, "available", True) is not False
+                    and callable(o_backend)
+                )
+                else None
+            )
         )
         # Validate before allocating or mutating the module. A failed
         # installation must not leave hundreds of MiB of arenas and a half-built
@@ -793,6 +821,30 @@ class DynamicPackedQ8QKV:
             projections[role] = projection
             role_names[role] = f"self_attn.{attribute}.weight"
 
+        bundle_roles = tuple(projections)
+        independent_matmuls = {}
+        independent_backends = {}
+        if resolved_o_matmul is not None:
+            projection = getattr(attention, "o_proj", None)
+            if (
+                projection is not None
+                and hasattr(projection, "weight")
+                and getattr(projection, "bias", None) is None
+                and len(tuple(projection.weight.shape)) == 2
+            ):
+                rows, cols = tuple(projection.weight.shape)
+                q_cursor = _align(q_cursor)
+                scale_cursor = _align(scale_cursor * 4) // 4
+                slots["o"] = (
+                    q_cursor, rows * cols, scale_cursor, rows, cols
+                )
+                q_cursor += rows * cols
+                scale_cursor += rows
+                projections["o"] = projection
+                role_names["o"] = "self_attn.o_proj.weight"
+                independent_matmuls["o"] = resolved_o_matmul
+                independent_backends["o"] = resolved_o_backend
+
         roles = tuple(projections)
         names_to_roles = {
             name: role for role, name in role_names.items()
@@ -847,11 +899,15 @@ class DynamicPackedQ8QKV:
         self.stage_sync_mode = stage_sync_mode
         self.stage_sync_contract = stage_sync_contract
         self.backend = resolved_backend
+        self.independent_backends = independent_backends
+        self.independent_matmuls = independent_matmuls
         self.module = module
         self.attention = attention
         self.state = state
         self.matmul = resolved_matmul
         self.projections = projections
+        self.bundle_roles = bundle_roles
+        self.independent_roles = tuple(independent_matmuls)
         self.roles = roles
         self.role_names = role_names
         self.names_to_roles = names_to_roles
@@ -1025,7 +1081,7 @@ class DynamicPackedQ8QKV:
         )
 
     def _fusion_layout_status(self):
-        records = [self.slots[role] for role in self.roles]
+        records = [self.slots[role] for role in self.bundle_roles]
         columns = {record[4] for record in records}
         if len(columns) != 1:
             return False, "packed projection input widths differ"
@@ -1039,13 +1095,13 @@ class DynamicPackedQ8QKV:
         return True, None
 
     def _fused_views(self):
-        first = self.slots[self.roles[0]]
-        last = self.slots[self.roles[-1]]
+        first = self.slots[self.bundle_roles[0]]
+        last = self.slots[self.bundle_roles[-1]]
         _owned_qoff, _qn, soff, _rows, cols = first
         if self.storage_mode == "stage":
             self._require_stage_current()
-            qoff = self._stage_records[self.roles[0]][0]
-            last_record = self._stage_records[self.roles[-1]]
+            qoff = self._stage_records[self.bundle_roles[0]][0]
+            last_record = self._stage_records[self.bundle_roles[-1]]
             q_end = last_record[0] + last_record[1]
             q_arena = self._stage_q_arena
         else:
@@ -1054,7 +1110,9 @@ class DynamicPackedQ8QKV:
             q_arena = getattr(self.attention, self._QBUF)
         scale_end = last[2] + last[3]
         scale_arena = getattr(self.attention, self._SBUF)
-        split_rows = tuple(self.slots[role][3] for role in self.roles)
+        split_rows = tuple(
+            self.slots[role][3] for role in self.bundle_roles
+        )
         total_rows = sum(split_rows)
         return (
             q_arena[qoff:q_end].view(total_rows, cols),
@@ -1345,9 +1403,9 @@ class DynamicPackedQ8QKV:
         """Drop transient fallback projections after the layer finishes.
 
         Production templates start with meta packed-role Parameters. A prompt
-        wider than the packed-GEMV crossover temporarily materializes about
-        1.32 GiB for K3's Q/K/V/G/F-A/B bundle; retaining those beside the
-        packed arenas would erase much of the residency benefit during decode.
+        wider than the packed-GEMV crossover temporarily materializes the
+        current packed roles; retaining those beside the packed arenas would
+        erase much of the residency benefit during decode.
         """
         if not self._dense_materialized or not self.enabled:
             return
@@ -1366,9 +1424,18 @@ class DynamicPackedQ8QKV:
         self._clear_fused_outputs()
 
     def _supports_tokens(self, token_count):
-        if self.backend is None:
-            return True
-        return bool(self.backend.supports_tokens(token_count))
+        if (
+            self.backend is not None
+            and not self.backend.supports_tokens(token_count)
+        ):
+            return False
+        for backend in self.independent_backends.values():
+            if (
+                backend is not None
+                and not backend.supports_tokens(token_count)
+            ):
+                return False
+        return True
 
     def finish_load(self):
         """Finish one layer, accepting all-packed or safely densifying hybrids."""
@@ -1422,6 +1489,7 @@ class DynamicPackedQ8QKV:
             if cached is not None:
                 return cached
         qweight, scale = self._views(role)
+        role_matmul = self.independent_matmuls.get(role, self.matmul)
         try:
             if scoped and role == self.trigger_role:
                 probing_stage_shape = (
@@ -1450,9 +1518,9 @@ class DynamicPackedQ8QKV:
                             *hidden.shape[:-1],
                             self._views(projected_role)[0].shape[0],
                         )
-                        for projected_role in self.roles
+                        for projected_role in self.bundle_roles
                     )
-                    operator_calls = len(self.roles)
+                    operator_calls = len(self.bundle_roles)
                     self.separate_operator_calls += operator_calls
                 if probing_stage_shape:
                     self._stage_full_shape_validated = True
@@ -1463,22 +1531,27 @@ class DynamicPackedQ8QKV:
                 self._fused_outputs = {
                     fused_role: fused_output
                     for fused_role, fused_output in zip(
-                        self.roles[1:], projected[1:]
+                        self.bundle_roles[1:], projected[1:]
                     )
                 }
                 self.packed_project_calls += 1
                 self.packed_operator_calls += operator_calls
                 return projected[0]
-            output = self.matmul(flat, qweight, scale)
+            output = role_matmul(flat, qweight, scale)
             output = output.view(*hidden.shape[:-1], qweight.shape[0])
             self.packed_project_calls += 1
             self.packed_operator_calls += 1
             self.separate_operator_calls += 1
             return output
-        except (NotImplementedError, RuntimeError, TypeError) as exc:
+        except (
+            NotImplementedError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as exc:
             # The packed operator may be present in the dispatcher yet reject
             # a future device generation, shape, or PyTorch ABI. Rebuild every
-            # current bundled weight before switching the template to dense.
+            # current packed weight before switching the template to dense.
             self.runtime_failures += 1
             self._clear_fused_outputs()
             self._materialize_dense()
@@ -1526,10 +1599,18 @@ class DynamicPackedQ8QKV:
             "fuse_qkv": self.fuse_qkv,
             "fusion_eligible": self.fusion_eligible,
             "fusion_reason": self.fusion_reason,
+            "bundle_roles": list(self.bundle_roles),
+            "independent_roles": list(self.independent_roles),
             "packed_roles": list(self.roles),
             "backend": (
                 self.backend.status() if self.backend is not None else None
             ),
+            "independent_backends": {
+                role: (
+                    backend.status() if backend is not None else None
+                )
+                for role, backend in self.independent_backends.items()
+            },
         }
 
     def uninstall(self):
@@ -1561,6 +1642,7 @@ def install_dynamic_q8_qkv(
     fuse_qkv=None,
     storage_mode="arena",
     stage_sync_mode="event",
+    o_backend=None,
 ):
     return DynamicPackedQ8QKV(
         module,
@@ -1571,6 +1653,7 @@ def install_dynamic_q8_qkv(
         fuse_qkv=fuse_qkv,
         storage_mode=storage_mode,
         stage_sync_mode=stage_sync_mode,
+        o_backend=o_backend,
     )
 
 
@@ -1585,6 +1668,17 @@ PHASE = {"read_s": 0.0, "read_bytes": 0, "h2d_s": 0.0, "h2d_bytes": 0,
 
 _readers = None
 _readers_lock = threading.Lock()
+
+
+def configure_read_threads(threads):
+    """Set the reader width before its lazy worker pool is constructed."""
+    global READ_THREADS
+    value = int(threads)
+    if value < 1:
+        raise ValueError("reader threads must be positive")
+    if _readers is not None:
+        raise RuntimeError("cannot change reader width after pool construction")
+    READ_THREADS = value
 
 
 def _pool_exec():

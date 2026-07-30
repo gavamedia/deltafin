@@ -56,6 +56,7 @@ class _BundledAttention(nn.Module):
         low_rank_gate=False,
         repeat_role=None,
         mutate_after_q=False,
+        output_projection=False,
     ):
         super().__init__()
         self.rows = dict(self.DEFAULT_ROWS if rows is None else rows)
@@ -71,6 +72,11 @@ class _BundledAttention(nn.Module):
             self.g_proj = nn.Linear(width, self.rows["g"], bias=False)
         self.repeat_role = repeat_role
         self.mutate_after_q = mutate_after_q
+        self.output_projection = output_projection
+        if output_projection:
+            self.o_proj = nn.Linear(
+                self.rows["g"], width, bias=False
+            )
 
     @property
     def gate_role(self):
@@ -96,6 +102,9 @@ class _BundledAttention(nn.Module):
             self.b_proj(hidden_states),
             self._projection(self.gate_role)(hidden_states),
         ])
+        if self.output_projection:
+            # Model the real tail's different input width and call position.
+            outputs.append(self.o_proj(outputs[-1]))
         return tuple(outputs)
 
     @property
@@ -104,6 +113,8 @@ class _BundledAttention(nn.Module):
         if self.repeat_role == "f_a":
             roles.append("f_a")
         roles.extend(["b", self.gate_role])
+        if self.output_projection:
+            roles.append("o")
         return tuple(roles)
 
 
@@ -325,6 +336,8 @@ class DynamicQ8QKVTests(unittest.TestCase):
         low_rank_gate=False,
         repeat_role=None,
         mutate_after_q=False,
+        output_projection=False,
+        o_backend=None,
         storage_mode="arena",
         stage_sync_mode="event",
         device=torch.device("cpu"),
@@ -335,12 +348,14 @@ class DynamicQ8QKVTests(unittest.TestCase):
                     low_rank_gate=low_rank_gate,
                     repeat_role=repeat_role,
                     mutate_after_q=mutate_after_q,
+                    output_projection=output_projection,
                 )
         else:
             layer = _BundledLayer(
                 low_rank_gate=low_rank_gate,
                 repeat_role=repeat_role,
                 mutate_after_q=mutate_after_q,
+                output_projection=output_projection,
             )
         state = spine_fast.DynamicQ8State()
         controller = spine_fast.install_dynamic_q8_qkv(
@@ -350,6 +365,7 @@ class DynamicQ8QKVTests(unittest.TestCase):
             backend if backend is not None else _reference_mm,
             storage_mode=storage_mode,
             stage_sync_mode=stage_sync_mode,
+            o_backend=o_backend,
         )
         return layer, state, controller
 
@@ -444,6 +460,178 @@ class DynamicQ8QKVTests(unittest.TestCase):
                 ),
                 rtol=0,
                 atol=0,
+            )
+
+    def test_output_projection_uses_its_independent_backend(self):
+        bundle_backend = _Backend(
+            _row_independent_reference_mm,
+            max_tokens=9,
+            fuse_qkv=True,
+        )
+        output_backend = _Backend(
+            _row_independent_reference_mm,
+            max_tokens=9,
+            # Even a fusion-capable backend must not fuse the different-input
+            # output projection into the first-stage bundle.
+            fuse_qkv=True,
+        )
+        layer, state, controller = self._bundle_controller(
+            backend=bundle_backend,
+            o_backend=output_backend,
+            output_projection=True,
+        )
+        source = {}
+        for index, role in enumerate(controller.roles, start=1):
+            rows, cols = controller.projections[role].weight.shape
+            source[role] = _source_for_shape(index, rows, cols)
+        _apply_sources(layer, source, {})
+        hidden = torch.randn(1, 2, 64)
+        outputs = layer.self_attn(hidden_states=hidden)
+
+        self.assertEqual(
+            controller.bundle_roles,
+            ("q", "k", "v", "g", "f_a", "b"),
+        )
+        self.assertEqual(controller.independent_roles, ("o",))
+        self.assertEqual(controller.roles[-1], "o")
+        self.assertTrue(state.enabled, state.reason)
+        self.assertEqual(bundle_backend.calls, 1)
+        self.assertEqual(output_backend.calls, 1)
+        self.assertEqual(controller.fused_operator_calls, 1)
+        self.assertEqual(controller.separate_operator_calls, 1)
+        self.assertEqual(controller.packed_operator_calls, 2)
+        self.assertEqual(controller.packed_project_calls, 7)
+
+        by_role = dict(zip(layer.self_attn.output_roles, outputs))
+        for role in controller.bundle_roles:
+            torch.testing.assert_close(
+                by_role[role],
+                _row_independent_reference_mm(
+                    hidden, source[role][0], source[role][1].float()
+                ),
+                rtol=0,
+                atol=0,
+            )
+        expected_o = _row_independent_reference_mm(
+            by_role["g"], source["o"][0], source["o"][1].float()
+        )
+        torch.testing.assert_close(
+            by_role["o"], expected_o, rtol=0, atol=0
+        )
+
+    def test_output_projection_stays_dense_without_qualified_backend(self):
+        bundle_backend = _Backend(
+            _row_independent_reference_mm,
+            max_tokens=9,
+            fuse_qkv=True,
+        )
+        layer, state, controller = self._bundle_controller(
+            backend=bundle_backend,
+            o_backend=None,
+            output_projection=True,
+        )
+        self._load_bundle(controller)
+        self.assertNotIn("o", controller.roles)
+        self.assertNotIn(
+            "self_attn.o_proj.weight", controller.names_to_roles
+        )
+        self.assertNotIn("forward", layer.self_attn.o_proj.__dict__)
+
+        outputs = layer.self_attn(torch.randn(1, 1, 64))
+        self.assertTrue(state.enabled, state.reason)
+        self.assertEqual(bundle_backend.calls, 1)
+        self.assertEqual(len(outputs), 7)
+
+    def test_output_crossover_densifies_before_first_stage(self):
+        bundle_backend = _Backend(
+            _row_independent_reference_mm,
+            max_tokens=9,
+            fuse_qkv=True,
+        )
+        output_backend = _Backend(
+            _row_independent_reference_mm,
+            max_tokens=1,
+        )
+        layer, state, controller = self._bundle_controller(
+            backend=bundle_backend,
+            o_backend=output_backend,
+            output_projection=True,
+            meta=True,
+        )
+        source = self._load_bundle(controller)
+        hidden = torch.randn(1, 2, 64)
+        outputs = layer.self_attn(hidden)
+
+        self.assertTrue(state.enabled, state.reason)
+        self.assertEqual(bundle_backend.calls, 0)
+        self.assertEqual(output_backend.calls, 0)
+        self.assertEqual(controller.dense_crossover_materializations, 1)
+        self.assertEqual(
+            controller.dense_crossover_project_calls,
+            len(controller.roles),
+        )
+        by_role = dict(zip(layer.self_attn.output_roles, outputs))
+        for role in controller.bundle_roles:
+            torch.testing.assert_close(
+                by_role[role],
+                _reference_mm(
+                    hidden, source[role][0], source[role][1].float()
+                ),
+                rtol=0,
+                atol=0,
+            )
+        torch.testing.assert_close(
+            by_role["o"],
+            _reference_mm(
+                by_role["g"], source["o"][0], source["o"][1].float()
+            ),
+            rtol=0,
+            atol=0,
+        )
+        for projection in controller.projections.values():
+            self.assertEqual(projection.weight.device.type, "meta")
+
+    def test_output_backend_failure_materializes_dense_group(self):
+        def reject_output(_hidden, _qweight, _scale):
+            raise ValueError("synthetic output-shape rejection")
+
+        bundle_backend = _Backend(
+            _row_independent_reference_mm,
+            max_tokens=9,
+            fuse_qkv=True,
+        )
+        output_backend = _Backend(reject_output, max_tokens=9)
+        layer, state, controller = self._bundle_controller(
+            backend=bundle_backend,
+            o_backend=output_backend,
+            output_projection=True,
+            meta=True,
+        )
+        source = self._load_bundle(controller)
+        hidden = torch.randn(1, 1, 64)
+        outputs = layer.self_attn(hidden)
+        by_role = dict(zip(layer.self_attn.output_roles, outputs))
+
+        self.assertFalse(state.enabled)
+        self.assertIn("output-shape rejection", state.reason)
+        self.assertEqual(bundle_backend.calls, 1)
+        self.assertEqual(output_backend.calls, 1)
+        self.assertEqual(controller.runtime_failures, 1)
+        torch.testing.assert_close(
+            by_role["o"],
+            _reference_mm(
+                by_role["g"], source["o"][0], source["o"][1].float()
+            ),
+            rtol=0,
+            atol=0,
+        )
+        for role, projection in controller.projections.items():
+            expected_weight = (
+                source[role][0].float()
+                * source[role][1].float()[:, None]
+            )
+            torch.testing.assert_close(
+                projection.weight, expected_weight, rtol=0, atol=0
             )
 
     @unittest.skipUnless(
@@ -551,12 +739,16 @@ class DynamicQ8QKVTests(unittest.TestCase):
         self,
         *,
         backend=None,
+        o_backend=None,
+        output_projection=False,
         offset=0,
         meta=True,
         stage_sync_mode="event",
     ):
         layer, state, controller = self._bundle_controller(
             backend=backend,
+            o_backend=o_backend,
+            output_projection=output_projection,
             meta=meta,
             storage_mode="stage",
             stage_sync_mode=stage_sync_mode,
@@ -804,8 +996,11 @@ class DynamicQ8QKVTests(unittest.TestCase):
                 atol=0,
             )
 
-    def test_stage_plan_layout_places_six_roles_in_direct_view_order(self):
-        _layer, _state, controller, _source = self._stage_bundle()
+    def test_stage_plan_layout_places_qualified_roles_in_direct_view_order(self):
+        _layer, _state, controller, _source = self._stage_bundle(
+            o_backend=_Backend(max_tokens=9),
+            output_projection=True,
+        )
         prefix = "stage-layout-test."
         with tempfile.TemporaryDirectory() as int8_dir, (
             tempfile.TemporaryDirectory()
@@ -844,6 +1039,43 @@ class DynamicQ8QKVTests(unittest.TestCase):
             if prior_end is not None:
                 self.assertEqual(qoff, prior_end)
             prior_end = qoff + qbytes
+
+    def test_stage_output_projection_consumes_before_attention_fence(self):
+        controller = None
+        saw_live_stage = []
+
+        def output_mm(hidden, qweight, scale):
+            saw_live_stage.append(
+                controller is not None
+                and controller._stage_q_arena is not None
+                and controller._stage_lease is not None
+            )
+            return _row_independent_reference_mm(
+                hidden, qweight, scale
+            )
+
+        bundle_backend = _Backend(
+            _row_independent_reference_mm,
+            max_tokens=9,
+            fuse_qkv=True,
+        )
+        output_backend = _Backend(output_mm, max_tokens=9)
+        layer, state, controller, source = self._stage_bundle(
+            backend=bundle_backend,
+            o_backend=output_backend,
+            output_projection=True,
+        )
+        _apply_sources(layer, source, {})
+        outputs = layer.self_attn(torch.randn(1, 1, 64))
+
+        self.assertTrue(state.enabled, state.reason)
+        self.assertEqual(controller.roles[-1], "o")
+        self.assertEqual(bundle_backend.calls, 1)
+        self.assertEqual(output_backend.calls, 1)
+        self.assertEqual(saw_live_stage, [True])
+        self.assertEqual(controller.stage_release_count, 1)
+        self.assertIsNone(controller._stage_q_arena)
+        self.assertEqual(len(outputs), len(controller.roles))
 
     def test_stage_key_resolves_implicit_cuda_device_without_gpu_alias(self):
         with mock.patch.object(

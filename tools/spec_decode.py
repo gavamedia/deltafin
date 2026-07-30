@@ -99,6 +99,8 @@ import torch
 DEPTH = max(1, min(8, int(os.environ.get("K3_SPEC_DEPTH", "1"))))
 ADAPT = os.environ.get("K3_SPEC_ADAPT", "0") == "1"
 ROLLBACK = os.environ.get("K3_SPEC_ROLLBACK", "replay").lower()
+if ROLLBACK not in {"replay", "rerun"}:
+    raise ValueError("K3_SPEC_ROLLBACK must be replay or rerun")
 MIN_N = int(os.environ.get("K3_SPEC_MIN_N", "2"))
 MAX_N = int(os.environ.get("K3_SPEC_MAX_N", "6"))
 RECUR_MATCH = os.environ.get("K3_SPEC_RECUR_MATCH", "1") == "1"
@@ -138,6 +140,8 @@ def arm():
     returns, because `rollback_replay` reads the records; the caller must
     `release()` in a finally."""
     global _CAP
+    if _CAP is not None:
+        raise RuntimeError("spec_decode capture is already armed")
     _CAP = {}
 
 
