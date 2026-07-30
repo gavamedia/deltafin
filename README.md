@@ -540,10 +540,26 @@ intrinsics regardless of `/arch` and uses `/arch:AVX` for the same baseline.
 The Windows kernels reach POSIX threading through `tools/win_compat.h`, a narrow
 shim over SRW locks, condition variables and `_beginthreadex`.
 
-Windows support currently covers the native build and the MXFP4 kernels, not yet
-a complete end-to-end run: the spine and expert readers still call `os.preadv`
-and `os.pread`, which CPython does not provide on Windows. Porting that data
-path is tracked as remaining work.
+Windows support currently covers the native build and the MXFP4 kernels. The
+read path needs one more change, because CPython provides neither `os.preadv`
+nor `os.pread` there:
+
+- The resident spine is unaffected in its default configuration, which reads
+  with `open()` and `readinto()` on a per-thread handle. Only the opt-in
+  `spine_io` tuning flags (`K3_SPINE_FDCACHE`, `K3_SPINE_CHUNK_MB`,
+  `K3_SPINE_RDADVISE`, `K3_SPINE_NOCACHE`) take the positional-read path.
+- The expert reader defaults to `K3_EXPERT_READ=pread`. Set
+  `K3_EXPERT_READ=mmap` on Windows; that path demand-faults `np.memmap` views
+  instead, measured at 0.87-0.93 GB/s against 7.0 GB/s for `pread` on the
+  reference machine.
+- `LazyEmbed` in `kimi_run.py` reads embedding rows with `os.pread` and has no
+  local alternative. This is the one remaining blocker for an end-to-end
+  Windows run.
+
+Restoring full expert-read throughput needs a Windows positional-read layer,
+most directly `ReadFile` with an `OVERLAPPED` offset on handles opened
+`FILE_FLAG_OVERLAPPED`, which is the native equivalent of `preadv` and keeps
+the concurrent reads the current design depends on.
 
 Validation is intentionally separated from platform support:
 
@@ -552,7 +568,7 @@ Validation is intentionally separated from platform support:
 | Apple Silicon / MPS + Metal | maintainer-run end-to-end benchmarks and exact-token gates |
 | Linux aarch64 / CUDA + CPU MoE | community end-to-end run and contributor kernel tests on DGX Spark |
 | Linux x86-64 / CPU | strict fat-binary compilation plus selected/compatibility exactness under Rosetta; native Linux AVX2 timing is still wanted |
-| Windows x86-64 / CPU | MSVC build plus the selected/compatibility and scale-LUT exactness gates run natively; the positional-read data path is not ported yet, so no end-to-end run exists |
+| Windows x86-64 / CPU | MSVC build plus the selected/compatibility and scale-LUT exactness gates run natively; the embedding reader still needs `os.pread`, so no end-to-end run exists yet |
 | Native CUDA MXFP4 MoE | implementation is ABI/KAT/fallback-gated; CUDA hardware parity and throughput measurements are still wanted |
 
 ### Where this could go
