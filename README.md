@@ -86,8 +86,32 @@ shell rather than only from a Developer Command Prompt.
 For an NVIDIA system, install a CUDA-enabled PyTorch build using the
 [official PyTorch selector](https://pytorch.org/get-started/locally/) before
 installing the remaining Python packages. Deltafin does not vendor PyTorch or a
-CUDA runtime. On Linux and Windows, the native build also detects NVCC when it
-is available.
+CUDA runtime.
+
+**On Windows this step is easy to miss, because the obvious command silently
+gives you a CPU build.** PyPI's Linux wheel carries CUDA, but its Windows wheel
+does not — for torch 2.13.0 the Linux wheel is 527 MB and declares four
+`nvidia-*` dependencies gated to `platform_system == "Linux"`, while the Windows
+wheel is 122 MB and declares none. A plain `pip install torch` therefore leaves
+a Windows machine on the CPU path with no error, and Deltafin reports it at
+startup as `no MPS or CUDA GPU found`. Install from the CUDA index instead:
+
+```powershell
+.\venv\Scripts\python -m pip install --index-url https://download.pytorch.org/whl/cu130 torch
+```
+
+Match the variant to the card rather than taking the newest torch version:
+CUDA 12.6 builds do not support `sm_120`, so a Blackwell GPU needs a CUDA 12.8
+or newer variant, and not every variant carries every torch release. Then check
+what actually landed:
+
+```powershell
+.\venv\Scripts\python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+```
+
+`torch.version.cuda` printing `None` means the CPU wheel is still installed.
+
+On Linux and Windows, the native build also detects NVCC when it is available.
 Its CUDA artifact is optional in the default `--cuda=auto` mode: a missing or
 incompatible toolkit cannot block the CPU libraries. Use `--cuda=on` to require
 and diagnose that artifact, or `--cuda=off` to skip the probe explicitly. When
