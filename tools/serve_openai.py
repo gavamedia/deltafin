@@ -12,8 +12,18 @@ Design notes, honestly stated:
     (K3 emits an end token) and 256 for raw completions (which never end on
     their own). Explicit max_tokens is honored as-is; operators can set a
     ceiling with K3_SERVER_MAX_TOKENS.
-  * One generation at a time (a global lock). Concurrency would be meaningless
-    at this speed.
+  * One generation at a time. Concurrency would be meaningless at this speed,
+    so by default a concurrent request is rejected immediately with 429 plus a
+    Retry-After estimate. K3_SERVER_QUEUE=N (or --queue N) instead lets up to
+    N requests wait for the generation slot; wakeup is arrival-order in
+    practice, though CPython's lock does not guarantee it. A client that
+    disconnects is detected by peeking its socket: every 0.5 s while queued
+    (freeing the slot) and before every decoder layer while generating —
+    prefill included — abandoning the generation. Worst case is one layer's
+    remaining work (e.g. a single cold expert fetch), not a whole pass.
+  * Internal failures always produce a JSON error response: 400 for malformed
+    requests, 500 (type "server_error") for everything else. A failure after
+    streaming has begun is reported as a final SSE error event instead.
   * Chat mode renders K3's template, which includes a thinking section; the
     response splits it into `reasoning_content` and `content` (DeepSeek-style).
   * Each request uses a fresh KV/state cache; nothing is shared across calls.
@@ -29,7 +39,10 @@ the pinned wheel in requirements.txt; ``--gigatoken off`` never imports it.
 """
 import argparse
 import json
+import math
 import os
+import select
+import socket
 import sys
 import threading
 import time
@@ -44,12 +57,16 @@ from response_memo import DeterministicResponseMemo  # noqa: E402
 
 MODEL_ID = "deltafin-kimi-k3"
 MAX_TOKENS_CAP = int(os.environ.get("K3_SERVER_MAX_TOKENS", "0"))   # 0 = no cap
+QUEUE_SIZE = int(os.environ.get("K3_SERVER_QUEUE", "0"))  # waiting slots; 0 = reject when busy
 RESPONSE_MEMO_ENTRIES = int(
     os.environ.get("K3_RESPONSE_MEMO_ENTRIES", "32"))
 RESPONSE_MARKER = "<|open|>response<|sep|>"
 THINK_CLOSE = "<|close|>think<|sep|>"
 
 _lock = threading.Lock()
+_active_lock = threading.Lock()
+_active = 0                 # requests holding or waiting for _lock
+_last_gen_seconds = None    # wall time of the last completed generation
 _chat_tokenizer_gate = threading.Lock()
 _tok = None
 _layers = None
@@ -102,8 +119,25 @@ def _split_reasoning(text):
     return None, text
 
 
-def _gen(ids, max_new, on_delta=None):
-    """Run one generation under the global lock; stream decoded-text deltas."""
+def _retry_after_estimate():
+    """Seconds to suggest in Retry-After; the caller holds _active_lock.
+
+    Based on the last completed generation times the number of requests
+    already ahead — an honest guess, not a promise.
+    """
+    per_gen = _last_gen_seconds if _last_gen_seconds else 60.0
+    return max(30, math.ceil(per_gen * max(1, _active)))
+
+
+def _gen(ids, max_new, on_delta=None, check_abort=None):
+    """Run one generation under the global lock; stream decoded-text deltas.
+
+    check_abort, when given, runs before every decoder layer of every pass —
+    prefill included — and may raise to abandon the generation (used to stop
+    working for a vanished client).
+    """
+    global _last_gen_seconds
+    started = time.monotonic()
     cache = kr.ml.KimiDynamicCache(kr.config)
     decoder = kr.IncrementalTokenDecoder(_tok) if on_delta else None
 
@@ -114,15 +148,16 @@ def _gen(ids, max_new, on_delta=None):
         if delta:
             on_delta(delta)
 
-    out = kr.generate(
-        _layers,
-        cache,
-        _embed,
-        ids,
-        max_new,
-        on_token=on_token if on_delta else None,
-        universal_drafter=_universal_drafter,
-    )
+    with kr.abort_check(check_abort):
+        out = kr.generate(
+            _layers,
+            cache,
+            _embed,
+            ids,
+            max_new,
+            on_token=on_token if on_delta else None,
+            universal_drafter=_universal_drafter,
+        )
     if decoder is not None:
         tail = decoder.finish()
         if tail:
@@ -133,6 +168,7 @@ def _gen(ids, max_new, on_delta=None):
         finish = "stop"
     else:
         finish = "length"
+    _last_gen_seconds = time.monotonic() - started
     return out, _tok.decode(out), finish
 
 
@@ -142,17 +178,23 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *a):
         print(f"[serve] {self.address_string()} {fmt % a}", flush=True)
 
-    def _json(self, code, obj):
+    def _json(self, code, obj, headers=None):
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
+        self._headers_sent = True
         self.wfile.write(body)
         self.wfile.flush()
 
-    def _err(self, code, msg):
-        self._json(code, {"error": {"message": msg, "type": "invalid_request_error"}})
+    def _err(self, code, msg, err_type="invalid_request_error", retry_after=None):
+        headers = None
+        if retry_after is not None:
+            headers = {"Retry-After": str(retry_after)}
+        self._json(code, {"error": {"message": msg, "type": err_type}}, headers)
 
     def do_GET(self):
         if self.path in ("/v1/models", "/models"):
@@ -162,10 +204,96 @@ class Handler(BaseHTTPRequestHandler):
             self._err(404, f"no route {self.path}")
 
     def do_POST(self):
+        self._headers_sent = False
+        self._streaming = False
+        try:
+            self._handle_post()
+        except BrokenPipeError:
+            print("[serve] client disconnected", flush=True)
+        except Exception as e:
+            print(f"[serve] error: {e!r}", flush=True)
+            self._report_failure(str(e))
+
+    def _report_failure(self, message):
+        try:
+            if self._streaming:
+                # The 200 status and SSE headers are already on the wire; a
+                # status line cannot be un-sent, so report through the stream.
+                self.wfile.write(b"data: " + json.dumps(
+                    {"error": {"message": message, "type": "server_error"}}
+                ).encode() + b"\n\n")
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            elif not self._headers_sent:
+                self._err(500, message, err_type="server_error")
+        except Exception:
+            pass
+
+    def _client_disconnected(self):
+        """True once the client socket reports EOF or reset (peek, no consume).
+
+        Readable-with-data means a pipelined request, not a disconnect.
+        Fabricated handlers without a socket (unit tests) count as connected.
+        """
+        conn = getattr(self, "connection", None)
+        if conn is None:
+            return False
+        try:
+            readable, _, _ = select.select([conn], [], [], 0)
+            if not readable:
+                return False
+            return conn.recv(1, socket.MSG_PEEK) == b""
+        except (OSError, ValueError):
+            return True
+
+    def _abort_if_disconnected(self):
+        if self._client_disconnected():
+            raise BrokenPipeError("client disconnected")
+
+    def _acquire_generation_slot(self):
+        """Admit this request and wait for the generation lock.
+
+        Returns True with the lock held, or False after replying 429 (no free
+        slot) or silently dropping a client that disconnected while queued.
+        """
+        global _active
+        with _active_lock:
+            if _active >= 1 + QUEUE_SIZE:
+                if QUEUE_SIZE:
+                    msg = (f"a generation is running and the queue is full "
+                           f"({QUEUE_SIZE} waiting); retry later")
+                else:
+                    msg = ("a generation is already running (Deltafin serves "
+                           "one at a time; K3_SERVER_QUEUE allows waiting)")
+                self._err(429, msg, err_type="rate_limit_error",
+                          retry_after=_retry_after_estimate())
+                return False
+            _active += 1
+        while not _lock.acquire(timeout=0.5):
+            if self._client_disconnected():
+                with _active_lock:
+                    _active -= 1
+                print("[serve] queued client disconnected; slot freed",
+                      flush=True)
+                return False
+        if self._client_disconnected():
+            self._release_generation_slot()
+            print("[serve] client disconnected before its turn", flush=True)
+            return False
+        return True
+
+    def _release_generation_slot(self):
+        global _active
+        _lock.release()
+        with _active_lock:
+            _active -= 1
+
+    def _handle_post(self):
         rendered_chars = 0
         try:
-            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0)) or 0) or b"{}")
-        except json.JSONDecodeError:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:  # bad Content-Length or bad JSON (JSONDecodeError)
             return self._err(400, "invalid JSON body")
         chat = self.path in ("/v1/chat/completions", "/chat/completions")
         comp = self.path in ("/v1/completions", "/completions")
@@ -186,8 +314,12 @@ class Handler(BaseHTTPRequestHandler):
         # naturally at EOS; raw completions have no terminator, so only THEY get
         # a default cap (256) — an explicit max_tokens is always honored.
         req_max = body.get("max_tokens")
+        if req_max is not None and (
+                not isinstance(req_max, int) or isinstance(req_max, bool)
+                or req_max < 0):
+            return self._err(400, "max_tokens must be a non-negative integer")
         if req_max:
-            max_new = int(req_max)
+            max_new = req_max
         else:
             max_new = 1_000_000 if chat else 256
         if MAX_TOKENS_CAP:
@@ -196,8 +328,8 @@ class Handler(BaseHTTPRequestHandler):
         rid = ("chatcmpl-" if chat else "cmpl-") + uuid.uuid4().hex[:20]
         created = int(time.time())
 
-        if not _lock.acquire(timeout=5):
-            return self._err(429, "a generation is already running (Deltafin serves one at a time)")
+        if not self._acquire_generation_slot():
+            return
         try:
             mode = "chat" if chat else "completion"
             cached = _memo.get(mode, ids, max_new)
@@ -210,6 +342,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "close")
                 self.end_headers()
+                self._headers_sent = True
+                self._streaming = True
 
                 def sse(obj):
                     self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n")
@@ -228,7 +362,8 @@ class Handler(BaseHTTPRequestHandler):
 
                 if cached is None:
                     out, text, finish = _gen(
-                        ids, max_new, on_delta=on_delta)
+                        ids, max_new, on_delta=on_delta,
+                        check_abort=self._abort_if_disconnected)
                     _memo.put(mode, ids, max_new, out, text, finish)
                 else:
                     out = list(cached.token_ids)
@@ -258,7 +393,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if cached is None:
-                out, text, finish = _gen(ids, max_new)
+                out, text, finish = _gen(
+                    ids, max_new,
+                    check_abort=self._abort_if_disconnected)
                 _memo.put(mode, ids, max_new, out, text, finish)
             else:
                 out = list(cached.token_ids)
@@ -283,16 +420,15 @@ class Handler(BaseHTTPRequestHandler):
                                  "model": MODEL_ID, "usage": usage,
                                  "choices": [{"index": 0, "text": text,
                                               "finish_reason": finish}]})
-        except BrokenPipeError:
-            print("[serve] client disconnected mid-generation", flush=True)
-        except Exception as e:
-            print(f"[serve] error: {e!r}", flush=True)
-            try:
-                self._err(500, str(e))
-            except Exception:
-                pass
         finally:
-            _lock.release()
+            self._release_generation_slot()
+
+
+def _queue_size(value):
+    queue = int(value)
+    if queue < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return queue
 
 
 def _build_parser():
@@ -309,16 +445,29 @@ def _build_parser():
             "off never imports GigaToken"
         ),
     )
+    ap.add_argument(
+        "--queue",
+        type=_queue_size,
+        default=os.environ.get("K3_SERVER_QUEUE", "0"),
+        help=(
+            "requests allowed to wait for the single generation slot; 0 "
+            "(default) rejects a concurrent request immediately with 429 + "
+            "Retry-After; the K3_SERVER_QUEUE environment variable sets the "
+            "default"
+        ),
+    )
     return ap
 
 
 def main():
+    global QUEUE_SIZE
     ap = _build_parser()
     args = ap.parse_args()
     try:
         gigatoken_mode = server_tokenizer.parse_mode(args.gigatoken)
     except ValueError as exc:
         ap.error(str(exc))
+    QUEUE_SIZE = args.queue
     _boot(gigatoken_mode)
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"[serve] Deltafin OpenAI-compatible API on http://{args.host}:{args.port}/v1",
@@ -343,6 +492,17 @@ def main():
         f"[serve] chat tokenizer: {tokenizer_message}",
         flush=True,
     )
+    if QUEUE_SIZE:
+        admission_message = (
+            f"one generation at a time; up to {QUEUE_SIZE} request(s) wait "
+            "for the slot (roughly arrival order), the rest get 429"
+        )
+    else:
+        admission_message = (
+            "one generation at a time; a concurrent request gets an "
+            "immediate 429 + Retry-After (--queue N allows waiting)"
+        )
+    print(f"[serve] admission: {admission_message}", flush=True)
     try:
         srv.serve_forever()
     finally:

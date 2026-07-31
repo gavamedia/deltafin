@@ -1883,6 +1883,26 @@ def causal_mask(T, past=0, dtype=None):
     return m
 
 
+_ABORT_CHECK = None
+
+
+@contextlib.contextmanager
+def abort_check(callback):
+    """Run ``callback`` before each decoder layer of every forward pass.
+
+    The callback may raise to abandon the pass mid-flight; the server uses
+    this to stop spending hours on a client that has disconnected. The check
+    runs before a layer's weights are fetched, so an abort never strands a
+    freshly materialized layer.
+    """
+    global _ABORT_CHECK
+    _ABORT_CHECK = callback
+    try:
+        yield
+    finally:
+        _ABORT_CHECK = None
+
+
 def forward_pass(
     layers,
     cache,
@@ -1925,6 +1945,8 @@ def forward_pass(
     fut = (_PRELOADER.submit(_spine_read, layers[nxt], f"{PFX}layers.{nxt}.")
            if PRELOAD and nxt < NL else None)
     for i, layer in enumerate(layers):
+        if _ABORT_CHECK is not None:
+            _ABORT_CHECK()
         _step_ctx["layer"] = i
         if TEMPLATES:
             layer.layer_idx = i
