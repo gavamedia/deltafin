@@ -27,8 +27,8 @@ class _ChatTokenizer:
         self.encodes = []
         self.responses = []
 
-    def encode_chat(self, messages, add_generation_prompt=True):
-        self.encodes.append((messages, add_generation_prompt))
+    def encode_chat(self, messages, add_generation_prompt=True, **kwargs):
+        self.encodes.append((messages, add_generation_prompt, kwargs))
         return server.server_tokenizer.ChatEncoding(
             [1, 2, 3], 12_345, "tiktoken")
 
@@ -195,11 +195,35 @@ class ServerConfigurationTests(unittest.TestCase):
             mock.patch.object(server, "_chat_tokenizer", controller),
         ):
             ids, chars, backend = server._encode_chat(
-                [{"role": "user", "content": "hello"}])
+                [{"role": "user", "content": "hello"}], reasoning_effort="max")
             self.assertIs(server._tok, original)
         self.assertEqual(ids, [1, 2, 3])
         self.assertEqual(chars, 12_345)
         self.assertEqual(backend, "tiktoken")
+        self.assertEqual(
+            controller.encodes[0][2], {"thinking_effort": "max"}
+        )
+
+    def test_chat_delta_streamer_splits_reasoning_and_content(self):
+        emitted = []
+        streamer = server.ChatDeltaStreamer(
+            lambda reasoning=None, content=None: emitted.append((reasoning, content))
+        )
+
+        streamer.push("<|open|>think<|sep|>Reasoning step 1.\n")
+        streamer.push("Reasoning step 2.<|close|>think<|sep|><|open|>response<|sep|>Answer part 1. ")
+        streamer.push("Answer part 2.")
+        streamer.finish()
+
+        self.assertEqual(
+            emitted,
+            [
+                ("Reasoning step 1.\n", None),
+                ("Reasoning step 2.", None),
+                (None, "Answer part 1. "),
+                (None, "Answer part 2."),
+            ]
+        )
 
 
 class ServerHandlerTokenizerLifecycleTests(unittest.TestCase):

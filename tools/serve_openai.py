@@ -84,16 +84,16 @@ def _boot(gigatoken_mode="auto"):
 
 def _encode_chat(messages, reasoning_effort=None):
     with _chat_tokenizer_gate:
+        te_kwargs = {}
+        if reasoning_effort is not None:
+            te_kwargs["thinking_effort"] = reasoning_effort
         if _chat_tokenizer is None:
-            te_kwargs = {}
-            if reasoning_effort is not None:
-                te_kwargs["thinking_effort"] = reasoning_effort
             ids = _tok.apply_chat_template(
                 messages, tokenize=True, add_generation_prompt=True,
                 **te_kwargs)
             return list(ids), 0, "tiktoken"
         result = _chat_tokenizer.encode_chat(
-            messages, add_generation_prompt=True)
+            messages, add_generation_prompt=True, **te_kwargs)
         return result.token_ids, result.rendered_chars, result.backend
 
 
@@ -104,6 +104,72 @@ def _split_reasoning(text):
         reasoning = pre.replace(THINK_CLOSE, "").replace("<|open|>think<|sep|>", "").strip()
         return reasoning or None, ans
     return None, text
+
+
+class ChatDeltaStreamer:
+    """State machine splitting streaming deltas into reasoning_content vs content."""
+
+    def __init__(self, emit_chunk_fn):
+        self.emit_chunk = emit_chunk_fn
+        self.state = "THINK"
+        self.buffer = ""
+
+    def push(self, delta):
+        self.buffer += delta
+        while self.buffer:
+            if self.state == "THINK":
+                if RESPONSE_MARKER in self.buffer:
+                    think_part, rest = self.buffer.split(RESPONSE_MARKER, 1)
+                    cleaned_think = (
+                        think_part.replace(THINK_CLOSE, "")
+                        .replace("<|open|>think<|sep|>", "")
+                    )
+                    if cleaned_think:
+                        self.emit_chunk(reasoning=cleaned_think)
+                    self.state = "RESPONSE"
+                    self.buffer = rest
+                    continue
+
+                max_p = 0
+                for marker in (RESPONSE_MARKER, THINK_CLOSE, "<|open|>think<|sep|>"):
+                    for i in range(1, len(marker)):
+                        if self.buffer.endswith(marker[:i]):
+                            max_p = max(max_p, i)
+
+                if max_p > 0:
+                    emit_len = len(self.buffer) - max_p
+                    if emit_len > 0:
+                        chunk = self.buffer[:emit_len].replace("<|open|>think<|sep|>", "")
+                        self.buffer = self.buffer[emit_len:]
+                        if chunk:
+                            self.emit_chunk(reasoning=chunk)
+                    break
+                else:
+                    chunk = self.buffer.replace("<|open|>think<|sep|>", "")
+                    self.buffer = ""
+                    if chunk:
+                        self.emit_chunk(reasoning=chunk)
+                    break
+            else:
+                chunk = self.buffer
+                self.buffer = ""
+                if chunk:
+                    self.emit_chunk(content=chunk)
+                break
+
+    def finish(self):
+        if self.buffer:
+            if self.state == "THINK":
+                cleaned = (
+                    self.buffer.replace(THINK_CLOSE, "")
+                    .replace("<|open|>think<|sep|>", "")
+                    .replace(RESPONSE_MARKER, "")
+                )
+                if cleaned:
+                    self.emit_chunk(reasoning=cleaned)
+            else:
+                self.emit_chunk(content=self.buffer)
+            self.buffer = ""
 
 
 def _gen(ids, max_new, on_delta=None):
@@ -228,12 +294,24 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n")
                     self.wfile.flush()
 
+                if chat:
+                    def _emit_chunk(reasoning=None, content=None):
+                        delta_dict = {}
+                        if reasoning is not None:
+                            delta_dict["reasoning_content"] = reasoning
+                        if content is not None:
+                            delta_dict["content"] = content
+                        if delta_dict:
+                            sse({"id": rid, "object": "chat.completion.chunk", "created": created,
+                                 "model": MODEL_ID,
+                                 "choices": [{"index": 0, "delta": delta_dict,
+                                              "finish_reason": None}]})
+
+                    streamer = ChatDeltaStreamer(_emit_chunk)
+
                 def on_delta(delta):
                     if chat:
-                        sse({"id": rid, "object": "chat.completion.chunk", "created": created,
-                             "model": MODEL_ID,
-                             "choices": [{"index": 0, "delta": {"content": delta},
-                                          "finish_reason": None}]})
+                        streamer.push(delta)
                     else:
                         sse({"id": rid, "object": "text_completion", "created": created,
                              "model": MODEL_ID,
@@ -249,6 +327,8 @@ class Handler(BaseHTTPRequestHandler):
                     finish = cached.finish_reason
                     if text:
                         on_delta(text)
+                if chat:
+                    streamer.finish()
                 key = "delta" if chat else "text"
 
                 def finish_stream():
