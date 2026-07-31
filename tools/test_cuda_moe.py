@@ -28,7 +28,7 @@ import cuda_moe  # noqa: E402
 
 
 REAL_CUDA = (
-    sys.platform.startswith("linux")
+    cuda_moe._CUDA_MOE_PLATFORM
     and torch.cuda.is_available()
     and os.path.isfile(cuda_moe._LIBRARY_PATH)
 )
@@ -404,15 +404,28 @@ class TestRealCudaBridge(unittest.TestCase):
             "w3": matrix((3072, 1792), (3072, 112), up),
         }
 
-    @staticmethod
-    def _analytical(values, *, gate=1.0, up=2.0, down=1.0):
+    # MXFP4 e2m1 magnitudes, indexed by the packed nibble code.
+    E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+    @classmethod
+    def _analytical(cls, values, *, gate=1, up=2, down=1):
+        """Expected output for _raw_expert built from the same nibble codes.
+
+        These parameters are packed codes, exactly as _raw_expert takes them,
+        and are decoded through e2m1 here.  Passing a code straight through as
+        a magnitude is what made this reference disagree with the kernel: e2m1
+        maps code 1 to 0.5 and code 2 to 1.0, not to 1.0 and 2.0.
+        """
+        gate_weight = cls.E2M1[gate]
+        up_weight = cls.E2M1[up]
+        down_weight = cls.E2M1[down]
         expected = torch.zeros(
             (len(values), cuda_moe.HIDDEN), dtype=torch.float32
         )
         for row, value in enumerate(values):
-            g = gate * value
-            u = up * value
-            expected[row, 0] = down * (
+            g = gate_weight * value
+            u = up_weight * value
+            expected[row, 0] = down_weight * (
                 4.0 * math.tanh(g / 4.0) / (1.0 + math.exp(-g))
                 * (25.0 * math.tanh(u / 25.0))
             )
@@ -542,7 +555,7 @@ class TestRealCudaBridge(unittest.TestCase):
         self.assertFalse(torch.equal(first, other))
         torch.testing.assert_close(
             other.cpu(),
-            self._analytical([1.0], down=2.0),
+            self._analytical([1.0], down=4),
             atol=2e-5,
             rtol=2e-5,
         )
@@ -572,8 +585,8 @@ class TestRealCudaBridge(unittest.TestCase):
         )
         torch.cuda.synchronize(self.device)
         expected = (
-            self._analytical([1.0], down=1.0)
-            + self._analytical([1.0], down=2.0)
+            self._analytical([1.0], down=1)
+            + self._analytical([1.0], down=4)
         ) * 0.5
         torch.testing.assert_close(
             output.cpu(), expected, atol=2e-5, rtol=2e-5

@@ -68,14 +68,17 @@ static k3_job_t g_job;
 // on one cache line makes those independent protocols invalidate each other.
 // This is layout-only: it changes neither the synchronization order nor the
 // kernel arithmetic, and remains useful across Apple CPU generations.
+//
+// The attribute leads the declaration because that is the one position both
+// GCC's aligned attribute and MSVC's __declspec(align) accept.
 #ifndef K3_ATOMIC_ALIGN
-#define K3_ATOMIC_ALIGN __attribute__((aligned(128)))
+#define K3_ATOMIC_ALIGN K3_ALIGN_PREFIX(128)
 #endif
-static _Atomic long g_gen      K3_ATOMIC_ALIGN = 0;   // dispatch generation
-static _Atomic int  g_cursor   K3_ATOMIC_ALIGN = 0;   // next work unit
-static _Atomic int  g_finished K3_ATOMIC_ALIGN = 0;   // completed workers
-static _Atomic int  g_stop     K3_ATOMIC_ALIGN = 0;
-static _Atomic int  g_ready    K3_ATOMIC_ALIGN = 0;   // startup latch
+K3_ATOMIC_ALIGN static _Atomic long g_gen      = 0;   // dispatch generation
+K3_ATOMIC_ALIGN static _Atomic int  g_cursor   = 0;   // next work unit
+K3_ATOMIC_ALIGN static _Atomic int  g_finished = 0;   // completed workers
+K3_ATOMIC_ALIGN static _Atomic int  g_stop     = 0;
+K3_ATOMIC_ALIGN static _Atomic int  g_ready    = 0;   // startup latch
 
 static pthread_t       g_th[K3_MAX_THREADS];
 static int             g_nworkers = 0;
@@ -125,9 +128,9 @@ static int k3_prepare_batch_x_avx2(
         size_t bytes = need * sizeof(float);
         if (bytes > SIZE_MAX - 63) return 0;
         size_t aligned_bytes = (bytes + 63) & ~(size_t)63;
-        float *grown = (float *)aligned_alloc(64, aligned_bytes);
+        float *grown = (float *)k3_aligned_alloc(64, aligned_bytes);
         if (!grown) return 0;
-        free(g_xscratch);
+        k3_aligned_free(g_xscratch);
         g_xscratch = grown;
         g_xscratch_n = aligned_bytes / sizeof(float);
     }
@@ -149,7 +152,7 @@ static int k3_prepare_batch_x_avx2(
 }
 #endif
 
-int mxfp4_batch_last_x_permutations(void) {
+K3_EXPORT int mxfp4_batch_last_x_permutations(void) {
     return g_last_x_permutations;
 }
 
@@ -255,7 +258,7 @@ static void k3_pool_stop_locked(void) {
     atomic_store_explicit(&g_stop, 0, memory_order_release);
 }
 
-int mxfp4_pool_init(int nthreads) {
+K3_EXPORT int mxfp4_pool_init(int nthreads) {
     if (nthreads < 1) nthreads = 1;
     if (nthreads > K3_MAX_THREADS) nthreads = K3_MAX_THREADS;
     pthread_mutex_lock(&g_api);
@@ -287,11 +290,11 @@ int mxfp4_pool_init(int nthreads) {
     return r;
 }
 
-void mxfp4_pool_shutdown(void) {
+K3_EXPORT void mxfp4_pool_shutdown(void) {
     pthread_mutex_lock(&g_api);
     k3_pool_stop_locked();
 #if MXFP4_CAN_BUILD_AVX2
-    free(g_xscratch);
+    k3_aligned_free(g_xscratch);
     g_xscratch = NULL;
     g_xscratch_n = 0;
 #endif
@@ -299,7 +302,7 @@ void mxfp4_pool_shutdown(void) {
     pthread_mutex_unlock(&g_api);
 }
 
-int mxfp4_pool_threads(void) { return g_nworkers; }
+K3_EXPORT int mxfp4_pool_threads(void) { return g_nworkers; }
 
 // ---------------------------------------------------------------- dispatch
 // Caller must hold g_api. g_job must be fully populated (incl. n_units).
@@ -347,9 +350,10 @@ static void k3_dispatch(void) {
 // Matrix m computes ys[m][r] = dot(W_m[r,:], xs[m]) for r in [0, rows[m]).
 // One dispatch for the whole batch; rows are work-stolen across all matrices, so a
 // short matrix cannot leave a thread idle at the tail.
-void mxfp4_gemv_batch(const uint8_t *const *packed, const uint8_t *const *scales,
-                      const float *const *xs, float *const *ys,
-                      const int *rows, const int *cols, int n_mats, int nthreads) {
+K3_EXPORT void mxfp4_gemv_batch(
+        const uint8_t *const *packed, const uint8_t *const *scales,
+        const float *const *xs, float *const *ys,
+        const int *rows, const int *cols, int n_mats, int nthreads) {
     if (n_mats <= 0) return;
     if (n_mats > K3_MAX_MATS) n_mats = K3_MAX_MATS;
     mxfp4_pool_init(nthreads);
@@ -377,9 +381,10 @@ void mxfp4_gemv_batch(const uint8_t *const *packed, const uint8_t *const *scales
 // Requested shape: n_mats matrices that all consume the SAME x (this is exactly the
 // w1/w3 phase of a MoE layer: 16 experts x 2 matrices, one shared activation), with
 // outputs concatenated into `out` at offset sum(rows[0..m)).
-void mxfp4_moe_layer(const uint8_t *const *packed, const uint8_t *const *scales,
-                     const int *rows, const int *cols, int n_mats,
-                     const float *x, float *out, int nthreads) {
+K3_EXPORT void mxfp4_moe_layer(
+        const uint8_t *const *packed, const uint8_t *const *scales,
+        const int *rows, const int *cols, int n_mats,
+        const float *x, float *out, int nthreads) {
     if (n_mats <= 0) return;
     if (n_mats > K3_MAX_MATS) n_mats = K3_MAX_MATS;
     const float *xs[K3_MAX_MATS];
@@ -395,7 +400,8 @@ void mxfp4_moe_layer(const uint8_t *const *packed, const uint8_t *const *scales,
 
 // Parallel SiTU over n_ex experts. gu is [n_ex][2][d_ff] (gate,up interleaved per
 // expert, i.e. the natural mxfp4_moe_layer output when mats are ordered w1,w3,w1,w3...).
-void mxfp4_situ_batch(const float *gu, float *h, int n_ex, int d_ff, int nthreads) {
+K3_EXPORT void mxfp4_situ_batch(
+        const float *gu, float *h, int n_ex, int d_ff, int nthreads) {
     if (n_ex <= 0 || d_ff <= 0) return;
     mxfp4_pool_init(nthreads);
     pthread_mutex_lock(&g_api);
@@ -419,11 +425,12 @@ static float *g_scr = NULL;
 static size_t g_scr_n = 0;
 static pthread_mutex_t g_scr_mu = PTHREAD_MUTEX_INITIALIZER;
 
-void mxfp4_moe_expert_set(const uint8_t *const *p13, const uint8_t *const *s13,
-                          const uint8_t *const *p2,  const uint8_t *const *s2,
-                          const float *x, const float *wts,
-                          int n_ex, int d_ff, int d_model,
-                          float *scratch, float *out, int nthreads) {
+K3_EXPORT void mxfp4_moe_expert_set(
+        const uint8_t *const *p13, const uint8_t *const *s13,
+        const uint8_t *const *p2,  const uint8_t *const *s2,
+        const float *x, const float *wts,
+        int n_ex, int d_ff, int d_model,
+        float *scratch, float *out, int nthreads) {
     if (n_ex <= 0 || n_ex > K3_MAX_MATS / 2
             || d_ff <= 0 || d_model <= 0) return;
     size_t dff = (size_t)d_ff, dmodel = (size_t)d_model;

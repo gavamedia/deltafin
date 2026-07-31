@@ -21,6 +21,7 @@ from __future__ import annotations
 import ctypes
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -40,6 +41,55 @@ F32P = ctypes.POINTER(ctypes.c_float)
 I32P = ctypes.POINTER(ctypes.c_int)
 
 
+def _build_msvc(
+    source: str,
+    output: Path,
+    *,
+    extra_cflags: tuple[str, ...] = (),
+) -> None:
+    """Build one kernel with MSVC, matching what build_native.py installs.
+
+    The GNU flags above have no cl.exe spelling, so the dialect is translated
+    here rather than approximated: /arch:AVX is the -mavx baseline, and the
+    -D defines the callers pass become /D.
+    """
+    import build_native as native
+
+    environment = native.msvc_environment()
+    compiler = shutil.which(
+        "cl",
+        path=native.environment_path(environment) if environment else None,
+    )
+    if compiler is None:
+        raise RuntimeError("cl.exe not found; install the VS C++ build tools")
+    scratch = output.parent
+    defines = [f"/D{flag[2:]}" for flag in extra_cflags]
+    if any(not flag.startswith("-D") for flag in extra_cflags):
+        raise RuntimeError(f"cannot translate {extra_cflags!r} for MSVC")
+    subprocess.run(
+        [
+            compiler,
+            "/nologo",
+            "/O2",
+            "/std:c11",
+            "/experimental:c11atomics",
+            "/arch:AVX",
+            *defines,
+            "/DNO_MAIN",
+            "/LD",
+            str(HERE / source),
+            f"/Fe:{output}",
+            f"/Fo:{os.path.join(str(scratch), '')}",
+            "/link",
+            "/INCREMENTAL:NO",
+            f"/IMPLIB:{scratch / (output.stem + '.lib')}",
+        ],
+        check=True,
+        cwd=HERE,
+        env=dict(environment) if environment else None,
+    )
+
+
 def _build(
     source: str,
     output: Path,
@@ -49,6 +99,10 @@ def _build(
     machine = platform.machine().lower()
     if machine not in {"arm64", "aarch64", "x86_64", "amd64"}:
         raise RuntimeError(f"unsupported test architecture: {machine}")
+
+    if os.name == "nt":
+        _build_msvc(source, output, extra_cflags=extra_cflags)
+        return
 
     cc = os.environ.get("CC", "cc")
     cmd = [
@@ -477,8 +531,24 @@ def _test_partial_pthread_create(
     _test_expert_thread_bound(lib, rng)
 
 
+def _release(*libraries: ctypes.CDLL) -> None:
+    """Unload test libraries so the temporary directory can be removed.
+
+    Windows keeps a loaded module's file locked; on POSIX this is a no-op.
+    """
+    import build_native as native
+
+    for library in libraries:
+        native.release_library(library)
+
+
 def _run_portability_suite() -> None:
-    suffix = ".dylib" if sys.platform == "darwin" else ".so"
+    if sys.platform == "darwin":
+        suffix = ".dylib"
+    elif os.name == "nt":
+        suffix = ".dll"
+    else:
+        suffix = ".so"
     with tempfile.TemporaryDirectory(prefix="deltafin-kernel-test-") as td:
         tmp = Path(td)
         gemv_path = tmp / f"libmxfp4gemv{suffix}"
@@ -508,15 +578,21 @@ def _run_portability_suite() -> None:
         synth_gemv = _load(synth_gemv_path)
         synth_batch = _load(synth_batch_path)
         fail = _load(fail_path)
-        _bind_gemv(gemv)
-        _bind_gemv(synth_gemv)
-        _test_single_and_mt(gemv)
-        _test_scale_lut_equivalence(gemv, synth_gemv)
-        rng = np.random.default_rng(0xD37AF1)
-        _test_batch(batch, rng)
-        _test_scale_lut_batch_equivalence(batch, synth_batch)
-        _test_expert_thread_bound(gemv, rng)
-        _test_partial_pthread_create(fail, rng)
+        try:
+            _bind_gemv(gemv)
+            _bind_gemv(synth_gemv)
+            _test_single_and_mt(gemv)
+            _test_scale_lut_equivalence(gemv, synth_gemv)
+            rng = np.random.default_rng(0xD37AF1)
+            _test_batch(batch, rng)
+            _test_scale_lut_batch_equivalence(batch, synth_batch)
+            _test_expert_thread_bound(gemv, rng)
+            _test_partial_pthread_create(fail, rng)
+        finally:
+            # The pool owns live worker threads; stop them before unloading.
+            batch.mxfp4_pool_shutdown()
+            synth_batch.mxfp4_pool_shutdown()
+            _release(gemv, batch, synth_gemv, synth_batch, fail)
 
 
 class TestFusedGemvPortability(unittest.TestCase):

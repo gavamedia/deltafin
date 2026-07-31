@@ -11,10 +11,10 @@
 ### An experiment in running [Kimi K3](https://huggingface.co/moonshotai/Kimi-K3) (2.8T parameters) on one local workstation
 
 Deltafin is a small research project that runs a Mixture-of-Experts model far
-larger than the machine it sits on. It supports Apple Silicon macOS and
-x86-64/aarch64 Linux, automatically selecting MPS, CUDA or CPU for the resident
-model path and a qualified Metal, CUDA or CPU MXFP4 expert kernel. The
-maintainer-run exact-oracle reference is now **0.2660 token/s (3.76
+larger than the machine it sits on. It supports Apple Silicon macOS,
+x86-64/aarch64 Linux and x86-64 Windows, automatically selecting MPS, CUDA or
+CPU for the resident model path and a qualified Metal, CUDA or CPU MXFP4 expert
+kernel. The maintainer-run exact-oracle reference is now **0.2660 token/s (3.76
 seconds/token median)** on a modest 64 GB M1 Max; that is one first-generation
 machine, not a ceiling for newer hardware. Speculative acceptance varies with
 the text, so the observed three-run range is reported below rather than hidden.
@@ -32,7 +32,7 @@ verifies—not what is allowed to reach the output.
 ![model](https://img.shields.io/badge/model-Kimi_K3_·_2.8T_MoE-blueviolet)
 ![hardware](https://img.shields.io/badge/measured_on-M1_Max_·_64GB-silver)
 ![speed](https://img.shields.io/badge/reference_decode-0.2660_tok%2Fs_·_3.76s%2Ftoken_(M1_Max)-brightgreen)
-![platforms](https://img.shields.io/badge/platforms-macOS_arm64_·_Linux_x86--64%2Faarch64-informational)
+![platforms](https://img.shields.io/badge/platforms-macOS_arm64_·_Linux_x86--64%2Faarch64_·_Windows_x86--64-informational)
 ![accelerators](https://img.shields.io/badge/accelerators-MPS_·_CUDA_·_CPU-9cf)
 ![precision](https://img.shields.io/badge/experts-MXFP4_native-teal)
 ![mode](https://img.shields.io/badge/decoding-greedy_·_reproducible-green)
@@ -79,10 +79,39 @@ matches that revision.
 
 On macOS, install Xcode Command Line Tools first (`xcode-select --install`). On
 Linux, install a C/C++ compiler toolchain such as `build-essential` or GCC/Clang.
+On Windows, install the Visual Studio "Desktop development with C++" workload;
+the native build locates it with `vswhere` and captures the environment
+`vcvars64.bat` sets, so `python tools\build_native.py` works from an ordinary
+shell rather than only from a Developer Command Prompt.
 For an NVIDIA system, install a CUDA-enabled PyTorch build using the
 [official PyTorch selector](https://pytorch.org/get-started/locally/) before
 installing the remaining Python packages. Deltafin does not vendor PyTorch or a
-CUDA runtime. On Linux, the native build also detects NVCC when it is available.
+CUDA runtime.
+
+**On Windows this step is easy to miss, because the obvious command silently
+gives you a CPU build.** PyPI's Linux wheel carries CUDA, but its Windows wheel
+does not — for torch 2.13.0 the Linux wheel is 527 MB and declares four
+`nvidia-*` dependencies gated to `platform_system == "Linux"`, while the Windows
+wheel is 122 MB and declares none. A plain `pip install torch` therefore leaves
+a Windows machine on the CPU path with no error, and Deltafin reports it at
+startup as `no MPS or CUDA GPU found`. Install from the CUDA index instead:
+
+```powershell
+.\venv\Scripts\python -m pip install --index-url https://download.pytorch.org/whl/cu130 torch
+```
+
+Match the variant to the card rather than taking the newest torch version:
+CUDA 12.6 builds do not support `sm_120`, so a Blackwell GPU needs a CUDA 12.8
+or newer variant, and not every variant carries every torch release. Then check
+what actually landed:
+
+```powershell
+.\venv\Scripts\python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+```
+
+`torch.version.cuda` printing `None` means the CPU wheel is still installed.
+
+On Linux and Windows, the native build also detects NVCC when it is available.
 Its CUDA artifact is optional in the default `--cuda=auto` mode: a missing or
 incompatible toolkit cannot block the CPU libraries. Use `--cuda=on` to require
 and diagnose that artifact, or `--cuda=off` to skip the probe explicitly. When
@@ -333,8 +362,9 @@ startup. These variables exist for overriding that:
 |---|---|---|
 | `K3_DEV` | auto | `mps` when available, then the first CUDA device visible to the process, otherwise `cpu`; accepts explicit `mps`, `cuda`, `cuda:N` or `cpu` |
 | `K3_MOE` | auto | `metal` on MPS; a native `cuda` candidate on CUDA; otherwise `cpu`. Optional GPU backends must pass their own ABI, shape and correctness checks or fall back to CPU |
-| `K3_GEMV_LIB` / `K3_BATCH_LIB` | platform default | override the native MXFP4 library paths (`.dylib` on macOS, `.so` on Linux) |
-| `K3_CUDA_MOE_LIB` | `tools/libcudamoe.so` | override the optional native CUDA library path |
+| `K3_GEMV_LIB` / `K3_BATCH_LIB` | platform default | override the native MXFP4 library paths (`.dylib` on macOS, `.so` on Linux, `.dll` on Windows) |
+| `K3_CUDA_MOE_LIB` | `tools/libcudamoe.so` (`.dll` on Windows) | override the optional native CUDA library path |
+| `K3_ASSUME_FMA3` | `0` | Windows only: assert FMA3 on a CPU that has it without AVX2, which Windows cannot report |
 | `K3_CUDA_ARCH` | auto | add compiler-supported native CUDA images detected from installed GPUs while retaining a portable PTX fallback; accepts strict values such as `sm_89` or `sm_89,sm_120` for cross-builds |
 | `K3_CUDA_EXPERT_CACHE` | `auto` | maximum resident GPU experts; `auto` budgets from free VRAM at the first real route, after model allocations, while `0` keeps CUDA compute but disables residency |
 | `K3_CUDA_EXPERT_CACHE_RESERVE` | `auto` | VRAM kept outside the expert cache (`auto` is at least 2 GiB and 20% of free VRAM); accepts byte units or a percentage |
@@ -355,7 +385,7 @@ startup. These variables exist for overriding that:
 | `K3_SPEC_ROLLBACK` | `replay` | replay captured KDA inputs and truncate MLA for partial n-gram drafts; partial universal drafts always restore and narrow-rerun, while `rerun` selects that conservative path for n-grams too |
 | `K3_TEMPLATES` | `1` | template-layer buffer reuse |
 | `K3_PRELOAD` / `K3_PREFETCH` | `1` | background layer loading / expert prefetch |
-| `K3_GEMV_THREADS` | auto | native CPU MXFP4 workers: up to 4 effective CPUs on macOS and 8 on Linux, respecting affinity and cgroup quota; override to retune a specific host |
+| `K3_GEMV_THREADS` | auto | native CPU MXFP4 workers: up to 4 effective CPUs on macOS and 8 on Linux and Windows, respecting affinity and cgroup quota; override to retune a specific host |
 | `K3_GEMV_AUTOTUNE` | `0` | experimental one-shot CPU worker-width calibration on the first complete expert set; enables a width only when two exact trials agree on at least a 5% gain, and skips under load or when Metal/CUDA is selected ([details](OPTIMIZATIONS.md#live-cpu-worker-width-calibration)) |
 | `K3_METAL_POSITION_BATCH` | `0` | MPS/Metal-specific exact opt-in T>1 position-major MoE; measured +2.0% on accepted speculative passes and should be retuned per Mac |
 | `K3_MOE_TOP_K` | `16` | must remain the model's full 16 routed experts; startup rejects any lower value rather than exposing a quality/speed trade |
@@ -378,11 +408,14 @@ not promoted as general defaults here.
 
 ### Requirements
 
-- Apple Silicon macOS, or glibc-based x86-64/aarch64 Linux. Linux x86-64
-  requires AVX, FMA3, SSE3 and SSSE3; AVX2 is detected and selected at
-  runtime. The hash-pinned optional tokenizer wheels use the manylinux2014
-  ABI, so Alpine/musl is not currently an installation target.
-- A C/C++ compiler: Xcode Command Line Tools on macOS, or GCC/Clang on Linux.
+- Apple Silicon macOS, glibc-based x86-64/aarch64 Linux, or x86-64 Windows.
+  x86-64 hosts require AVX, FMA3, SSE3 and SSSE3; AVX2 is detected and selected
+  at runtime. Windows publishes no FMA3 query, so it is inferred from AVX2
+  there; set `K3_ASSUME_FMA3=1` for the rare CPU with FMA3 but no AVX2. The
+  hash-pinned optional tokenizer wheels use the manylinux2014 ABI, so
+  Alpine/musl is not currently an installation target.
+- A C/C++ compiler: Xcode Command Line Tools on macOS, GCC/Clang on Linux, or
+  the Visual Studio C++ build tools on Windows.
   Building the optional native CUDA expert path also requires NVCC; inference
   retains the native CPU expert path when it is absent.
 - Python 3.12 or newer.
@@ -642,17 +675,37 @@ The short version is:
 | NVIDIA Linux, x86-64 or aarch64 | CUDA | qualified native CUDA MXFP4, with native CPU fallback |
 | Linux x86-64 (AVX/FMA3/SSSE3 baseline) | CPU | runtime AVX2/FMA or exact 128-bit compatibility MXFP4 |
 | Linux aarch64 | CPU | native NEON MXFP4 |
+| NVIDIA Windows x86-64 | CUDA | qualified native CUDA MXFP4, with native CPU fallback |
+| Windows x86-64 (AVX/FMA3/SSSE3 baseline) | CPU | runtime AVX2/FMA or exact 128-bit compatibility MXFP4 |
 
 The NVIDIA path qualifies the optional CUDA expert library with a versioned
 ABI, fixed shape/layout handshake and small on-device known-answer tests before
 the first real expert call. Failure leaves the resident CUDA model path intact
-and selects the native CPU MXFP4 fallback. `build_native.py` selects `.dylib` or
-`.so`, applies the appropriate host ISA flags, validates required symbols and
-ABI, and only then installs the artifacts. Optional CUDA build failure cannot
-block installation of the required CPU libraries.
+and selects the native CPU MXFP4 fallback. `build_native.py` selects `.dylib`,
+`.so` or `.dll`, applies the appropriate host ISA flags, validates required
+symbols and ABI, and only then installs the artifacts. Optional CUDA build
+failure cannot block installation of the required CPU libraries.
 The x86 build is one fat binary: it requires the instructions used by the exact
 AVX/FMA3/SSSE3 baseline, detects AVX2 once at runtime, and calls the
-target-attributed 256-bit kernel only when the CPU and OS support it.
+256-bit kernel only when the CPU and OS support it. GCC and Clang isolate that
+kernel with a target attribute and `-mavx` sets the baseline; MSVC accepts the
+intrinsics regardless of `/arch` and uses `/arch:AVX` for the same baseline.
+The Windows kernels reach POSIX threading through `tools/win_compat.h`, a narrow
+shim over SRW locks, condition variables and `_beginthreadex`.
+
+The readers use positional reads rather than seek-then-read, so one cached
+open file can serve a whole worker pool without those threads serialising on a
+file pointer. CPython exposes that as `os.preadv` on POSIX and not at all on
+Windows, so `tools/positional_io.py` supplies the primitive directly:
+`ReadFile` takes its offset in an `OVERLAPPED` structure, and on a handle
+opened `FILE_FLAG_OVERLAPPED` several such reads may be in flight at once.
+Each read still blocks its own caller, so the readers keep their synchronous
+shape; only the serialisation disappears.
+
+Measured on the Windows reference machine over the real expert cache, warm,
+eight workers: 11.5 GB/s for the positional path against 1.9 GB/s for the
+`K3_EXPERT_READ=mmap` alternative, and `tools/test_expert_read.py` reads whole
+layers bit-exactly at 3.7 GB/s.
 
 Validation is intentionally separated from platform support:
 
@@ -661,7 +714,8 @@ Validation is intentionally separated from platform support:
 | Apple Silicon / MPS + Metal | maintainer-run end-to-end benchmarks and exact-token gates |
 | Linux aarch64 / CUDA + CPU MoE | community end-to-end run and contributor kernel tests on DGX Spark |
 | Linux x86-64 / CPU | strict fat-binary compilation plus selected/compatibility exactness under Rosetta; native Linux AVX2 timing is still wanted |
-| Native CUDA MXFP4 MoE | implementation is ABI/KAT/fallback-gated; CUDA hardware parity and throughput measurements are still wanted |
+| Windows x86-64 / CPU | MSVC build, the selected/compatibility and scale-LUT exactness gates, and bit-exact layer reads through the overlapped read path all run natively; an end-to-end token timing is still wanted |
+| Native CUDA MXFP4 MoE | ABI/KAT/fallback-gated, and the real-bridge tests now pass on an sm_120 device: exact e2m1 decode across all sixteen codes, cache identity, eviction and route combine. Throughput measurements are still wanted |
 
 ### Where this could go
 

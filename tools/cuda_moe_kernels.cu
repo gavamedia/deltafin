@@ -20,6 +20,14 @@
 #include <cstdio>
 #include <limits>
 
+// A Windows DLL exports nothing unless asked; ELF and Mach-O export every
+// non-static symbol.  K3_CUDA_EXPORT keeps one spelling for both.
+#if defined(_WIN32)
+#define K3_CUDA_EXPORT extern "C" __declspec(dllexport)
+#else
+#define K3_CUDA_EXPORT extern "C"
+#endif
+
 namespace {
 
 constexpr uint32_t kAbiVersion = 1;
@@ -232,11 +240,11 @@ int launch_gemv(
 
 }  // namespace
 
-extern "C" uint32_t k3_cuda_moe_abi_version(void) {
+K3_CUDA_EXPORT uint32_t k3_cuda_moe_abi_version(void) {
     return kAbiVersion;
 }
 
-extern "C" void k3_cuda_moe_shapes(
+K3_CUDA_EXPORT void k3_cuda_moe_shapes(
     int* hidden,
     int* intermediate,
     int64_t* expert_span,
@@ -255,11 +263,11 @@ extern "C" void k3_cuda_moe_shapes(
     }
 }
 
-extern "C" const char* k3_cuda_last_error(void) {
+K3_CUDA_EXPORT const char* k3_cuda_last_error(void) {
     return g_last_error;
 }
 
-extern "C" int k3_cuda_moe_available(int device) {
+K3_CUDA_EXPORT int k3_cuda_moe_available(int device) {
     int count = 0;
     cudaError_t status = cudaGetDeviceCount(&count);
     if (status != cudaSuccess) {
@@ -303,7 +311,7 @@ extern "C" int k3_cuda_moe_available(int device) {
     return 1;
 }
 
-extern "C" int k3_cuda_mxfp4_gemv(
+K3_CUDA_EXPORT int k3_cuda_mxfp4_gemv(
     const uint8_t* packed,
     const uint8_t* scales,
     const float* x,
@@ -323,7 +331,7 @@ extern "C" int k3_cuda_mxfp4_gemv(
         reinterpret_cast<cudaStream_t>(stream_pointer));
 }
 
-extern "C" int k3_cuda_moe_launch(
+K3_CUDA_EXPORT int k3_cuda_moe_launch(
     const uint8_t* expert_span,
     const float* x,
     int batches,
@@ -400,7 +408,7 @@ extern "C" int k3_cuda_moe_launch(
         stream);
 }
 
-extern "C" int k3_cuda_int8_dequant(
+K3_CUDA_EXPORT int k3_cuda_int8_dequant(
     const int8_t* quantized,
     const uint16_t* scales_fp16,
     float* output,

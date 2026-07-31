@@ -73,8 +73,10 @@ except ImportError:  # imported as tools.spine_cache instead of top-level
 _IS_DARWIN = sys.platform == "darwin"
 _IS_LINUX = sys.platform.startswith("linux")
 try:
+    # Windows has no sysconf at all, which is an AttributeError rather than the
+    # OSError a POSIX host raises for an unknown name.
     PAGE = int(os.sysconf("SC_PAGE_SIZE"))
-except (OSError, ValueError):
+except (AttributeError, OSError, ValueError):
     PAGE = 16384 if _IS_DARWIN else 4096
 _libc = None
 GIB = 1 << 30

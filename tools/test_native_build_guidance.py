@@ -18,6 +18,35 @@ import runtime_platform as rp
 import metal_moe
 
 
+def split_like_the_shell(command: str) -> list[str]:
+    """Parse a command the way the host's own shell would.
+
+    Windows is asked through CommandLineToArgvW rather than shlex, so this
+    checks the guidance against the real parser that will consume it instead of
+    against POSIX rules that would read its separators as escapes.
+    """
+    if os.name != "nt":
+        return shlex.split(command)
+
+    import ctypes
+    from ctypes import wintypes
+
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    local_free = ctypes.WinDLL("kernel32", use_last_error=True).LocalFree
+    shell32.CommandLineToArgvW.argtypes = [
+        wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)
+    ]
+    shell32.CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
+    count = ctypes.c_int(0)
+    argv = shell32.CommandLineToArgvW(command, ctypes.byref(count))
+    if not argv:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return [argv[index] for index in range(count.value)]
+    finally:
+        local_free(argv)
+
+
 class NativeBuildGuidanceTests(unittest.TestCase):
     def test_command_uses_active_python_and_quotes_checkout_path(self):
         tools = os.path.join(os.sep, "tmp", "Deltafin checkout", "tools")
@@ -25,10 +54,10 @@ class NativeBuildGuidanceTests(unittest.TestCase):
             tools, executable="/tmp/venv with spaces/bin/python"
         )
         self.assertEqual(
-            shlex.split(command),
+            split_like_the_shell(command),
             [
                 "/tmp/venv with spaces/bin/python",
-                os.path.join(tools, "build_native.py"),
+                os.path.join(os.path.abspath(tools), "build_native.py"),
             ],
         )
 
@@ -53,10 +82,10 @@ class NativeBuildGuidanceTests(unittest.TestCase):
             self.assertIn("K3_BATCH_LIB", message)
             command = message.split("with: ", 1)[1].split(" ; or ", 1)[0]
             self.assertEqual(
-                shlex.split(command),
+                split_like_the_shell(command),
                 [
                     "/tmp/venv/bin/python",
-                    os.path.join(tools, "build_native.py"),
+                    os.path.join(os.path.abspath(tools), "build_native.py"),
                 ],
             )
 

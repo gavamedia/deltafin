@@ -20,7 +20,6 @@ experts occupy ONE shard, back-to-back with zero gaps, sorted by str(eid).
 """
 import atexit
 import collections
-import fcntl
 import http.client
 import json
 import mmap
@@ -30,6 +29,12 @@ import ssl
 import stat
 import sys
 import threading
+
+try:
+    # Only ever called behind a Darwin guard, for F_NOCACHE.
+    import fcntl
+except ImportError:  # Windows has no fcntl module
+    fcntl = None
 import time
 import urllib.parse
 import concurrent.futures
@@ -39,10 +44,11 @@ import numpy as np
 try:
     from cache_writer import AsyncCacheWriter, atomic_publish
     import model_source
+    import positional_io
     import runtime_platform
 except ImportError:  # imported as tools.fetch_v2 instead of a top-level module
     from .cache_writer import AsyncCacheWriter, atomic_publish
-    from . import model_source, runtime_platform
+    from . import model_source, positional_io, runtime_platform
 
 ROOT = os.environ.get("DELTAFIN_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INV_PATH = os.path.join(ROOT, "k3-meta/tensor_inventory_offsets.json")
@@ -548,18 +554,16 @@ class _Slot:
         _bump(pread_slots=1)
 
     def read(self, path):
-        fd = os.open(path, os.O_RDONLY)
+        source = positional_io.open_positional(path)
         try:
+            fd = source.fileno()
             _apply_pread_nocache(fd)
-            off = 0
-            while off < EXPERT_SPAN:
-                n = os.preadv(fd, [self.mv[off:]], off)
-                if n <= 0:
-                    raise IOError(f"short read {off}/{EXPERT_SPAN} from {path}")
-                off += n
+            got = source.read_into(self.mv, 0)
+            if got != EXPERT_SPAN:
+                raise IOError(f"short read {got}/{EXPERT_SPAN} from {path}")
             _drop_linux_pread_cache(fd)
         finally:
-            os.close(fd)
+            source.close()
 
 
 class GroupReadError(IOError):

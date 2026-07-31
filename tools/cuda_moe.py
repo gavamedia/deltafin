@@ -27,6 +27,11 @@ from typing import Any, Hashable, Iterable, Mapping, Sequence
 import numpy as np
 import torch
 
+try:
+    from runtime_platform import native_library_filename
+except ImportError:  # imported as tools.cuda_moe instead of a top-level module
+    from .runtime_platform import native_library_filename
+
 
 ABI_VERSION = 1
 POINTER_LAYOUT = 1
@@ -38,8 +43,14 @@ EXPERT_SPAN = 17_547_264
 DEFAULT_LAYER_STRATA = 92
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+# The platforms tools/build_native.py can produce this library for.  macOS has
+# no CUDA at all, so the check stays a positive list rather than a Linux test.
+_CUDA_MOE_PLATFORM = (
+    sys.platform.startswith("linux") or sys.platform == "win32"
+)
 _LIBRARY_PATH = os.environ.get(
-    "K3_CUDA_MOE_LIB", os.path.join(_HERE, "libcudamoe.so")
+    "K3_CUDA_MOE_LIB",
+    os.path.join(_HERE, native_library_filename("libcudamoe")),
 )
 _DEFAULT_MODEL_KEY = ("deltafin-default-model",)
 _REQUIRED_SYMBOLS = (
@@ -323,13 +334,15 @@ def _load():
     with _load_lock:
         if _lib is not None or _load_error is not None:
             return _lib
-        if not sys.platform.startswith("linux"):
-            _load_error = "CUDA MoE native library is supported on Linux only"
+        if not _CUDA_MOE_PLATFORM:
+            _load_error = (
+                "CUDA MoE native library is supported on Linux and Windows only"
+            )
             return None
         if not os.path.isfile(_LIBRARY_PATH):
             _load_error = (
                 f"CUDA MoE library not found: {_LIBRARY_PATH}; "
-                "run this checkout's tools/build_native.py on a CUDA Linux host"
+                "run this checkout's tools/build_native.py on a CUDA host"
             )
             return None
         try:

@@ -16,6 +16,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))    # fla shim, k3loader, mxfp4
 # modeling files imported via tools/k3pkg package
 
+import positional_io  # noqa: E402
 import runtime_platform  # noqa: E402
 import packed_q8  # noqa: E402
 import quality_policy  # noqa: E402
@@ -53,7 +54,6 @@ MOE_TOP_K = quality_policy.full_moe_top_k(
 H = config.hidden_size
 NL = config.num_hidden_layers
 PFX = "language_model.model."
-_PREADV = getattr(os, "preadv", None)
 # Sensible defaults, no env vars required: use the GPU when there is one, and
 # use the int8 spine when it has been built. Both remain overridable.
 INT8_DIR = os.path.join(ROOT, "k3-resident-int8/tensors")
@@ -1343,28 +1343,28 @@ def _pilot_load(full):
 
 # --- embeddings via memmap (row reads only) -----------------------------------
 class LazyEmbed:
-    """bf16 embedding rows from a persistent local fd, else HTTP Range."""
+    """bf16 embedding rows from a persistent local file, else HTTP Range."""
     NAME = PFX + "embed_tokens.weight"
 
     def __init__(self):
         self.path = os.path.join(ROOT, "k3-resident/tensors", self.NAME)
         self.meta = k3loader.INV[self.NAME]
         self.rowbytes = H * 2
-        self._fd = None
-        self._ensure_fd()
+        self._source = None
+        self._ensure_source()
 
-    def _ensure_fd(self):
-        if self._fd is None:
+    def _ensure_source(self):
+        if self._source is None:
             try:
-                self._fd = os.open(self.path, os.O_RDONLY)
+                self._source = positional_io.open_positional(self.path)
             except FileNotFoundError:
                 pass
-        return self._fd
+        return self._source
 
     def close(self):
-        if self._fd is not None:
-            os.close(self._fd)
-            self._fd = None
+        if self._source is not None:
+            self._source.close()
+            self._source = None
 
     def __del__(self):
         try:
@@ -1373,7 +1373,7 @@ class LazyEmbed:
             pass
 
     def _local_rows(self, tids):
-        """Read sorted unique ids, coalescing adjacent rows into one pread."""
+        """Read sorted unique ids, coalescing adjacent rows into one read."""
         rows = {}
         uniq = sorted(set(tids))
         i = 0
@@ -1383,9 +1383,10 @@ class LazyEmbed:
                 j += 1
             first, count = uniq[i], j - i
             want = count * self.rowbytes
-            data = os.pread(self._fd, want, first * self.rowbytes)
-            if len(data) != want:
-                raise IOError(f"short embedding read {len(data)}/{want}")
+            try:
+                data = self._source.read(want, first * self.rowbytes)
+            except OSError as exc:
+                raise IOError(f"short embedding read of {want} bytes") from exc
             for k, tid in enumerate(uniq[i:j]):
                 lo = k * self.rowbytes
                 rows[tid] = data[lo:lo + self.rowbytes]
@@ -1395,35 +1396,33 @@ class LazyEmbed:
     def _local_row_buffer(self, tid):
         """Read one row directly into its final mutable tensor owner.
 
-        ``pread`` returns immutable bytes, which the frombuffer handoff must
-        copy into a bytearray. macOS and Linux expose ``preadv``; filling that
-        bytearray in place removes the common T=1 copy. The loop retains the
-        old error contract and completes a positive partial read.
+        Reading into bytes would force the frombuffer handoff to copy into a
+        bytearray; filling that bytearray in place removes the common T=1 copy.
+        positional_io supplies the positional read on every platform, so this
+        fast path is not restricted to hosts that expose preadv. A positive
+        partial read is completed there, and a genuine I/O failure propagates
+        unchanged; only a short file becomes the fail-closed error below.
         """
-        if _PREADV is None:
+        source = self._ensure_source()
+        if source is None:
             return None
         result = bytearray(self.rowbytes)
-        view = memoryview(result)
-        done = 0
-        while done < self.rowbytes:
-            count = _PREADV(
-                self._fd,
-                [view[done:]],
-                tid * self.rowbytes + done,
-            )
-            if count <= 0:
-                raise IOError(
-                    f"short embedding read {done}/{self.rowbytes}"
-                )
-            done += count
+        try:
+            source.read_into(memoryview(result), tid * self.rowbytes)
+        except positional_io.ShortRead as exc:
+            raise IOError(
+                f"short embedding read {exc.completed}/{self.rowbytes}"
+            ) from exc
         return result
 
     def _row(self, tid):
-        if self._ensure_fd() is not None:
-            buf = os.pread(self._fd, self.rowbytes, tid * self.rowbytes)
-            if len(buf) != self.rowbytes:
-                raise IOError(f"short embedding read {len(buf)}/{self.rowbytes}")
-            return buf
+        if self._ensure_source() is not None:
+            try:
+                return self._source.read(self.rowbytes, tid * self.rowbytes)
+            except OSError as exc:
+                raise IOError(
+                    f"short embedding read of {self.rowbytes} bytes"
+                ) from exc
         m = self.meta
         start = 8 + m["hlen"] + m["offsets"][0] + tid * self.rowbytes
         import urllib.request
@@ -1435,7 +1434,7 @@ class LazyEmbed:
 
     def __call__(self, ids):
         tids = [int(t) for t in ids]
-        local = self._ensure_fd() is not None
+        local = self._ensure_source() is not None
         owner = (
             self._local_row_buffer(tids[0])
             if local and len(tids) == 1

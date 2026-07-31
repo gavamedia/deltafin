@@ -28,10 +28,6 @@
 #error "The MXFP4 SIMD table expansion currently requires little-endian byte order"
 #endif
 
-#include <pthread.h>
-#if defined(__APPLE__)
-#include <pthread/qos.h>
-#endif
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -39,7 +35,30 @@
 #include <string.h>
 #include <time.h>
 #include <math.h>
+
+#if defined(_WIN32)
+// Supplies the pthread, sched and clock_gettime subset used below, plus the
+// aligned allocator and the export attribute a DLL needs.
+#include "win_compat.h"
+#else
+#include <pthread.h>
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
 #include <sched.h>
+// Mach-O and ELF export every non-static symbol, and both toolchains take the
+// aligned attribute in the same declaration slots.
+#define K3_EXPORT
+#define K3_ALIGNAS(n) __attribute__((aligned(n)))
+#define K3_ALIGN_PREFIX(n) __attribute__((aligned(n)))
+static inline void *k3_aligned_alloc(size_t alignment, size_t size) {
+    return aligned_alloc(alignment, size);
+}
+static inline void k3_aligned_free(void *ptr) {
+    free(ptr);
+}
+#endif
+
 #ifndef NO_MAIN
 #if defined(__APPLE__)
 #include <Accelerate/Accelerate.h>
@@ -52,14 +71,22 @@
 #endif
 #endif
 
-// x86 builds deliberately keep AVX2 inside target-attributed functions.  The
-// rest of the shared object needs only the exact 128-bit compatibility ISA, so
-// one binary can run on pre-AVX2 FMA hosts and select AVX2 at runtime.  This
-// requires GCC/Clang, which are also the compilers supported by build_native.py.
+// x86 builds deliberately keep AVX2 inside separately marked functions.  The
+// rest of the shared library needs only the exact 128-bit compatibility ISA, so
+// one binary can run on pre-AVX2 FMA hosts and select AVX2 at runtime.
+//
+// GCC and Clang need the target attribute to accept AVX2 intrinsics in a
+// translation unit compiled for a lower baseline.  MSVC instead accepts every
+// intrinsic regardless of /arch and emits AVX2 only where one is written, so the
+// same isolation holds with no attribute; /arch:AVX keeps the surrounding
+// baseline code VEX-encoded exactly as -mavx does.
 #if defined(MXFP4_ARCH_X86_64) \
         && (defined(__GNUC__) || defined(__clang__))
 #define MXFP4_CAN_BUILD_AVX2 1
 #define MXFP4_TARGET_AVX2 __attribute__((target("avx2,fma")))
+#elif defined(MXFP4_ARCH_X86_64) && defined(_MSC_VER)
+#define MXFP4_CAN_BUILD_AVX2 1
+#define MXFP4_TARGET_AVX2
 #else
 #define MXFP4_CAN_BUILD_AVX2 0
 #define MXFP4_TARGET_AVX2
@@ -82,7 +109,15 @@ static inline void mxfp4_qos_attr(pthread_attr_t *attr) {
 }
 
 static inline void mxfp4_cpu_relax(void) {
+#if defined(_MSC_VER)
+    // MSVC has no GNU inline assembler; these intrinsics emit the same YIELD
+    // and PAUSE instructions.
 #if defined(MXFP4_ARCH_ARM64)
+    __yield();
+#elif defined(MXFP4_ARCH_X86_64)
+    _mm_pause();
+#endif
+#elif defined(MXFP4_ARCH_ARM64)
     __asm__ volatile("yield");
 #elif defined(MXFP4_ARCH_X86_64)
     __asm__ volatile("pause");
@@ -92,7 +127,7 @@ static inline void mxfp4_cpu_relax(void) {
 #if defined(MXFP4_TEST_PTHREAD_FAIL_AFTER)
 static _Atomic int mxfp4_test_pthread_create_calls = 0;
 
-void mxfp4_test_reset_pthread_create(void) {
+K3_EXPORT void mxfp4_test_reset_pthread_create(void) {
     atomic_store_explicit(
         &mxfp4_test_pthread_create_calls, 0, memory_order_relaxed);
 }
@@ -120,7 +155,7 @@ static double now_s(void) {
 }
 
 // Stable loader handshake.  Increment only for an incompatible exported ABI change.
-uint32_t mxfp4_abi_version(void) {
+K3_EXPORT uint32_t mxfp4_abi_version(void) {
     return 1u;
 }
 
@@ -137,7 +172,7 @@ uint32_t mxfp4_abi_version(void) {
 #endif
 
 #if MXFP4_USE_SCALE_LUT
-typedef struct __attribute__((aligned(32))) {
+typedef struct K3_ALIGNAS(32) {
     uint8_t lo[16];
     uint8_t hi[16];
 } mxfp4_scale_lut_row_t;
@@ -201,8 +236,7 @@ typedef struct __attribute__((aligned(32))) {
     MXFP4_SCALE_LUT_ROW((s) + 12), MXFP4_SCALE_LUT_ROW((s) + 13), \
     MXFP4_SCALE_LUT_ROW((s) + 14), MXFP4_SCALE_LUT_ROW((s) + 15)
 
-static const mxfp4_scale_lut_row_t mxfp4_scale_lut[256]
-        __attribute__((aligned(64))) = {
+K3_ALIGN_PREFIX(64) static const mxfp4_scale_lut_row_t mxfp4_scale_lut[256] = {
     MXFP4_SCALE_LUT_ROWS_16(0),
     MXFP4_SCALE_LUT_ROWS_16(16),
     MXFP4_SCALE_LUT_ROWS_16(32),
@@ -320,9 +354,10 @@ static void ref_gemv(const uint8_t *restrict p, const uint8_t *restrict s,
 }
 
 // ---------------- fused kernel: TBL -> fp32-bit halves, exp add, widen, FMA ----------------
-void mxfp4_gemv_rows(const uint8_t *restrict p, const uint8_t *restrict s,
-                     const float *restrict x, float *restrict y,
-                     int row0, int row1, int cols) {
+K3_EXPORT void mxfp4_gemv_rows(
+        const uint8_t *restrict p, const uint8_t *restrict s,
+        const float *restrict x, float *restrict y,
+        int row0, int row1, int cols) {
     const int cp = cols / 2, groups = cols / 32;
     const uint8x16_t M0F = vdupq_n_u8(0x0F);
     for (int r = row0; r < row1; r++) {
@@ -363,9 +398,10 @@ void mxfp4_gemv_rows(const uint8_t *restrict p, const uint8_t *restrict s,
 }
 
 // ---- variant: 2 rows per pass, shared x loads, same per-row accumulation order ----
-void mxfp4_gemv_rows2(const uint8_t *restrict p, const uint8_t *restrict s,
-                      const float *restrict x, float *restrict y,
-                      int row0, int row1, int cols) {
+K3_EXPORT void mxfp4_gemv_rows2(
+        const uint8_t *restrict p, const uint8_t *restrict s,
+        const float *restrict x, float *restrict y,
+        int row0, int row1, int cols) {
     const int cp = cols / 2, groups = cols / 32;
     const uint8x16_t M0F = vdupq_n_u8(0x0F);
     int r = row0;
@@ -450,10 +486,10 @@ static float *mxfp4_prepare_x_avx2(const float *x, int cols) {
     size_t bytes = n * sizeof(float);
     if (bytes > SIZE_MAX - 63) return NULL;
     size_t aligned_bytes = (bytes + 63) & ~(size_t)63;
-    float *xp = (float *)aligned_alloc(64, aligned_bytes);
+    float *xp = (float *)k3_aligned_alloc(64, aligned_bytes);
     if (!xp) return NULL;
     if (!mxfp4_permute_x_avx2(x, xp, cols)) {
-        free(xp);
+        k3_aligned_free(xp);
         return NULL;
     }
     return xp;
@@ -622,7 +658,11 @@ static void dequant_neon_a(const uint8_t *restrict p, const uint8_t *restrict s,
 }
 
 // ---------------- threading ----------------
-typedef void (*gemv_fn)(const uint8_t *, const uint8_t *, const float *, float *, int, int, int);
+// The restrict qualifiers match both kernels this points at.  C ignores
+// top-level parameter qualifiers when comparing function types, but MSVC
+// compares them, so spelling them out keeps the assignment warning-free.
+typedef void (*gemv_fn)(const uint8_t *restrict, const uint8_t *restrict,
+                        const float *restrict, float *restrict, int, int, int);
 
 typedef struct { // generic row-partition job for one gemv
     gemv_fn fn;
@@ -726,12 +766,13 @@ static void *tworker(void *arg) {
 }
 
 // exported: full expert triple; returns seconds for iters repetitions
-double mxfp4_expert_triple(const uint8_t *p1, const uint8_t *s1,
-                           const uint8_t *p3, const uint8_t *s3,
-                           const uint8_t *p2, const uint8_t *s2,
-                           const float *x, const float *h,
-                           float *y1, float *y3, float *y2,
-                           int nthreads, int iters) {
+K3_EXPORT double mxfp4_expert_triple(
+        const uint8_t *p1, const uint8_t *s1,
+        const uint8_t *p3, const uint8_t *s3,
+        const uint8_t *p2, const uint8_t *s2,
+        const float *x, const float *h,
+        float *y1, float *y3, float *y2,
+        int nthreads, int iters) {
     _Atomic int bar = 0, ctrA = 0, ctrB = 0, start = 0;
     pthread_t th[MXFP4_MAX_THREADS];
     tjob_t jobs[MXFP4_MAX_THREADS];
@@ -774,12 +815,12 @@ double mxfp4_expert_triple(const uint8_t *p1, const uint8_t *s1,
 
 // Explicit exact compatibility exports make architecture tests able to compare
 // the selected path with the established 128-bit implementation.
-void mxfp4_gemv_compat(
+K3_EXPORT void mxfp4_gemv_compat(
         const uint8_t *p, const uint8_t *s, const float *x, float *y,
         int rows, int cols) {
     mxfp4_gemv_rows(p, s, x, y, 0, rows, cols);
 }
-void mxfp4_gemv_mt_compat(
+K3_EXPORT void mxfp4_gemv_mt_compat(
         const uint8_t *p, const uint8_t *s, const float *x, float *y,
         int rows, int cols, int nthreads) {
     run_gemv_mt(p, s, x, y, rows, cols, nthreads, 1);
@@ -794,16 +835,20 @@ static int mxfp4_dispatch_avx2 = 0;
 static void mxfp4_detect_dispatch(void) {
     const char *disable = getenv("K3_MXFP4_DISABLE_AVX2");
     if (disable && disable[0] && strcmp(disable, "0") != 0) return;
+#if defined(_MSC_VER)
+    mxfp4_dispatch_avx2 = k3_cpu_supports_avx2();
+#else
     __builtin_cpu_init();
     mxfp4_dispatch_avx2 = !!__builtin_cpu_supports("avx2");
+#endif
 }
 
-int mxfp4_have_avx2(void) {
+K3_EXPORT int mxfp4_have_avx2(void) {
     pthread_once(&mxfp4_dispatch_once, mxfp4_detect_dispatch);
     return mxfp4_dispatch_avx2;
 }
 
-MXFP4_TARGET_AVX2 void mxfp4_gemv_avx2(
+K3_EXPORT MXFP4_TARGET_AVX2 void mxfp4_gemv_avx2(
         const uint8_t *p, const uint8_t *s, const float *x, float *y,
         int rows, int cols) {
     float *xp = mxfp4_prepare_x_avx2(x, cols);
@@ -812,10 +857,10 @@ MXFP4_TARGET_AVX2 void mxfp4_gemv_avx2(
         return;
     }
     mxfp4_gemv_rows2_avx2_prepared(p, s, xp, y, 0, rows, cols);
-    free(xp);
+    k3_aligned_free(xp);
 }
 
-MXFP4_TARGET_AVX2 void mxfp4_gemv_mt_avx2(
+K3_EXPORT MXFP4_TARGET_AVX2 void mxfp4_gemv_mt_avx2(
         const uint8_t *p, const uint8_t *s, const float *x, float *y,
         int rows, int cols, int nthreads) {
     float *xp = mxfp4_prepare_x_avx2(x, cols);
@@ -826,15 +871,15 @@ MXFP4_TARGET_AVX2 void mxfp4_gemv_mt_avx2(
     run_gemv_mt_k(
         mxfp4_gemv_rows2_avx2_prepared,
         p, s, xp, y, rows, cols, nthreads, 1);
-    free(xp);
+    k3_aligned_free(xp);
 }
 #else
-int mxfp4_have_avx2(void) { return 0; }
+K3_EXPORT int mxfp4_have_avx2(void) { return 0; }
 #endif
 
 // Stable ctypes entry points select the best runtime path. ARM and x86 hosts
 // without AVX2 retain the exact established implementation.
-void mxfp4_gemv(
+K3_EXPORT void mxfp4_gemv(
         const uint8_t *p, const uint8_t *s, const float *x, float *y,
         int rows, int cols) {
 #if MXFP4_CAN_BUILD_AVX2
@@ -846,7 +891,7 @@ void mxfp4_gemv(
     mxfp4_gemv_compat(p, s, x, y, rows, cols);
 }
 
-void mxfp4_gemv_mt(
+K3_EXPORT void mxfp4_gemv_mt(
         const uint8_t *p, const uint8_t *s, const float *x, float *y,
         int rows, int cols, int nthreads) {
 #if MXFP4_CAN_BUILD_AVX2
@@ -861,7 +906,7 @@ void mxfp4_gemv_mt(
 #ifndef NO_MAIN
 // ---------------- harness ----------------
 static void *load_file(const char *name, size_t sz) {
-    void *buf = aligned_alloc(128, (sz + 127) & ~(size_t)127);
+    void *buf = k3_aligned_alloc(128, (sz + 127) & ~(size_t)127);
     FILE *f = fopen(name, "rb");
     if (!f || fread(buf, 1, sz, f) != sz) { fprintf(stderr, "load %s failed\n", name); exit(1); }
     fclose(f);
@@ -896,11 +941,11 @@ int main(int argc, char **argv) {
     double *r64_2 = load_file("w2_yref64.bin", R2 * sizeof(double));
     float *r32_1 = load_file("w1_yref32.bin", R13 * sizeof(float));
 
-    float *y_ref = aligned_alloc(128, R2 * sizeof(float));
-    float *y_fus = aligned_alloc(128, R2 * sizeof(float));
-    float *y1 = aligned_alloc(128, R13 * sizeof(float));
-    float *y3 = aligned_alloc(128, R13 * sizeof(float));
-    float *y2 = aligned_alloc(128, R2 * sizeof(float));
+    float *y_ref = k3_aligned_alloc(128, R2 * sizeof(float));
+    float *y_fus = k3_aligned_alloc(128, R2 * sizeof(float));
+    float *y1 = k3_aligned_alloc(128, R13 * sizeof(float));
+    float *y3 = k3_aligned_alloc(128, R13 * sizeof(float));
+    float *y2 = k3_aligned_alloc(128, R2 * sizeof(float));
 
     // ---- correctness ----
     printf("== correctness (real L1-E0 data) ==\n");
@@ -929,7 +974,7 @@ int main(int argc, char **argv) {
     errstats(r32_1, r64_1, R13, "w1 numpy-fp32 vs numpy-fp64");
 #if MXFP4_HAVE_CBLAS
     // Accelerate/OpenBLAS baseline correctness
-    float *Wbuf = aligned_alloc(128, (size_t)R13 * C13 * sizeof(float));
+    float *Wbuf = k3_aligned_alloc(128, (size_t)R13 * C13 * sizeof(float));
     dequant_neon_a(w1p, w1s, Wbuf, 0, R13, C13);
     cblas_sgemv(CblasRowMajor, CblasNoTrans, R13, C13, 1.0f, Wbuf, C13, x, 1, 0.0f, y_ref, 1);
     errstats(y_ref, r64_1, R13, "w1 dequant+sgemv vs fp64");
@@ -989,7 +1034,7 @@ int main(int argc, char **argv) {
         printf("triple extrapolated: %.1f us/expert\n", 3 * (bd + bs) * 1e6);
     }
 
-    free(Wbuf);
+    k3_aligned_free(Wbuf);
 #endif
     return 0;
 }

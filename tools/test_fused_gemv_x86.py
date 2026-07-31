@@ -16,6 +16,7 @@ import ctypes
 import os
 import platform
 import random
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,53 @@ F32P = ctypes.POINTER(ctypes.c_float)
 I32P = ctypes.POINTER(ctypes.c_int)
 
 
+def _build_msvc(
+    source: str,
+    output: Path,
+    *,
+    extra_cflags: tuple[str, ...] = (),
+) -> None:
+    """Build one kernel with MSVC, matching what build_native.py installs.
+
+    /arch:AVX is the -mavx analogue used by the GNU command below: a VEX
+    baseline that still leaves AVX2 to the kernel's runtime selection.
+    """
+    import build_native as native
+
+    if any(not flag.startswith("-D") for flag in extra_cflags):
+        raise RuntimeError(f"cannot translate {extra_cflags!r} for MSVC")
+    environment = native.msvc_environment()
+    compiler = shutil.which(
+        "cl",
+        path=native.environment_path(environment) if environment else None,
+    )
+    if compiler is None:
+        raise RuntimeError("cl.exe not found; install the VS C++ build tools")
+    scratch = output.parent
+    subprocess.run(
+        [
+            compiler,
+            "/nologo",
+            "/O2",
+            "/std:c11",
+            "/experimental:c11atomics",
+            "/arch:AVX",
+            *(f"/D{flag[2:]}" for flag in extra_cflags),
+            "/DNO_MAIN",
+            "/LD",
+            str(HERE / source),
+            f"/Fe:{output}",
+            f"/Fo:{os.path.join(str(scratch), '')}",
+            "/link",
+            "/INCREMENTAL:NO",
+            f"/IMPLIB:{scratch / (output.stem + '.lib')}",
+        ],
+        check=True,
+        cwd=HERE,
+        env=dict(environment) if environment else None,
+    )
+
+
 def _build(
     source: str,
     output: Path,
@@ -36,6 +84,9 @@ def _build(
 ) -> None:
     if platform.machine().lower() not in {"x86_64", "amd64"}:
         raise RuntimeError("this exactness gate must execute as x86-64")
+    if os.name == "nt":
+        _build_msvc(source, output, extra_cflags=extra_cflags)
+        return
     cc = os.environ.get("CC", "cc")
     cmd = [
         cc,
@@ -272,8 +323,24 @@ def _test_batch(
     lib.mxfp4_pool_shutdown()
 
 
+def _release(*libraries: ctypes.CDLL) -> None:
+    """Unload test libraries so the temporary directory can be removed.
+
+    Windows keeps a loaded module's file locked; on POSIX this is a no-op.
+    """
+    import build_native as native
+
+    for library in libraries:
+        native.release_library(library)
+
+
 def main() -> int:
-    suffix = ".dylib" if sys.platform == "darwin" else ".so"
+    if sys.platform == "darwin":
+        suffix = ".dylib"
+    elif os.name == "nt":
+        suffix = ".dll"
+    else:
+        suffix = ".so"
     with tempfile.TemporaryDirectory(prefix="deltafin-x86-kernel-test-") as td:
         tmp = Path(td)
         gemv_path = tmp / f"libmxfp4gemv{suffix}"
@@ -293,33 +360,40 @@ def main() -> int:
         gemv = ctypes.CDLL(str(gemv_path))
         batch = ctypes.CDLL(str(batch_path))
         synthesis = ctypes.CDLL(str(synth_path))
-        _bind(gemv)
-        _bind(batch)
-        _bind(synthesis)
-        rng = random.Random(0xD37AF1)
-        _test_gemv(gemv, rng)
-        _test_scale_lut_equivalence(gemv, synthesis, rng)
-        _test_batch(batch, synthesis, rng)
-
-        # The override is disable-only: it deterministically exercises the
-        # baseline through the stable entry points without ever permitting an
-        # unsupported ISA to be forced on.
-        old_disable = os.environ.get("K3_MXFP4_DISABLE_AVX2")
-        os.environ["K3_MXFP4_DISABLE_AVX2"] = "1"
+        forced_gemv = None
+        forced_batch = None
         try:
-            forced_gemv = ctypes.CDLL(str(forced_gemv_path))
-            forced_batch = ctypes.CDLL(str(forced_batch_path))
-            _bind(forced_gemv, expected_avx2=0)
-            _bind(forced_batch, expected_avx2=0)
-            forced_rng = random.Random(0xD37AF1)
-            _test_gemv(forced_gemv, forced_rng)
-            _test_scale_lut_equivalence(forced_gemv, synthesis, forced_rng)
-            _test_batch(forced_batch, synthesis, forced_rng)
+            _bind(gemv)
+            _bind(batch)
+            _bind(synthesis)
+            rng = random.Random(0xD37AF1)
+            _test_gemv(gemv, rng)
+            _test_scale_lut_equivalence(gemv, synthesis, rng)
+            _test_batch(batch, synthesis, rng)
+
+            # The override is disable-only: it deterministically exercises the
+            # baseline through the stable entry points without ever permitting
+            # an unsupported ISA to be forced on.
+            old_disable = os.environ.get("K3_MXFP4_DISABLE_AVX2")
+            os.environ["K3_MXFP4_DISABLE_AVX2"] = "1"
+            try:
+                forced_gemv = ctypes.CDLL(str(forced_gemv_path))
+                forced_batch = ctypes.CDLL(str(forced_batch_path))
+                _bind(forced_gemv, expected_avx2=0)
+                _bind(forced_batch, expected_avx2=0)
+                forced_rng = random.Random(0xD37AF1)
+                _test_gemv(forced_gemv, forced_rng)
+                _test_scale_lut_equivalence(forced_gemv, synthesis, forced_rng)
+                _test_batch(forced_batch, synthesis, forced_rng)
+            finally:
+                if old_disable is None:
+                    os.environ.pop("K3_MXFP4_DISABLE_AVX2", None)
+                else:
+                    os.environ["K3_MXFP4_DISABLE_AVX2"] = old_disable
         finally:
-            if old_disable is None:
-                os.environ.pop("K3_MXFP4_DISABLE_AVX2", None)
-            else:
-                os.environ["K3_MXFP4_DISABLE_AVX2"] = old_disable
+            loaded = [gemv, batch, synthesis]
+            loaded += [item for item in (forced_gemv, forced_batch) if item]
+            _release(*loaded)
     print(
         "PASS: x86-64 runtime ISA selection and forced compatibility dispatch, scale LUT "
         "versus synthesis, odd/even GEMV, MT, and deduplicated batch paths"

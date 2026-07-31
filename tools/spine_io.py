@@ -1,4 +1,4 @@
-"""Low-level spine read primitives (fd cache, chunked preadv, OS I/O hints).
+"""Low-level spine read primitives (reader cache, chunking, OS I/O hints).
 
 The int8 spine is 53 GB and is re-read from disk on every forward pass, so the
 read is the single largest term in a decode token.  tools/spine_fast.py's
@@ -37,11 +37,16 @@ Flags (all default to the pre-existing behaviour):
 """
 import ctypes
 import ctypes.util
-import fcntl
 import os
 import struct
 import sys
 import threading
+
+try:
+    # Only ever called behind a Darwin guard, for F_NOCACHE and F_RDADVISE.
+    import fcntl
+except ImportError:  # Windows has no fcntl module
+    fcntl = None
 
 try:
     import resource
@@ -49,8 +54,10 @@ except ImportError:  # Windows/import-only tooling; native readers are Unix.
     resource = None
 
 try:
+    import positional_io
     from runtime_platform import darwin_file_hints_enabled
 except ImportError:  # imported as tools.spine_io instead of a top-level module
+    from . import positional_io
     from .runtime_platform import darwin_file_hints_enabled
 
 # ------------------------------------------------------ descriptor budget ----
@@ -63,9 +70,17 @@ FDCACHE_DEFAULT_REQUIRED = 4_096
 FDCACHE_RESERVE = 1_024
 
 
+# Windows has no RLIMIT_NOFILE, and these readers are kernel handles from
+# CreateFileW rather than CRT descriptors, so the limit this budget polices does
+# not exist there.  Reporting it as effectively unbounded is the accurate
+# answer; reporting zero would read as "no descriptors available" and refuse a
+# cache the caller explicitly asked for.
+FDCACHE_UNPOLICED_LIMIT = 1 << 24
+
+
 def _fd_limits():
     if resource is None:
-        return 0, 0
+        return FDCACHE_UNPOLICED_LIMIT, FDCACHE_UNPOLICED_LIMIT
     try:
         return resource.getrlimit(resource.RLIMIT_NOFILE)
     except (OSError, ValueError):
@@ -134,10 +149,14 @@ def _fdcache_decision(requested, required_fds=None):
         f", raised automatically from {raised_from}"
         if raised_from is not None else ""
     )
+    unpoliced = (
+        "" if resource is not None
+        else " (Windows: handles are not subject to RLIMIT_NOFILE)"
+    )
     return (
         True,
         f"soft RLIMIT_NOFILE={soft} leaves {available} safe descriptors"
-        f"{raised}",
+        f"{raised}{unpoliced}",
     )
 
 
@@ -265,13 +284,15 @@ def set_thread_qos():
         return None
 
 
-# ------------------------------------------------------------- fd cache -----
+# --------------------------------------------------------- reader cache -----
 # Read-only blobs that never change for the life of the process.  Opened once,
-# never closed.  All reads go through preadv(), which is position-independent,
-# so a single fd is safe to share across every reader thread with no seek state
-# and no lock.
-_FDS = ({}, {})            # [0] = normal (page-cached), [1] = F_NOCACHE
-_FDS_LOCK = threading.Lock()
+# never closed.  Every read carries its own offset and touches no file pointer,
+# so one open file is safe to share across every reader thread with no seek
+# state and no lock.  tools/positional_io.py provides that guarantee on Windows
+# as well, where CPython has no preadv.
+# [0] = normal (page-cached), [1] = F_NOCACHE.
+_SOURCES = ({}, {})
+_SOURCES_LOCK = threading.Lock()
 OPENS = 0
 
 
@@ -311,44 +332,50 @@ def _drop_read_cache(fd, offset, count, requested=False):
     )
 
 
-def fd_for(path, nocache=False):
+def source_for(path, nocache=False):
+    """Return the cached positional reader for one path.
+
+    The cache exists so a whole worker pool shares one open file.  That is safe
+    precisely because every read carries its own offset, on Windows as well as
+    POSIX -- see tools/positional_io.py.
+    """
     nc = 1 if _use_nocache(nocache) else 0
-    tbl = _FDS[nc]
-    fd = tbl.get(path)
-    if fd is not None:
-        return fd
-    with _FDS_LOCK:
-        fd = tbl.get(path)
-        if fd is None:
-            fd = os.open(path, os.O_RDONLY)
+    tbl = _SOURCES[nc]
+    source = tbl.get(path)
+    if source is not None:
+        return source
+    with _SOURCES_LOCK:
+        source = tbl.get(path)
+        if source is None:
+            source = positional_io.open_positional(path)
             try:
                 if nc:
-                    _apply_nocache(fd, nocache)
+                    _apply_nocache(source.fileno(), nocache)
             except Exception:
-                os.close(fd)
+                source.close()
                 raise
-            tbl[path] = fd
+            tbl[path] = source
             global OPENS
             OPENS += 1
-    return fd
+    return source
 
 
 def _open_transient(path, nocache=False):
-    fd = os.open(path, os.O_RDONLY)
+    source = positional_io.open_positional(path)
     try:
-        _apply_nocache(fd, nocache)
+        _apply_nocache(source.fileno(), nocache)
     except Exception:
-        os.close(fd)
+        source.close()
         raise
-    return fd
+    return source
 
 
 def close_all():
-    with _FDS_LOCK:
-        for tbl in _FDS:
-            for fd in tbl.values():
+    with _SOURCES_LOCK:
+        for tbl in _SOURCES:
+            for source in tbl.values():
                 try:
-                    os.close(fd)
+                    source.close()
                 except OSError:
                     pass
             tbl.clear()
@@ -360,10 +387,13 @@ def rdadvise(path, offset=0, count=0):
     if not (_IS_DARWIN or _IS_LINUX):
         return False
     try:
-        fd = fd_for(path) if FDCACHE else _open_transient(path)
+        source = source_for(path) if FDCACHE else _open_transient(path)
     except OSError:
         return False
     try:
+        fd = source.fileno()
+        if fd is None:
+            return False
         if not count:
             count = os.fstat(fd).st_size - offset
         if count <= 0:
@@ -382,34 +412,26 @@ def rdadvise(path, offset=0, count=0):
     finally:
         if not FDCACHE:
             try:
-                os.close(fd)
+                source.close()
             except OSError:
                 pass
 
 
 # --------------------------------------------------------------- reading ----
-def _pread_into(fd, mv, off):
-    """preadv into a preallocated slice.  os.pread would allocate and then need
-    a second memcpy; preadv writes straight into our packed buffer."""
-    n = len(mv)
-    got = 0
-    while got < n:
-        r = os.preadv(fd, [mv[got:]], off + got)
-        if r <= 0:
-            raise OSError(f"short read: {got}/{n} @{off}")
-        got += r
-    return got
-
-
+# Reads go straight into a preallocated slice of the packed buffer.  Reading
+# into a fresh object and copying would double the memory traffic of the whole
+# spine, which is the one cost this path exists to avoid.
 def read_one(path, mv, off=0, nocache=False):
-    fd = fd_for(path, nocache) if FDCACHE else _open_transient(path, nocache)
+    source = source_for(path, nocache) if FDCACHE else _open_transient(
+        path, nocache
+    )
     try:
-        got = _pread_into(fd, mv, off)
-        _drop_read_cache(fd, off, got, nocache)
+        got = source.read_into(mv, off)
+        _drop_read_cache(source.fileno(), off, got, nocache)
         return got
     finally:
         if not FDCACHE:
-            os.close(fd)
+            source.close()
 
 
 def make_jobs(files):
@@ -472,13 +494,15 @@ def _drain(it, lock, nocache=False):
                 path, foff, mv = nxt()
             except StopIteration:
                 return
-        fd = fd_for(path, nocache) if FDCACHE else _open_transient(path, nocache)
+        source = source_for(path, nocache) if FDCACHE else _open_transient(
+            path, nocache
+        )
         try:
-            got = _pread_into(fd, mv, foff)
-            _drop_read_cache(fd, foff, got, nocache)
+            got = source.read_into(mv, foff)
+            _drop_read_cache(source.fileno(), foff, got, nocache)
         finally:
             if not FDCACHE:
-                os.close(fd)
+                source.close()
 
 
 # ------------------------------------------------------- two-tier reading ---

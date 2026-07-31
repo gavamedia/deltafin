@@ -220,8 +220,9 @@ def check_embedding_fd():
         with open(path, "wb") as f:
             f.write(payload)
         obj = kr.LazyEmbed.__new__(kr.LazyEmbed)
-        obj.path, obj.meta, obj.rowbytes, obj._fd = path, {}, rowbytes, None
-        obj._ensure_fd()
+        obj.path, obj.meta, obj.rowbytes = path, {}, rowbytes
+        obj._source = None
+        obj._ensure_source()
 
         def baseline(ids):
             rows = []

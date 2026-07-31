@@ -24,6 +24,32 @@ import inventory_meta  # noqa: E402
 import setup_k3 as setup  # noqa: E402
 
 
+def _can_create_symlinks() -> bool:
+    """Whether this process may create a symbolic link at all.
+
+    Windows requires SeCreateSymbolicLinkPrivilege, which an ordinary account
+    only holds with Developer Mode enabled.  The refusal these tests check is
+    real on every platform; without the privilege the fixture cannot be built,
+    which is a property of the test account, not of the code under test.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        target = os.path.join(directory, "target")
+        with open(target, "wb"):
+            pass
+        try:
+            os.symlink(target, os.path.join(directory, "link"))
+        except (OSError, NotImplementedError, AttributeError):
+            return False
+    return True
+
+
+SYMLINKS_AVAILABLE = _can_create_symlinks()
+requires_symlinks = unittest.skipUnless(
+    SYMLINKS_AVAILABLE,
+    "creating symbolic links is not permitted for this process",
+)
+
+
 class ModelSourcePinTests(unittest.TestCase):
     def test_default_source_is_an_immutable_revision(self):
         self.assertEqual(
@@ -133,6 +159,7 @@ class SetupPinTests(unittest.TestCase):
                 setup.fetch(name)
         self.assertEqual(destination.read_bytes(), payload + b"x")
 
+    @requires_symlinks
     def test_existing_symlink_is_refused(self):
         name, payload, specs = self.fixture()
         meta, package = self.directories()
@@ -299,6 +326,7 @@ class InventoryHardeningTests(unittest.TestCase):
             ):
                 inventory_meta.load_verified_inventory(str(meta))
 
+    @requires_symlinks
     def test_existing_inventory_symlink_is_refused_before_network(self):
         _root, meta = self.directories()
         target = meta / "untrusted.json"
@@ -442,7 +470,11 @@ class InventoryHardeningTests(unittest.TestCase):
             setup._publish_inventory(str(destination), document)
 
         self.assertEqual(destination.read_bytes(), payload)
-        self.assertGreaterEqual(fsync.call_count, 2)
+        # The payload fsync is universal. The directory fsync that persists the
+        # rename is POSIX-only: _fsync_directory documents itself as acting
+        # "where the platform supports it", and Windows cannot open a directory
+        # as a descriptor at all.
+        self.assertGreaterEqual(fsync.call_count, 1 if os.name == "nt" else 2)
         self.assertEqual(replace.call_count, 1)
         temporary, published = replace.call_args.args
         self.assertNotEqual(temporary, str(destination) + ".part")

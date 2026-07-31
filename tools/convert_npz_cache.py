@@ -46,13 +46,18 @@ Usage
 """
 import argparse
 import concurrent.futures
-import fcntl
 import hashlib
 import os
 import re
 import sys
 import threading
 import time
+
+try:
+    # Only ever called behind a Darwin guard, for F_NOCACHE.
+    import fcntl
+except ImportError:  # Windows has no fcntl module
+    fcntl = None
 
 import numpy as np
 

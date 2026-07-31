@@ -106,13 +106,84 @@ class TargetTests(unittest.TestCase):
         self.assertEqual(arm.c_arch_flags, ("-mcpu=native",))
         self.assertFalse(arm.supports_metal)
 
+    def test_windows_target_uses_msvc_and_a_vex_baseline(self):
+        windows = native.detect_target("win32", "AMD64")
+        self.assertEqual(windows.platform, "windows")
+        self.assertEqual(windows.machine, "x86_64")
+        self.assertEqual(windows.suffix, ".dll")
+        self.assertEqual(windows.toolchain, "msvc")
+        self.assertFalse(windows.supports_metal)
+        # /arch:AVX is the -mavx analogue: a VEX baseline that does not promise
+        # AVX2, which the kernel still selects at runtime.
+        self.assertEqual(windows.c_arch_flags, ("/arch:AVX",))
+        self.assertNotIn("/arch:AVX2", windows.c_arch_flags)
+        self.assertEqual(
+            native.detect_target("win32", "x86_64").machine, "x86_64"
+        )
+
     def test_unsupported_targets_are_clear(self):
         with self.assertRaisesRegex(native.BuildError, "Apple Silicon"):
             native.detect_target("darwin", "x86_64")
         with self.assertRaisesRegex(native.BuildError, "supported architectures"):
             native.detect_target("linux", "riscv64")
+        with self.assertRaisesRegex(
+            native.BuildError, "unsupported Windows architecture"
+        ):
+            native.detect_target("win32", "arm64")
         with self.assertRaisesRegex(native.BuildError, "unsupported platform"):
-            native.detect_target("win32", "amd64")
+            native.detect_target("freebsd14", "amd64")
+
+    def test_windows_artifacts_are_dlls_without_metal(self):
+        windows = native.detect_target("win32", "AMD64")
+        names = [
+            artifact.destination.name
+            for artifact in native.artifacts_for(windows)
+        ]
+        self.assertEqual(names, ["libmxfp4gemv.dll", "libmxfp4batch.dll"])
+        for artifact in native.artifacts_for(windows):
+            self.assertTrue(
+                set(native.X86_AVX2_SYMBOLS).issubset(artifact.required_symbols)
+            )
+        cuda = [
+            artifact
+            for artifact in native.artifacts_for(
+                windows, cuda_mode="on", nvcc_available=True
+            )
+            if artifact.language == "cuda"
+        ]
+        self.assertEqual([item.destination.name for item in cuda], ["libcudamoe.dll"])
+
+    def test_windows_cpu_preflight_infers_fma_from_avx2(self):
+        target = native.detect_target("win32", "AMD64")
+        complete = {
+            native.PF_SSE3_INSTRUCTIONS_AVAILABLE,
+            native.PF_SSSE3_INSTRUCTIONS_AVAILABLE,
+            native.PF_AVX_INSTRUCTIONS_AVAILABLE,
+            native.PF_AVX2_INSTRUCTIONS_AVAILABLE,
+        }
+        self.assertEqual(
+            native.windows_cpu_features(
+                feature_probe=lambda item: item in complete
+            ),
+            frozenset({"sse3", "ssse3", "avx", "fma"}),
+        )
+        without_avx2 = complete - {native.PF_AVX2_INSTRUCTIONS_AVAILABLE}
+        self.assertNotIn(
+            "fma",
+            native.windows_cpu_features(
+                feature_probe=lambda item: item in without_avx2
+            ),
+        )
+        self.assertIn(
+            "fma",
+            native.windows_cpu_features(
+                feature_probe=lambda item: item in without_avx2,
+                assume_fma3=True,
+            ),
+        )
+        native.preflight_target(target, cpu_flags=BASE_FLAGS)
+        with self.assertRaisesRegex(native.BuildError, "K3_ASSUME_FMA3"):
+            native.preflight_target(target, cpu_flags=BASE_FLAGS - {"fma"})
 
     def test_x86_cpu_preflight(self):
         target = native.detect_target("linux", "x86_64")
@@ -278,7 +349,9 @@ class CommandTests(unittest.TestCase):
         self.assertIn("-gencode=arch=compute_75,code=compute_75", command)
         self.assertFalse(any("sm_100" in part for part in command))
         self.assertFalse(any("sm_120" in part for part in command))
-        self.assertEqual(command[-2:], ["-o", "/tmp/libcudamoe.so"])
+        self.assertEqual(
+            command[-2:], ["-o", str(Path("/tmp/libcudamoe.so"))]
+        )
 
     def test_cuda_command_adds_native_sass_without_losing_portable_ptx(self):
         target = native.detect_target("linux", "x86_64")
@@ -329,6 +402,89 @@ class CommandTests(unittest.TestCase):
 
         with self.assertRaisesRegex(native.BuildError, "could not locate NVCC"):
             native.cuda_compiler_argv({}, finder=broken_path)
+
+    def test_windows_c_command_targets_msvc(self):
+        target = native.detect_target("win32", "AMD64")
+        artifact = native.artifacts_for(target)[0]
+        command = native.compile_command(
+            artifact,
+            target,
+            Path(r"C:\out\libmxfp4gemv.dll"),
+            environ={"CC": sys.executable},
+            scratch=Path(r"C:\scratch"),
+        )
+        self.assertEqual(command[0], sys.executable)
+        self.assertIn("/LD", command)
+        self.assertIn("/arch:AVX", command)
+        self.assertIn("/DNO_MAIN", command)
+        # MSVC gates C11 atomics, which the worker latches depend on.
+        self.assertIn("/experimental:c11atomics", command)
+        self.assertIn(r"/Fe:C:\out\libmxfp4gemv.dll", command)
+        # Objects and the import library must not land beside the installed DLL.
+        self.assertIn("/Fo:" + os.path.join(r"C:\scratch", ""), command)
+        # Build the expected import-library path the same way, rather than
+        # spelling the separator: this assertion has to hold when the suite
+        # runs on macOS or Linux too, where joining produces a forward slash.
+        self.assertIn(
+            "/IMPLIB:" + str(Path(r"C:\scratch") / "libmxfp4gemv.lib"),
+            command,
+        )
+        for gnu_only in ("-fPIC", "-shared", "-lpthread", "-lm", "-O3"):
+            self.assertNotIn(gnu_only, command)
+
+    def test_windows_cuda_command_uses_shared_crt_and_scratch_implib(self):
+        target = native.detect_target("win32", "AMD64")
+        artifact = next(
+            item
+            for item in native.artifacts_for(
+                target, cuda_mode="on", nvcc_available=True
+            )
+            if item.language == "cuda"
+        )
+        command = native.compile_command(
+            artifact,
+            target,
+            Path(r"C:\out\libcudamoe.dll"),
+            cuda_compiler=[sys.executable, "--nvcc-wrapper"],
+            cuda_codegen=native.CudaCodegen("75", ("120",)),
+            scratch=Path(r"C:\scratch"),
+        )
+        # The DLL and its Python caller must share one CRT heap.
+        self.assertIn("-Xcompiler=/MD", command)
+        self.assertNotIn("-Xcompiler=-fPIC", command)
+        self.assertIn(
+            "/IMPLIB:" + str(Path(r"C:\scratch") / "libcudamoe.lib"), command
+        )
+        self.assertIn("-gencode=arch=compute_75,code=sm_75", command)
+        self.assertIn("-gencode=arch=compute_120,code=sm_120", command)
+        self.assertIn("-gencode=arch=compute_75,code=compute_75", command)
+
+    def test_command_splitting_follows_the_host_not_the_target(self):
+        # A CC override names an executable this machine runs, so Windows path
+        # separators must survive even when building for another target.
+        self.assertEqual(
+            native.split_command(r"C:\Tools\cl.exe /nologo", windows=True),
+            [r"C:\Tools\cl.exe", "/nologo"],
+        )
+        self.assertEqual(
+            native.split_command(r'"C:\Program Files\cl.exe" /W3', windows=True),
+            [r"C:\Program Files\cl.exe", "/W3"],
+        )
+        self.assertEqual(
+            native.split_command("cc -pipe", windows=False), ["cc", "-pipe"]
+        )
+        self.assertEqual(
+            native.render_command(["cl", r"C:\a b\x.c"], windows=True),
+            'cl "C:\\a b\\x.c"',
+        )
+
+    def test_environment_path_lookup_is_case_insensitive(self):
+        # Windows reports its own variable as "Path", not "PATH".
+        self.assertEqual(
+            native.environment_path({"Path": r"C:\bin", "OTHER": "x"}), r"C:\bin"
+        )
+        self.assertEqual(native.environment_path({"PATH": "/usr/bin"}), "/usr/bin")
+        self.assertIsNone(native.environment_path({"HOME": "/root"}))
 
 
 class CudaArchitectureTests(unittest.TestCase):
