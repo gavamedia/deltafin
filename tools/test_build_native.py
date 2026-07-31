@@ -422,7 +422,13 @@ class CommandTests(unittest.TestCase):
         self.assertIn(r"/Fe:C:\out\libmxfp4gemv.dll", command)
         # Objects and the import library must not land beside the installed DLL.
         self.assertIn("/Fo:" + os.path.join(r"C:\scratch", ""), command)
-        self.assertIn(r"/IMPLIB:C:\scratch\libmxfp4gemv.lib", command)
+        # Build the expected import-library path the same way, rather than
+        # spelling the separator: this assertion has to hold when the suite
+        # runs on macOS or Linux too, where joining produces a forward slash.
+        self.assertIn(
+            "/IMPLIB:" + str(Path(r"C:\scratch") / "libmxfp4gemv.lib"),
+            command,
+        )
         for gnu_only in ("-fPIC", "-shared", "-lpthread", "-lm", "-O3"):
             self.assertNotIn(gnu_only, command)
 
@@ -446,7 +452,9 @@ class CommandTests(unittest.TestCase):
         # The DLL and its Python caller must share one CRT heap.
         self.assertIn("-Xcompiler=/MD", command)
         self.assertNotIn("-Xcompiler=-fPIC", command)
-        self.assertIn(r"/IMPLIB:C:\scratch\libcudamoe.lib", command)
+        self.assertIn(
+            "/IMPLIB:" + str(Path(r"C:\scratch") / "libcudamoe.lib"), command
+        )
         self.assertIn("-gencode=arch=compute_75,code=sm_75", command)
         self.assertIn("-gencode=arch=compute_120,code=sm_120", command)
         self.assertIn("-gencode=arch=compute_75,code=compute_75", command)
