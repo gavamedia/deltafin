@@ -306,13 +306,8 @@ Please read these caveats before pointing anything automated at it:
   just normal (slow) inference. The server prints a warning at startup when
   you're in streaming mode.
 - **Greedy only.** `temperature` and `top_p` are accepted and ignored, and one
-  request runs at a time. A second concurrent request is rejected immediately
-  with a 429 and a `Retry-After` estimate; set `K3_SERVER_QUEUE=N` (or
-  `--queue N`) to let up to N requests wait for the slot instead, in roughly
-  arrival order. A client that disconnects is dropped from the queue within
-  half a second, and a generation whose client has vanished is abandoned at
-  the next decoder layer — during prefill too, so a dead client cannot keep
-  an hours-long cold prefill running.
+  request runs at a time (a second concurrent request gets an immediate 429;
+  `K3_SERVER_QUEUE=N` lets N requests wait instead).
 - **Growing chats are resubmitted.** OpenAI-compatible clients normally send
   the complete message history each turn. Deltafin tokenizes that full history
   and currently creates a fresh model cache and prefills it again. The
@@ -374,7 +369,7 @@ startup. These variables exist for overriding that:
 | `DELTAFIN_ROOT` | repo root | where caches and weights live |
 | `K3_HF_HOST` / `K3_HF_PATH` | Hugging Face | point expert fetching at a mirror |
 | `K3_SERVER_MAX_TOKENS` | unlimited | optional hard ceiling on server generations |
-| `K3_SERVER_QUEUE` | `0` | requests allowed to wait for the single generation slot; `0` rejects a concurrent request immediately with 429 + `Retry-After`; the `--queue` flag overrides this |
+| `K3_SERVER_QUEUE` | `0` | requests allowed to wait for the generation slot; `0` returns 429 immediately |
 | `K3_SERVER_GIGATOKEN` | `auto` | exact server-chat tokenization: `auto` initializes after the first completed chat response, `on` requires it at startup, and `off` never imports it; the `--gigatoken` flag overrides this |
 | `K3_RESPONSE_MEMO_ENTRIES` | `32` | exact in-process replay cache for identical deterministic API requests; `0` disables |
 
