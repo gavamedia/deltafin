@@ -17,6 +17,8 @@
 #include "provider_target_tape.h"
 #include "../../tools/metal_moe_abi.h"
 
+#include <c10/cuda/CUDACachingAllocator.h>
+
 #include <ATen/ATen.h>
 #include <ATen/ops/_weight_int8pack_mm.h>
 #include <ATen/ops/add.h>
@@ -608,6 +610,12 @@ struct Session {
         hidden_columns(requested_hidden_columns),
         experts(requested_experts) {
     if (selected.device.is_cuda()) {
+      // PyTorch 2.13's CUDA caching allocator requires explicit initialization
+      // before any allocator API (getDeviceStats/emptyCache/allocations) is
+      // used; this session is the first CUDA touch in a fresh process and the
+      // higher-level PyTorch init paths that would do this are not exercised.
+      c10::cuda::CUDACachingAllocator::init(
+          c10::cuda::device_count_ensure_non_zero());
       // This is an authoritative target invariant, not a performance hint.
       // Reassert it in require_open() as well so later process-global changes
       // cannot silently switch an already-open K3 session to TF32.
