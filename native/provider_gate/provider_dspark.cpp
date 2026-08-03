@@ -375,6 +375,14 @@ at::Tensor dspark_apply_yarn_rotary_bf16(const at::Tensor& value,
   }
   const auto original_shape = value.sizes().vec();
   auto pair_shape = original_shape;
+  // Unreachable in practice: value.dim() >= 2 was validated above, so the
+  // shape has a trailing dimension. The explicit guard lets GCC's
+  // -Warray-bounds analysis prove pair_shape.back() below is in bounds;
+  // GCC 15 otherwise reports a false positive through the vector copy.
+  if (pair_shape.empty()) {
+    throw std::invalid_argument(
+        "DSpark rotary shape has no trailing dimension");
+  }
   pair_shape.back() = shape.qk_rope_head_dim / 2;
   pair_shape.push_back(2);
   const at::Tensor pairs = value.to(at::kFloat).reshape(pair_shape);
