@@ -109,6 +109,10 @@ dist/
 *~
 
 # --- private planning / experiment ledgers ------------------
+# Historical local A/B experiment scripts. The supported product and release
+# tests are native; these must not re-enter the published source graph.
+/scripts/ab_pilot.sh
+/scripts/ab_pilot_analyze.py
 /BRAINSTORM-SPEED.md
 /PLAN.md
 /experiments/
