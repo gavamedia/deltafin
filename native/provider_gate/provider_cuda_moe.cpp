@@ -8,6 +8,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -634,6 +635,27 @@ struct CudaMoeExpertCache::Impl {
       return;
     }
     const c10::cuda::CUDAGuard guard(device);
+    if (const char* override_gb =
+        std::getenv("K3_CUDA_EXPERT_CACHE_GB")) {
+      // Explicit GiB ceiling for the resident expert cache. The automatic
+      // free/5 reserve leaves too little contiguous headroom for transient
+      // spine binds on smaller GPUs; this bounds the cache so the engine's
+      // own transient arena fits. Decimal GiB, like K3_SPINE_RESIDENT_GB.
+      char* end = nullptr;
+      const double gigabytes = std::strtod(override_gb, &end);
+      if (end == override_gb || *end != '\0' || gigabytes < 0.0 ||
+          !std::isfinite(gigabytes)) {
+        throw std::invalid_argument(
+            "K3_CUDA_EXPERT_CACHE_GB must be a finite non-negative "
+            "GiB value");
+      }
+      const std::size_t bytes =
+          static_cast<std::size_t>(gigabytes * 1'000'000'000.0);
+      capacity =
+          std::min(kCudaMaximumExperts, bytes / kCudaExpertSpan);
+      budget_ready = true;
+      return;
+    }
     std::size_t free_bytes = 0;
     std::size_t total_bytes = 0;
     const cudaError_t status = cudaMemGetInfo(&free_bytes, &total_bytes);

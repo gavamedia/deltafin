@@ -6,6 +6,7 @@ Normal operation needs no environment overrides. The most useful controls are:
 |---|---|---|
 | `--device` / `K3_DEV` | `auto` | `mps`, `cuda`, `cuda:N` or `cpu`, with capability-gated auto selection |
 | `--expert-backend` / `K3_MOE` | `auto` | `metal`, `cuda` or `cpu`, with capability-gated auto selection |
+| `K3_CUDA_EXPERT_CACHE_GB` | auto | explicit GiB ceiling for the resident CUDA expert cache; the automatic free/5 reserve can leave too little contiguous headroom for transient spine binds on smaller GPUs |
 | `--spine` / `K3_SPINE` | `auto` | `auto` and `bf16` mean original weights; `int8` is explicit and non-weight-exact |
 | `K3_EXPERT_SCALE4` | `auto` | `auto`, `off` or `require` for complete lossless scale4 sidecars |
 | `K3_DSPARK` | `auto` | `auto`, `off` or force-qualified `on`; K3 verification is never bypassed |
