@@ -91,8 +91,9 @@ compiler/archiver must resolve to a native Mach-O or ELF executable, Python
 environment variables and shell-startup hooks are removed, and conventional
 interpreter names in the private build `PATH` resolve to a compiled denial
 guard. That guard leaves a marker before failing; every native compilation and
-archive operation checks the marker. CUDA 12.6/13.0 NVCC is admitted only as a
-native executable belonging to the same major toolkit ABI as LibTorch.
+archive operation checks the marker. CUDA 12.6 or any CUDA 13.x NVCC is
+admitted only as a native executable belonging to the same major toolkit ABI
+as LibTorch.
 
 HTTPS setup and upgrades likewise avoid a generic native-package discovery
 script. Deltafin carries a narrowly maintained `curl-sys` fork whose upstream

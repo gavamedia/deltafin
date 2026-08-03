@@ -2839,7 +2839,7 @@ fn build_cuda_kernel(
     };
     let Some(compiler) = discover_nvcc() else {
         if mode == CudaMode::On {
-            panic!("DELTAFIN_CUDA_MOE=ON needs NVCC from exact CUDA 12.6 or 13.0");
+            panic!("DELTAFIN_CUDA_MOE=ON needs NVCC from CUDA 12.6 or any CUDA 13.x");
         }
         if emit_cargo_metadata {
             println!(
@@ -2868,9 +2868,9 @@ fn build_cuda_kernel(
             compiler.display()
         );
     }
-    if !matches!((toolkit_major, toolkit_minor), (12, 6) | (13, 0)) {
+    if !matches!((toolkit_major, toolkit_minor), (12, 6) | (13, _)) {
         panic!(
-            "Deltafin's PyTorch 2.13 CUDA gate accepts exact CUDA 12.6 or 13.0; found {toolkit_version}"
+            "Deltafin's PyTorch 2.13 CUDA gate accepts CUDA 12.6 or any CUDA 13.x; found {toolkit_version}"
         );
     }
     let toolkit_root = cuda_toolkit_root(&compiler);
@@ -3052,8 +3052,8 @@ fn cuda_architectures(major: u8, minor: u8) -> String {
         return value.into_owned();
     }
     match (major, minor, target_arch().as_str()) {
-        (13, 0, "aarch64") => "80;90;100;110;120",
-        (13, 0, "x86_64") => "75;80;86;90;100;120",
+        (13, _, "aarch64") => "80;90;100;110;120",
+        (13, _, "x86_64") => "75;80;86;90;100;120",
         (12, 6, "aarch64") => "80;90",
         (12, 6, "x86_64") => "50;60;70;75;80;86;90",
         (_, _, arch) => panic!("unsupported CUDA toolkit/target combination for {arch}"),
@@ -3901,6 +3901,18 @@ mod tests {
         assert!(
             !CUDA_IEEE_MATH_FLAGS.contains(&"--use_fast_math"),
             "authoritative CUDA kernels must not enable fast math"
+        );
+    }
+
+    #[test]
+    fn cuda_architectures_accept_any_cuda_13_minor_for_blackwell() {
+        unsafe {
+            std::env::remove_var("DELTAFIN_CUDA_ARCHITECTURES");
+        }
+        let architectures = cuda_architectures(13, 3);
+        assert!(
+            architectures.split(';').any(|part| part == "120"),
+            "CUDA 13.x must keep targeting Blackwell sm_120, got {architectures}"
         );
     }
 }
