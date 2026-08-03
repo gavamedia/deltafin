@@ -10,5 +10,6 @@ rust-version.workspace = true
 
 [dependencies]
 curl = { version = "=0.4.50", default-features = false, features = ["force-system-lib-on-osx"] }
+libc = "=0.2.189"
 sha2 = "=0.10.9"
 zip = { version = "=7.2.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }

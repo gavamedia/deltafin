@@ -258,6 +258,7 @@ name = "deltafin-bootstrap"
 version = "0.1.0"
 dependencies = [
  "curl",
+ "libc",
  "sha2",
  "zip",
 ]

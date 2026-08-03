@@ -3685,7 +3685,12 @@ fn open_deferred_catalog_source(
     source: &DeferredSourceName,
 ) -> Result<File> {
     unsafe extern "C" {
-        fn openat(directory: i32, path: *const i8, flags: i32, ...) -> i32;
+        fn openat(
+            directory: libc::c_int,
+            path: *const libc::c_char,
+            flags: libc::c_int,
+            ...
+        ) -> libc::c_int;
     }
     // SAFETY: the catalog retains a live directory descriptor, `source` is a
     // validated NUL-terminated direct child name, and no mode argument is

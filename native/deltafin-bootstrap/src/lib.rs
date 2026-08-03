@@ -1775,7 +1775,7 @@ const fn open_nofollow_cloexec() -> i32 {
 }
 #[cfg(target_os = "linux")]
 const fn open_nofollow_cloexec() -> i32 {
-    0x000a_0000
+    libc::O_NOFOLLOW | libc::O_CLOEXEC
 }
 #[cfg(target_os = "macos")]
 const fn open_directory_flags() -> i32 {
@@ -1783,7 +1783,7 @@ const fn open_directory_flags() -> i32 {
 }
 #[cfg(target_os = "linux")]
 const fn open_directory_flags() -> i32 {
-    0x000b_0000
+    libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
 }
 
 #[cfg(target_os = "macos")]
