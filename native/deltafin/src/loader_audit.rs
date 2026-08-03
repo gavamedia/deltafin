@@ -698,6 +698,7 @@ fn system_elf_soname(path: &[u8]) -> bool {
         b"libcurl.so".as_slice(),
         b"libcuda.so".as_slice(),
         b"libnvidia-ml.so".as_slice(),
+        b"libz.so".as_slice(),
     ]
     .iter()
     .any(|stem| versioned_soname(basename, stem));
