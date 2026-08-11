@@ -465,7 +465,7 @@ impl CompiledSpine {
 
 type NativeQwenDraft = FailSoftQwenDraft<NativeQwen, K3Tokenizer, QwenTokenizer>;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct QwenPlan {
     state: QwenRuntimeState,
     initial: Option<QwenVariant>,
@@ -1338,19 +1338,18 @@ impl NativeTargetEngine {
         // first authoritative read. CUDA keeps its provider-owned device
         // cache, so the host tier is limited to the scattered-span backends.
         let expert_heat = ExpertHeat::open(&model_root, config.expert_heat);
-        let expert_pin_tier = (config.expert_pin_bytes > 0
-            && matches!(
-                expert_backend,
-                ResolvedExpertBackend::Cpu | ResolvedExpertBackend::Metal
-            ))
-        .then(|| {
-            ExpertPinTier::plan(
-                expert_heat.snapshot(),
-                experts.layout().expert_span_bytes(),
-                config.expert_pin_bytes,
-            )
-        })
-        .flatten();
+        // The tier is planned and charged only after residency selection:
+        // charging its ceiling ahead of selection let a large budget displace
+        // resident spine layers one-for-one. Only the request and the
+        // backend gate are captured here.
+        let requested_expert_pin_bytes = if matches!(
+            expert_backend,
+            ResolvedExpertBackend::Cpu | ResolvedExpertBackend::Metal
+        ) {
+            config.expert_pin_bytes
+        } else {
+            0
+        };
         let expert_reader_workers = configured_expert_reader_workers(config.expert_read_threads);
         let metal_expert_retire_hook: Option<BufferRetireHook> =
             (expert_backend == ResolvedExpertBackend::Metal).then(|| {
@@ -1444,25 +1443,16 @@ impl NativeTargetEngine {
         } else {
             0
         };
-        // The pin tier fills lazily, but its exact ceiling is reserved up
-        // front so residency selection can never double-book those bytes
-        // against the resident spine prefix. A cold histogram charges only
-        // the recorder arrays.
+        // The pin tier's exact ceiling is admitted against post-selection
+        // headroom below, so fixed costs carry only the recorder arrays here.
         let fixed_host_addition = fixed_host_addition
-            .checked_add(
-                expert_pin_tier
-                    .as_ref()
-                    .map_or(0, ExpertPinTier::charged_host_bytes),
-            )
-            .and_then(|bytes| {
-                bytes.checked_add(if expert_heat.recording() {
-                    EXPERT_HEAT_HOST_RESERVE_BYTES
-                } else {
-                    0
-                })
+            .checked_add(if expert_heat.recording() {
+                EXPERT_HEAT_HOST_RESERVE_BYTES
+            } else {
+                0
             })
             .ok_or_else(|| {
-                DeltafinError::new("expert-pin host reserve overflows fixed host costs")
+                DeltafinError::new("expert-heat host reserve overflows fixed host costs")
             })?;
         let fixed = fixed_costs(
             &program,
@@ -1524,27 +1514,32 @@ impl NativeTargetEngine {
             requested_layers: config.provider_resident_layers,
             requested_provider_bytes: None,
         };
-        let (baseline_residency, baseline_transient) = select_residency_with_transient(
-            host_memory,
-            provider_memory,
-            &provider_layer_bytes,
-            fixed,
-            residency_override,
-        )?;
-        let admit_qwen = |plan: QwenPlan| {
-            let qwen_fixed = qwen_fixed_costs(fixed, plan)?;
-            let (residency, transient_layer_bytes) = select_residency_with_transient(
+        // One complete plan selection (baseline residency plus the Qwen
+        // wide -> probe-only -> inactive fallback chain) for a given set of
+        // fixed costs. Pin-tier admission below re-runs this with candidate
+        // pin charges, so the chain must remain deterministic in `fixed`.
+        let select_plan = |fixed: FixedCosts| -> Result<(QwenPlan, ResidencySelection, u64)> {
+            let (baseline_residency, baseline_transient) = select_residency_with_transient(
                 host_memory,
                 provider_memory,
                 &provider_layer_bytes,
-                qwen_fixed,
+                fixed,
                 residency_override,
-            )
-            .ok()?;
-            qwen_residency_admitted(&residency).then_some((plan, residency, transient_layer_bytes))
-        };
-        let (qwen_plan, residency, transient_layer_bytes) =
-            if discovered_qwen.reserved_provider_bytes != 0 {
+            )?;
+            let admit_qwen = |plan: QwenPlan| {
+                let qwen_fixed = qwen_fixed_costs(fixed, plan)?;
+                let (residency, transient_layer_bytes) = select_residency_with_transient(
+                    host_memory,
+                    provider_memory,
+                    &provider_layer_bytes,
+                    qwen_fixed,
+                    residency_override,
+                )
+                .ok()?;
+                qwen_residency_admitted(&residency)
+                    .then_some((plan, residency, transient_layer_bytes))
+            };
+            Ok(if discovered_qwen.reserved_provider_bytes != 0 {
                 if let Some(admitted) = admit_qwen(discovered_qwen) {
                     admitted
                 } else if let Some(admitted) =
@@ -1560,6 +1555,78 @@ impl NativeTargetEngine {
                 }
             } else {
                 (discovered_qwen, baseline_residency, baseline_transient)
+            })
+        };
+        let (qwen_plan, residency, transient_layer_bytes) = select_plan(fixed)?;
+        // Post-selection pin admission. The selected spine prefix, the Qwen
+        // plan and a valid residency memory proof all outrank the optional
+        // pin tier, so its budget is clamped to the largest whole-expert
+        // charge whose re-selection reproduces the plan above exactly. A
+        // cold or sparse histogram disables the tier as before; that is not
+        // a memory clamp and is not reported as one.
+        let (expert_pin_tier, qwen_plan, residency, transient_layer_bytes) =
+            if requested_expert_pin_bytes == 0 {
+                (None, qwen_plan, residency, transient_layer_bytes)
+            } else {
+                let span_bytes = experts.layout().expert_span_bytes();
+                match ExpertPinTier::plan(
+                    expert_heat.snapshot(),
+                    span_bytes,
+                    requested_expert_pin_bytes,
+                ) {
+                    None => (None, qwen_plan, residency, transient_layer_bytes),
+                    Some(requested_tier) => {
+                        let nominal_count = requested_tier.candidate_count();
+                        let admitted_count = admit_expert_pin_budget(
+                            nominal_count,
+                            span_bytes,
+                            fixed,
+                            &select_plan,
+                            &qwen_plan,
+                            &residency,
+                        );
+                        if admitted_count < nominal_count {
+                            eprintln!(
+                                "[native] expert pin tier: memory admission clamped the requested {:.2} GiB roster to {} of {} candidate experts ({:.2} GiB); the resident spine prefix and Qwen plan are preserved",
+                                requested_expert_pin_bytes as f64 / f64::from(1_u32 << 30),
+                                admitted_count,
+                                nominal_count,
+                                (admitted_count as u64 * span_bytes as u64) as f64
+                                    / f64::from(1_u32 << 30),
+                            );
+                        }
+                        if admitted_count == 0 {
+                            (None, qwen_plan, residency, transient_layer_bytes)
+                        } else {
+                            let admitted_bytes = (admitted_count as u64)
+                                .checked_mul(span_bytes as u64)
+                                .ok_or_else(|| {
+                                    DeltafinError::new(
+                                        "admitted expert-pin charge overflows u64",
+                                    )
+                                })?;
+                            let tier = ExpertPinTier::plan(
+                                expert_heat.snapshot(),
+                                span_bytes,
+                                admitted_bytes,
+                            );
+                            let charge =
+                                tier.as_ref().map_or(0, ExpertPinTier::charged_host_bytes);
+                            let host_bytes =
+                                fixed.host_bytes.checked_add(charge).ok_or_else(|| {
+                                    DeltafinError::new(
+                                        "expert-pin host reserve overflows fixed host costs",
+                                    )
+                                })?;
+                            let (qwen_plan, residency, transient_layer_bytes) =
+                                select_plan(FixedCosts {
+                                    host_bytes,
+                                    provider_bytes: fixed.provider_bytes,
+                                })?;
+                            (tier, qwen_plan, residency, transient_layer_bytes)
+                        }
+                    }
+                }
             };
         let spine_reader_workers = configured_spine_reader_workers(
             config.spine_read_threads,
@@ -2878,6 +2945,61 @@ fn qwen_residency_admitted(selection: &ResidencySelection) -> bool {
             | ResidencyStop::FixedCostsExceedBudget
             | ResidencyStop::ArithmeticOverflow
     )
+}
+
+/// Largest whole-expert pin charge that reproduces the reference plan.
+///
+/// The reference (resident spine prefix, Qwen plan, valid memory proof)
+/// always outranks the optional pin tier. Charged bytes are nondecreasing in
+/// the candidate count, residency selection never grows under larger fixed
+/// costs, and the Qwen fallback chain only degrades — so admission is a
+/// monotone prefix over the count and binary search is sound. A candidate is
+/// also rejected when its own selection's memory proof failed, which keeps an
+/// explicit zero-layer override distinguishable from an over-budget result.
+fn admit_expert_pin_budget<S>(
+    eligible_experts: usize,
+    span_bytes: usize,
+    base_fixed: FixedCosts,
+    select_plan: &S,
+    reference_qwen: &QwenPlan,
+    reference_residency: &ResidencySelection,
+) -> usize
+where
+    S: Fn(FixedCosts) -> Result<(QwenPlan, ResidencySelection, u64)>,
+{
+    let admitted = |count: usize| -> bool {
+        if count == 0 {
+            return true;
+        }
+        let Some(charge) = (count as u64).checked_mul(span_bytes as u64) else {
+            return false;
+        };
+        let Some(host_bytes) = base_fixed.host_bytes.checked_add(charge) else {
+            return false;
+        };
+        let probe = FixedCosts {
+            host_bytes,
+            provider_bytes: base_fixed.provider_bytes,
+        };
+        match select_plan(probe) {
+            Ok((qwen_plan, residency, _)) => {
+                residency.resident_layers == reference_residency.resident_layers
+                    && qwen_plan == *reference_qwen
+                    && qwen_residency_admitted(&residency)
+            }
+            Err(_) => false,
+        }
+    };
+    let (mut low, mut high) = (0_usize, eligible_experts);
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if admitted(mid) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    low
 }
 
 impl NativeTargetEngine {
@@ -9742,5 +9864,177 @@ mod tests {
         assert_eq!(spans[0], &expected[..span_bytes]);
         assert_eq!(spans[1], &expected[span_bytes..2 * span_bytes]);
         assert_eq!(tier.hits(), 4);
+    }
+
+    const PIN_TEST_SPAN: usize = 1 << 20;
+
+    fn pin_test_selection(resident_layers: usize, stop: ResidencyStop) -> ResidencySelection {
+        ResidencySelection {
+            resident_layers,
+            resident_provider_bytes: 0,
+            host_envelope_bytes: None,
+            provider_envelope_bytes: None,
+            stop,
+            override_clamped_by_safety: false,
+        }
+    }
+
+    fn pin_test_base_fixed() -> FixedCosts {
+        FixedCosts {
+            host_bytes: 8 * PIN_TEST_SPAN as u64,
+            provider_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn pin_admission_fills_only_residual_headroom() {
+        // Ten whole experts of headroom remain above base fixed costs; the
+        // eleventh displaces a resident spine layer and must be refused.
+        let base = pin_test_base_fixed();
+        let reference_qwen = QwenPlan::inactive(QwenRuntimeState::NotInstalled);
+        let reference_residency =
+            pin_test_selection(93, ResidencyStop::NextLayerWouldExceedBudget);
+        let headroom = base.host_bytes + 10 * PIN_TEST_SPAN as u64;
+        let select = |fixed: FixedCosts| -> Result<(QwenPlan, ResidencySelection, u64)> {
+            let layers = if fixed.host_bytes <= headroom { 93 } else { 92 };
+            Ok((
+                QwenPlan::inactive(QwenRuntimeState::NotInstalled),
+                pin_test_selection(layers, ResidencyStop::NextLayerWouldExceedBudget),
+                0,
+            ))
+        };
+        for eligible in [0_usize, 1, 10, 100] {
+            let admitted = admit_expert_pin_budget(
+                eligible,
+                PIN_TEST_SPAN,
+                base,
+                &select,
+                &reference_qwen,
+                &reference_residency,
+            );
+            assert_eq!(admitted, eligible.min(10), "eligible={eligible}");
+        }
+    }
+
+    #[test]
+    fn pin_admission_rejects_probes_whose_memory_proof_failed() {
+        // An explicit zero-layer override and an over-budget selection both
+        // report zero resident layers; only the failed proof distinguishes
+        // them, so the proof conjunct must bound admission.
+        let base = pin_test_base_fixed();
+        let reference_qwen = QwenPlan::inactive(QwenRuntimeState::NotInstalled);
+        let reference_residency = pin_test_selection(0, ResidencyStop::ExplicitLayerLimit);
+        let proof_limit = base.host_bytes + 5 * PIN_TEST_SPAN as u64;
+        let select = |fixed: FixedCosts| -> Result<(QwenPlan, ResidencySelection, u64)> {
+            let stop = if fixed.host_bytes <= proof_limit {
+                ResidencyStop::ExplicitLayerLimit
+            } else {
+                ResidencyStop::FixedCostsExceedBudget
+            };
+            Ok((
+                QwenPlan::inactive(QwenRuntimeState::NotInstalled),
+                pin_test_selection(0, stop),
+                0,
+            ))
+        };
+        let admitted = admit_expert_pin_budget(
+            64,
+            PIN_TEST_SPAN,
+            base,
+            &select,
+            &reference_qwen,
+            &reference_residency,
+        );
+        assert_eq!(admitted, 5);
+    }
+
+    #[test]
+    fn pin_admission_rejects_qwen_plan_downgrades() {
+        // A charge that pushes the wide Qwen plan into its probe-only
+        // fallback preserves the layer count but changes the plan; the full
+        // QwenPlan equality must refuse it.
+        let base = pin_test_base_fixed();
+        let wide = QwenPlan {
+            state: QwenRuntimeState::NotInstalled,
+            initial: None,
+            wide_lazy: true,
+            reserved_provider_bytes: 4 * PIN_TEST_SPAN as u64,
+            reserved_verify_bytes: 0,
+            reserved_verify_positions: 0,
+            context_capacity: 0,
+        };
+        let reference_residency = pin_test_selection(93, ResidencyStop::AllLayersFit);
+        let wide_limit = base.host_bytes + 3 * PIN_TEST_SPAN as u64;
+        let select = |fixed: FixedCosts| -> Result<(QwenPlan, ResidencySelection, u64)> {
+            let plan = if fixed.host_bytes <= wide_limit {
+                wide
+            } else {
+                QwenPlan {
+                    wide_lazy: false,
+                    reserved_provider_bytes: PIN_TEST_SPAN as u64,
+                    ..wide
+                }
+            };
+            Ok((
+                plan,
+                pin_test_selection(93, ResidencyStop::AllLayersFit),
+                0,
+            ))
+        };
+        let admitted = admit_expert_pin_budget(
+            64,
+            PIN_TEST_SPAN,
+            base,
+            &select,
+            &wide,
+            &reference_residency,
+        );
+        assert_eq!(admitted, 3);
+    }
+
+    #[test]
+    fn pin_admission_returns_zero_without_headroom_or_on_overflow() {
+        let reference_qwen = QwenPlan::inactive(QwenRuntimeState::NotInstalled);
+        let reference_residency = pin_test_selection(93, ResidencyStop::AllLayersFit);
+        // No headroom: any charge at all costs a spine layer.
+        let strict = |fixed: FixedCosts| -> Result<(QwenPlan, ResidencySelection, u64)> {
+            let layers = if fixed.host_bytes <= pin_test_base_fixed().host_bytes {
+                93
+            } else {
+                92
+            };
+            Ok((
+                QwenPlan::inactive(QwenRuntimeState::NotInstalled),
+                pin_test_selection(layers, ResidencyStop::AllLayersFit),
+                0,
+            ))
+        };
+        assert_eq!(
+            admit_expert_pin_budget(
+                16,
+                PIN_TEST_SPAN,
+                pin_test_base_fixed(),
+                &strict,
+                &reference_qwen,
+                &reference_residency,
+            ),
+            0
+        );
+        // Checked arithmetic rejects the probe instead of wrapping.
+        let saturated = FixedCosts {
+            host_bytes: u64::MAX - 1,
+            provider_bytes: 0,
+        };
+        assert_eq!(
+            admit_expert_pin_budget(
+                16,
+                PIN_TEST_SPAN,
+                saturated,
+                &strict,
+                &reference_qwen,
+                &reference_residency,
+            ),
+            0
+        );
     }
 }

@@ -18,6 +18,6 @@ Normal operation needs no environment overrides. The most useful controls are:
 | `K3_TRACE` / `K3_TRACE_PATH` | `off` | native router trace mode and path; CLI flags are preferred |
 | `K3_EXPERT_STREAM_NOCACHE` | `auto` | page-cache treatment for streaming expert reads: `auto` purges on the memory-tight macOS reference host and keeps the kernel file cache warm elsewhere; `1`/`0` force either behavior |
 | `K3_EXPERT_HEAT` | `on` | persistent expert-heat histogram (`k3-meta/expert_heat.v1.bin`) accumulated from authoritative routes during ordinary runs; advisory, never affects routing |
-| `K3_EXPERT_PIN_GB` | `0` | byte budget (decimal GB) for the permanent learned-expert RAM tier on CPU/Metal; `0` keeps it off. Candidates come from the heat histogram and are promoted only when a route naturally reads them |
+| `K3_EXPERT_PIN_GB` | `0` | best-effort byte ceiling (decimal GB) for the permanent learned-expert RAM tier on CPU/Metal; `0` keeps it off. The charge is admitted only from headroom left after residency selection — it can never displace resident spine layers or change the Qwen plan, and a clamped roster is reported at startup. Candidates come from the heat histogram and are promoted only when a route naturally reads them |
 
 The quality guard rejects fewer than 16 experts, non-fp32 target activations and approximation switches. Original BF16 remains the automatic resident authority. Optional paths must validate their device, ABI, shapes, memory and correctness before activation.
