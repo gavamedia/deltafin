@@ -597,8 +597,11 @@ impl<T: AuthoritativeTarget> OpenAiService<T> {
         let prompt = object
             .get("prompt")
             .and_then(Value::as_str)
+            .filter(|prompt| !prompt.is_empty())
             .ok_or_else(|| {
-                ApiFailure::invalid("`prompt` must be a JSON string for native completions")
+                ApiFailure::invalid(
+                    "`prompt` must be a non-empty JSON string for native completions",
+                )
             })?;
         let max_new_tokens = parse_max_tokens(
             object,
@@ -2501,6 +2504,25 @@ mod tests {
                 reasoning_effort: None,
             }]
         );
+    }
+
+    #[test]
+    fn empty_completion_prompt_fails_closed_before_target_entry() {
+        let target = RecordingTarget::new();
+        let requests = Arc::clone(&target.requests);
+        let response = service(target).dispatch(
+            HttpMethod::Post,
+            "/v1/completions",
+            br#"{"prompt":"","max_tokens":4}"#,
+        );
+        assert_eq!(response.status, 400);
+        assert_eq!(body(&response)["error"]["type"], "invalid_request_error");
+        assert!(
+            body(&response)["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("non-empty"))
+        );
+        assert!(requests.lock().unwrap().is_empty());
     }
 
     #[test]
