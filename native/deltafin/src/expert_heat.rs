@@ -802,16 +802,24 @@ mod tests {
                         heat.observe_layer_routes(2, [&one_route(0)].into_iter());
                         heat.note_pass_committed();
                         // Contention restores deltas, so retry until merged.
+                        // A retry count has no wall-clock meaning here: the
+                        // lock winner holds the lock across file and
+                        // directory fsync, so under parallel test load a
+                        // yield-only loser can exhaust any count while the
+                        // winner is still syncing. Bound the retry by time
+                        // instead, sleeping so the loser cedes real time.
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(30);
                         let mut merged = false;
-                        for _ in 0..1_000 {
+                        while std::time::Instant::now() < deadline {
                             heat.flush_best_effort();
                             if heat.pass_delta.load(Ordering::Relaxed) == 0 {
                                 merged = true;
                                 break;
                             }
-                            std::thread::yield_now();
+                            std::thread::sleep(std::time::Duration::from_millis(1));
                         }
-                        assert!(merged, "flush never acquired the heat lock");
+                        assert!(merged, "flush never acquired the heat lock within 30s");
                     }
                 });
             }
