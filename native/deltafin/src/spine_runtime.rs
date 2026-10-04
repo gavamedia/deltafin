@@ -123,6 +123,16 @@ impl SpinePipeline {
         self.reader.workers()
     }
 
+    /// Bytes this pipeline has read from storage since it was created.
+    pub fn bytes_read(&self) -> u64 {
+        self.reader.bytes_read()
+    }
+
+    /// Let spine reads use, and be charged to, the drives in `homes`.
+    pub fn set_storage_homes(&mut self, homes: Option<std::sync::Arc<crate::storage_homes::StorageHomes>>) {
+        self.reader.set_storage_homes(homes);
+    }
+
     pub fn resident_prefix_target(&self) -> u32 {
         self.resident_prefix_target
     }
@@ -614,14 +624,20 @@ mod tests {
         let provider = NativeProviderSession::target(crate::platform::Device::Cpu).unwrap();
         let mut pipeline = SpinePipeline::new(2, 2).unwrap();
 
+        let window = std::time::Instant::now();
         pipeline.prime(&first).unwrap();
         let report = pipeline
             .bind_current_profiled(&provider, &first, Some(&second))
             .unwrap();
+        let window = window.elapsed();
         assert!(report.profiled);
         assert_eq!(report.layer, 0);
         assert_eq!(report.read.bytes, 256);
-        assert!(report.read.elapsed >= report.read_wait);
+        // The read's lifetime (submit to completion) and the bind's wait for
+        // it are two different intervals that each lie inside this window;
+        // comparing them with each other races on a loaded host.
+        assert!(report.read.elapsed <= window);
+        assert!(report.read_wait <= window);
         assert!(report.next_prefetch_started);
         assert_eq!(
             &*provider

@@ -12,9 +12,8 @@
 //! data second (the activation edge used by the existing loader), and an
 //! identity/digest receipt last.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use half::f16;
@@ -24,6 +23,7 @@ use crate::error::{DeltafinError, Result};
 use crate::inventory::{K3Inventory, PINNED_INVENTORY_SHA256, TensorRecord, safe_tensor_path};
 use crate::packfile::{Digest, DigestState, digest_open_file};
 use crate::trusted_download::{fsync_directory, publish_hard_link, secure_create_new};
+use crate::sys::fs::{self as sys_fs, Open};
 
 pub const IS_WEIGHT_EXACT: bool = false;
 pub const RECEIPT_SCHEMA: &str = "deltafin-spine-row-i8-f16-v1";
@@ -184,7 +184,7 @@ struct FileIdentity {
 }
 
 impl FileIdentity {
-    fn from_metadata(metadata: &fs::Metadata) -> Self {
+    fn from_metadata(metadata: &sys_fs::Stat) -> Self {
         Self {
             device: metadata.dev(),
             inode: metadata.ino(),
@@ -252,7 +252,7 @@ fn select_targets(inventory: &K3Inventory, source_root: &Path) -> Result<Vec<Tar
             continue;
         }
         let source = safe_tensor_path(source_root, name)?;
-        let metadata = match fs::symlink_metadata(&source) {
+        let metadata = match sys_fs::lstat(&source) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(io_error("inspect resident BF16 tensor", &source, error)),
@@ -274,7 +274,7 @@ fn target_from_metadata(
     name: &str,
     record: &TensorRecord,
     source: PathBuf,
-    metadata: fs::Metadata,
+    metadata: sys_fs::Stat,
 ) -> Result<Target> {
     let [rows, columns]: [u64; 2] = record
         .shape
@@ -834,11 +834,11 @@ fn publish_receipt(paths: &PairPaths, output_root: &Path, receipt: &PairReceipt)
     let payload = serde_json::to_vec(receipt)
         .map_err(|error| invalid(format!("serialize pair receipt: {error}")))?;
     let mut create = false;
-    match fs::symlink_metadata(&paths.receipt_part) {
+    match sys_fs::lstat(&paths.receipt_part) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink()
                 || !metadata.is_file()
-                || metadata.mode() & 0o077 != 0
+                || !metadata.is_owner_only()
             {
                 return Err(invalid(format!(
                     "unsafe receipt partial: {}",
@@ -911,8 +911,7 @@ fn publish_receipt(paths: &PairPaths, output_root: &Path, receipt: &PairReceipt)
     require_open_identity(&partial, &paths.receipt_part, partial_identity)?;
     publish_hard_link(&paths.receipt_part, &paths.receipt, output_root)?;
     let published_identity = FileIdentity::from_metadata(
-        &partial
-            .metadata()
+        &sys_fs::fstat(&partial)
             .map_err(|error| io_error("restat published pair receipt", &paths.receipt, error))?,
     );
     require_path_identity(&paths.receipt, published_identity, "published pair receipt")
@@ -985,29 +984,28 @@ fn verify_receipt(target: &Target, paths: &PairPaths) -> Result<()> {
 }
 
 fn open_or_create_partial(path: &Path, directory: &Path) -> Result<(File, bool)> {
-    match fs::symlink_metadata(path) {
+    match sys_fs::lstat(path) {
         Ok(observed) => {
             if observed.file_type().is_symlink()
                 || !observed.is_file()
-                || observed.mode() & 0o077 != 0
+                || !observed.is_owner_only()
             {
                 return Err(invalid(format!(
                     "partial is not a private regular non-symlink file: {}",
                     path.display()
                 )));
             }
-            let file = OpenOptions::new()
+            let file = Open::new()
                 .read(true)
                 .write(true)
-                .custom_flags(open_nofollow_cloexec())
+                .no_follow()
                 .open(path)
                 .map_err(|error| {
                     io_error("open partial without following symlinks", path, error)
                 })?;
-            let opened = file
-                .metadata()
+            let opened = sys_fs::fstat(&file)
                 .map_err(|error| io_error("stat opened partial", path, error))?;
-            if opened.mode() & 0o077 != 0
+            if !opened.is_owner_only()
                 || FileIdentity::from_metadata(&opened) != FileIdentity::from_metadata(&observed)
             {
                 return Err(invalid(format!(
@@ -1018,12 +1016,12 @@ fn open_or_create_partial(path: &Path, directory: &Path) -> Result<(File, bool)>
             Ok((file, true))
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let file = OpenOptions::new()
+            let file = Open::new()
                 .read(true)
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
-                .custom_flags(open_nofollow_cloexec())
+                .no_follow()
                 .open(path)
                 .map_err(|error| io_error("securely create conversion partial", path, error))?;
             file.sync_all()
@@ -1036,20 +1034,19 @@ fn open_or_create_partial(path: &Path, directory: &Path) -> Result<(File, bool)>
 }
 
 fn open_exact(path: &Path, bytes: u64, label: &str) -> Result<(File, FileIdentity)> {
-    let observed = fs::symlink_metadata(path).map_err(|error| io_error("inspect", path, error))?;
+    let observed = sys_fs::lstat(path).map_err(|error| io_error("inspect", path, error))?;
     if observed.file_type().is_symlink() || !observed.is_file() || observed.len() != bytes {
         return Err(invalid(format!(
             "{label} {} must be a regular non-symlink {bytes}-byte file",
             path.display()
         )));
     }
-    let file = OpenOptions::new()
+    let file = Open::new()
         .read(true)
-        .custom_flags(open_nofollow_cloexec())
+        .no_follow()
         .open(path)
         .map_err(|error| io_error("open without following symlinks", path, error))?;
-    let opened = file
-        .metadata()
+    let opened = sys_fs::fstat(&file)
         .map_err(|error| io_error("stat opened file", path, error))?;
     let observed = FileIdentity::from_metadata(&observed);
     let opened = FileIdentity::from_metadata(&opened);
@@ -1063,7 +1060,7 @@ fn open_exact(path: &Path, bytes: u64, label: &str) -> Result<(File, FileIdentit
 }
 
 fn open_bounded(path: &Path, maximum: u64, label: &str) -> Result<(File, FileIdentity)> {
-    let observed = fs::symlink_metadata(path).map_err(|error| io_error("inspect", path, error))?;
+    let observed = sys_fs::lstat(path).map_err(|error| io_error("inspect", path, error))?;
     if observed.file_type().is_symlink()
         || !observed.is_file()
         || observed.len() == 0
@@ -1078,8 +1075,7 @@ fn open_bounded(path: &Path, maximum: u64, label: &str) -> Result<(File, FileIde
 }
 
 fn require_open_identity(file: &File, path: &Path, expected: FileIdentity) -> Result<()> {
-    let current = file
-        .metadata()
+    let current = sys_fs::fstat(&file)
         .map_err(|error| io_error("restat opened file", path, error))?;
     if FileIdentity::from_metadata(&current) != expected {
         return Err(invalid(format!(
@@ -1092,7 +1088,7 @@ fn require_open_identity(file: &File, path: &Path, expected: FileIdentity) -> Re
 
 fn require_path_identity(path: &Path, expected: FileIdentity, label: &str) -> Result<()> {
     let metadata =
-        fs::symlink_metadata(path).map_err(|error| io_error("reinspect", path, error))?;
+        sys_fs::lstat(path).map_err(|error| io_error("reinspect", path, error))?;
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
         || FileIdentity::from_metadata(&metadata) != expected
@@ -1106,8 +1102,7 @@ fn require_path_identity(path: &Path, expected: FileIdentity, label: &str) -> Re
 }
 
 fn require_open_extent(file: &File, path: &Path, expected: u64) -> Result<()> {
-    let actual = file
-        .metadata()
+    let actual = sys_fs::fstat(&file)
         .map_err(|error| io_error("stat completed partial", path, error))?
         .len();
     if actual != expected {
@@ -1120,8 +1115,7 @@ fn require_open_extent(file: &File, path: &Path, expected: u64) -> Result<()> {
 }
 
 fn require_open_path_identity(file: &File, path: &Path, label: &str) -> Result<FileIdentity> {
-    let metadata = file
-        .metadata()
+    let metadata = sys_fs::fstat(&file)
         .map_err(|error| io_error("restat opened file", path, error))?;
     let identity = FileIdentity::from_metadata(&metadata);
     require_path_identity(path, identity, label)?;
@@ -1148,12 +1142,12 @@ fn read_exact_retry(file: &mut File, target: &mut [u8], path: &Path) -> Result<(
 }
 
 fn remove_redundant_link(part: &Path, final_path: &Path, directory: &Path) -> Result<()> {
-    let part_metadata = match fs::symlink_metadata(part) {
+    let part_metadata = match sys_fs::lstat(part) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(io_error("inspect redundant partial link", part, error)),
     };
-    let final_metadata = fs::symlink_metadata(final_path)
+    let final_metadata = sys_fs::lstat(final_path)
         .map_err(|error| io_error("inspect published output", final_path, error))?;
     if part_metadata.file_type().is_symlink()
         || !part_metadata.is_file()
@@ -1183,7 +1177,7 @@ fn ensure_directory_without_links(path: &Path) -> Result<()> {
     } else {
         path
     };
-    match fs::symlink_metadata(selected) {
+    match sys_fs::lstat(selected) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => return Ok(()),
         Ok(_) => {
             return Err(invalid(format!(
@@ -1218,7 +1212,7 @@ fn ensure_spotlight_marker(directory: &Path) -> Result<()> {
         return Ok(());
     }
     let marker = directory.join(SPOTLIGHT_MARKER);
-    match fs::symlink_metadata(&marker) {
+    match sys_fs::lstat(&marker) {
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(()),
         Ok(_) => Err(invalid(format!(
             "unsafe Spotlight marker {}",
@@ -1235,7 +1229,7 @@ fn ensure_spotlight_marker(directory: &Path) -> Result<()> {
 }
 
 fn validate_real_directory(path: &Path, label: &str) -> Result<()> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| io_error("inspect", path, error))?;
+    let metadata = sys_fs::lstat(path).map_err(|error| io_error("inspect", path, error))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(invalid(format!("{label} is not a real directory")));
     }
@@ -1249,7 +1243,7 @@ struct ConversionLock {
 impl ConversionLock {
     fn acquire(directory: &Path) -> Result<Self> {
         let path = directory.join(LOCK_NAME);
-        let existed = match fs::symlink_metadata(&path) {
+        let existed = match sys_fs::lstat(&path) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() || !metadata.is_file() {
                     return Err(invalid("conversion lock is not a regular non-symlink file"));
@@ -1259,21 +1253,20 @@ impl ConversionLock {
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,
             Err(error) => return Err(io_error("inspect conversion lock", &path, error)),
         };
-        let file = OpenOptions::new()
+        let file = Open::new()
             .read(true)
             .write(true)
             .create(true)
             .mode(0o600)
-            .custom_flags(open_nofollow_cloexec())
+            .no_follow()
             .open(&path)
             .map_err(|error| io_error("open conversion lock", &path, error))?;
-        let opened = file
-            .metadata()
+        let opened = sys_fs::fstat(&file)
             .map_err(|error| io_error("stat conversion lock", &path, error))?;
-        let live = fs::symlink_metadata(&path)
+        let live = sys_fs::lstat(&path)
             .map_err(|error| io_error("reinspect conversion lock", &path, error))?;
         if !opened.is_file()
-            || opened.mode() & 0o077 != 0
+            || !opened.is_owner_only()
             || live.file_type().is_symlink()
             || !live.is_file()
             || (opened.dev(), opened.ino()) != (live.dev(), live.ino())
@@ -1285,22 +1278,22 @@ impl ConversionLock {
                 .map_err(|error| io_error("fsync conversion lock", &path, error))?;
             fsync_directory(directory)?;
         }
-        // SAFETY: `file` owns a live descriptor for the duration of the lock.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let locked = sys_fs::try_lock_exclusive(&file)
+            .map_err(|error| io_error("acquire exclusive conversion lock", &path, error))?;
+        if !locked {
             return Err(io_error(
                 "acquire exclusive conversion lock",
                 &path,
-                io::Error::last_os_error(),
+                io::Error::from(io::ErrorKind::WouldBlock),
             ));
         }
         Ok(Self { _file: file })
     }
 }
 
-use std::os::fd::AsRawFd;
 
 fn path_exists(path: &Path) -> Result<bool> {
-    match fs::symlink_metadata(path) {
+    match sys_fs::lstat(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(invalid(format!(
             "refusing symlink conversion path {}",
             path.display()
@@ -1328,10 +1321,6 @@ fn hex_digest(digest: Digest) -> String {
     output
 }
 
-const fn open_nofollow_cloexec() -> i32 {
-    libc::O_NOFOLLOW | libc::O_CLOEXEC
-}
-
 fn invalid(message: impl Into<String>) -> DeltafinError {
     DeltafinError::new(format!(
         "native spine int8 conversion failed: {}",
@@ -1346,6 +1335,7 @@ fn io_error(operation: &str, path: &Path, error: io::Error) -> DeltafinError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT_TEST: AtomicUsize = AtomicUsize::new(0);
@@ -1447,7 +1437,7 @@ mod tests {
             }
         }
         file.sync_all().unwrap();
-        let metadata = fs::symlink_metadata(&source).unwrap();
+        let metadata = sys_fs::lstat(&source).unwrap();
         Target {
             name: name.into(),
             source,
@@ -1726,7 +1716,7 @@ mod tests {
 
         let mut refreshed = target.clone();
         refreshed.source_identity =
-            FileIdentity::from_metadata(&fs::symlink_metadata(&refreshed.source).unwrap());
+            FileIdentity::from_metadata(&sys_fs::lstat(&refreshed.source).unwrap());
         let expected = expected_outputs(&refreshed);
         let mut progress = CaptureStart::default();
         let report = convert_targets(

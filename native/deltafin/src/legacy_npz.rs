@@ -10,10 +10,8 @@
 //! be unlinked.
 
 use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -25,6 +23,7 @@ use zip::{CompressionMethod, ZipArchive};
 use crate::error::{DeltafinError, Result};
 use crate::packfile::{Digest, DigestState, digest_open_file};
 use crate::trusted_download::{fsync_directory, rename_noreplace, secure_create_new};
+use crate::sys::fs::{self as sys_fs, Open};
 
 pub const EXPERT_SPAN_BYTES: usize = 17_547_264;
 pub const DEFAULT_CONVERSION_WORKERS: usize = 4;
@@ -296,7 +295,7 @@ fn validate_layout() -> Result<()> {
 }
 
 fn inspect_cache_directory(cache: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(cache)
+    let metadata = sys_fs::lstat(cache)
         .map_err(|error| io_error("inspect expert-cache directory", cache, error))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(DeltafinError::new(format!(
@@ -304,9 +303,9 @@ fn inspect_cache_directory(cache: &Path) -> Result<()> {
             cache.display()
         )));
     }
-    let directory = OpenOptions::new()
+    let directory = Open::new()
         .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .directory().no_follow()
         .open(cache)
         .map_err(|error| {
             io_error(
@@ -315,8 +314,7 @@ fn inspect_cache_directory(cache: &Path) -> Result<()> {
                 error,
             )
         })?;
-    let opened = directory
-        .metadata()
+    let opened = sys_fs::fstat(&directory)
         .map_err(|error| io_error("stat opened expert-cache directory", cache, error))?;
     if !opened.is_dir() || opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
         return Err(DeltafinError::new(format!(
@@ -344,7 +342,7 @@ fn scan(cache: &Path) -> Result<Vec<LegacyExpert>> {
 }
 
 fn parse_source_name(name: &OsStr) -> Result<Option<LegacyExpert>> {
-    let bytes = name.as_bytes();
+    let bytes = crate::sys::path::os_str_bytes(name);
     if !bytes.starts_with(b"L") || !bytes.ends_with(b".npz") {
         return Ok(None);
     }
@@ -453,8 +451,7 @@ fn convert_one(cache: &Path, expert: &LegacyExpert, keep_npz: bool) -> Result<On
             .ok_or_else(|| DeltafinError::new("canonical expert byte count overflowed"))?;
     }
     let source = archive.into_inner();
-    let source_after = source
-        .metadata()
+    let source_after = sys_fs::fstat(&source)
         .map_err(|error| io_error("restat opened legacy NPZ", &source_path, error))?;
     if !same_file(&source_metadata, &source_after) {
         return Err(DeltafinError::new(format!(
@@ -470,8 +467,7 @@ fn convert_one(cache: &Path, expert: &LegacyExpert, keep_npz: bool) -> Result<On
     temporary
         .sync_all()
         .map_err(|error| io_error("fsync canonical expert temporary", &temporary_path, error))?;
-    let temporary_metadata = temporary
-        .metadata()
+    let temporary_metadata = sys_fs::fstat(&temporary)
         .map_err(|error| io_error("stat canonical expert temporary", &temporary_path, error))?;
     if !temporary_metadata.is_file() || temporary_metadata.len() != EXPERT_SPAN_BYTES as u64 {
         return Err(DeltafinError::new(format!(
@@ -555,9 +551,9 @@ fn convert_one(cache: &Path, expert: &LegacyExpert, keep_npz: bool) -> Result<On
     Ok(OneConversion { kind, deleted_npz })
 }
 
-fn admit_source(path: &Path) -> Result<fs::Metadata> {
+fn admit_source(path: &Path) -> Result<sys_fs::Stat> {
     let metadata =
-        fs::symlink_metadata(path).map_err(|error| io_error("inspect legacy NPZ", path, error))?;
+        sys_fs::lstat(path).map_err(|error| io_error("inspect legacy NPZ", path, error))?;
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
         || metadata.len() > MAX_ARCHIVE_BYTES
@@ -570,14 +566,13 @@ fn admit_source(path: &Path) -> Result<fs::Metadata> {
     Ok(metadata)
 }
 
-fn open_source(path: &Path, expected: &fs::Metadata) -> Result<File> {
-    let file = OpenOptions::new()
+fn open_source(path: &Path, expected: &sys_fs::Stat) -> Result<File> {
+    let file = Open::new()
         .read(true)
-        .custom_flags(open_nofollow_cloexec())
+        .no_follow()
         .open(path)
         .map_err(|error| io_error("open legacy NPZ without following links", path, error))?;
-    let opened = file
-        .metadata()
+    let opened = sys_fs::fstat(&file)
         .map_err(|error| io_error("stat opened legacy NPZ", path, error))?;
     if !same_file(expected, &opened) {
         return Err(DeltafinError::new(format!(
@@ -971,17 +966,17 @@ fn create_temporary(cache: &Path, destination_name: &str) -> Result<(PathBuf, Fi
 
 struct VerifiedFile {
     file: File,
-    metadata: fs::Metadata,
+    metadata: sys_fs::Stat,
 }
 
 fn verify_exact_file(
     path: &Path,
     expected_bytes: u64,
     expected_digest: Digest,
-    expected_identity: Option<&fs::Metadata>,
+    expected_identity: Option<&sys_fs::Stat>,
     label: &str,
 ) -> Result<VerifiedFile> {
-    let before = fs::symlink_metadata(path)
+    let before = sys_fs::lstat(path)
         .map_err(|error| io_error(&format!("inspect {label}"), path, error))?;
     if before.file_type().is_symlink() || !before.is_file() || before.len() != expected_bytes {
         return Err(DeltafinError::new(format!(
@@ -995,9 +990,9 @@ fn verify_exact_file(
             path.display()
         )));
     }
-    let file = OpenOptions::new()
+    let file = Open::new()
         .read(true)
-        .custom_flags(open_nofollow_cloexec())
+        .no_follow()
         .open(path)
         .map_err(|error| {
             io_error(
@@ -1007,8 +1002,7 @@ fn verify_exact_file(
             )
         })?;
     cache_neutral(&file);
-    let opened = file
-        .metadata()
+    let opened = sys_fs::fstat(&file)
         .map_err(|error| io_error(&format!("stat opened {label}"), path, error))?;
     if !same_file(&before, &opened) {
         return Err(DeltafinError::new(format!(
@@ -1018,8 +1012,7 @@ fn verify_exact_file(
     }
     let digest = digest_open_file(&file, path)
         .map_err(|error| DeltafinError::new(format!("hash {label} {}: {error}", path.display())))?;
-    let after = file
-        .metadata()
+    let after = sys_fs::fstat(&file)
         .map_err(|error| io_error(&format!("restat {label}"), path, error))?;
     if !same_file(&opened, &after) || digest != expected_digest {
         return Err(DeltafinError::new(format!(
@@ -1038,7 +1031,7 @@ fn verify_existing_destination(
     path: &Path,
     expected_digest: Digest,
 ) -> Result<Option<VerifiedFile>> {
-    match fs::symlink_metadata(path) {
+    match sys_fs::lstat(path) {
         Ok(_) => verify_exact_file(
             path,
             EXPERT_SPAN_BYTES as u64,
@@ -1052,8 +1045,8 @@ fn verify_existing_destination(
     }
 }
 
-fn assert_path_identity(path: &Path, expected: &fs::Metadata, label: &str) -> Result<()> {
-    let actual = fs::symlink_metadata(path)
+fn assert_path_identity(path: &Path, expected: &sys_fs::Stat, label: &str) -> Result<()> {
+    let actual = sys_fs::lstat(path)
         .map_err(|error| io_error(&format!("inspect {label}"), path, error))?;
     // A successful rename can legitimately advance ctime while preserving the
     // inode. Publication identity therefore uses the immutable descriptor
@@ -1100,7 +1093,7 @@ fn remove_temporary(guard: &mut TemporaryGuard) -> Result<()> {
     Ok(())
 }
 
-fn same_inode_and_length(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+fn same_inode_and_length(left: &sys_fs::Stat, right: &sys_fs::Stat) -> bool {
     left.is_file()
         && right.is_file()
         && left.dev() == right.dev()
@@ -1108,7 +1101,7 @@ fn same_inode_and_length(left: &fs::Metadata, right: &fs::Metadata) -> bool {
         && left.len() == right.len()
 }
 
-fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+fn same_file(left: &sys_fs::Stat, right: &sys_fs::Stat) -> bool {
     same_inode_and_length(left, right)
         && left.mtime() == right.mtime()
         && left.mtime_nsec() == right.mtime_nsec()
@@ -1143,10 +1136,6 @@ fn drop_completed_cache(file: &File, bytes: u64) {
     let _ = (file, bytes);
 }
 
-const fn open_nofollow_cloexec() -> i32 {
-    libc::O_NOFOLLOW | libc::O_CLOEXEC
-}
-
 fn io_error(operation: &str, path: &Path, error: io::Error) -> DeltafinError {
     DeltafinError::new(format!("{operation} {}: {error}", path.display()))
 }
@@ -1154,6 +1143,7 @@ fn io_error(operation: &str, path: &Path, error: io::Error) -> DeltafinError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1386,7 +1376,7 @@ mod tests {
         {
             let target = root.0.join("target");
             fs::write(&target, b"untouched").unwrap();
-            std::os::unix::fs::symlink(&target, root.0.join("L2-E3.npz")).unwrap();
+            crate::sys::fs::symlink(&target, root.0.join("L2-E3.npz")).unwrap();
             assert!(
                 convert_all(
                     &root.0,

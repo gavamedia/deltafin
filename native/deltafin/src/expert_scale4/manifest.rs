@@ -6,21 +6,21 @@
 //! checked lazily when selected for execution.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use super::{
     FILE_BYTES, HEADER_BYTES, LAYOUT_ID, MANIFEST_NAME, MANIFEST_SCHEMA, MANIFEST_VERSION, VERSION,
-    cache_neutral, drop_completed_cache, exponent_table, open_nofollow_cloexec, parse_header,
-    record_digest, source_identity,
+    cache_neutral, drop_completed_cache, exponent_table, parse_header, record_digest,
+    source_identity,
 };
 use crate::dspark_checkpoint::strict_json;
 use crate::error::{DeltafinError, Result};
 use crate::packfile::{Digest, DigestState, digest_bytes};
+use crate::sys::fs::{self as sys_fs, Open};
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -102,7 +102,7 @@ impl Scale4Manifest {
     pub fn load_for_raw_names(root: impl AsRef<Path>, raw_names: &[String]) -> Result<Self> {
         let root = root.as_ref();
         let manifest_path = root.join(MANIFEST_NAME);
-        let metadata = fs::symlink_metadata(&manifest_path)
+        let metadata = sys_fs::lstat(&manifest_path)
             .map_err(|error| io_error("inspect scale4 manifest", &manifest_path, error))?;
         if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
             return Err(invalid(format!(
@@ -129,7 +129,7 @@ impl Scale4Manifest {
             if path.parent() != Some(root) {
                 return Err(invalid("scale4 layer path escapes its corpus root"));
             }
-            let metadata = fs::symlink_metadata(&path)
+            let metadata = sys_fs::lstat(&path)
                 .map_err(|error| io_error("inspect scale4 layer", &path, error))?;
             if metadata.file_type().is_symlink()
                 || !metadata.is_file()
@@ -246,7 +246,7 @@ impl Scale4Manifest {
         let expected_bytes = (entries.len() as u64)
             .checked_mul(FILE_BYTES as u64)
             .ok_or_else(|| invalid("scale4 verification extent overflowed"))?;
-        let observed = fs::symlink_metadata(&path)
+        let observed = sys_fs::lstat(&path)
             .map_err(|error| io_error("inspect scale4 layer for verification", &path, error))?;
         if observed.file_type().is_symlink()
             || !observed.is_file()
@@ -258,13 +258,12 @@ impl Scale4Manifest {
             )));
         }
         let observed_identity = source_identity(&observed);
-        let mut file = OpenOptions::new()
+        let mut file = Open::new()
             .read(true)
-            .custom_flags(open_nofollow_cloexec())
+            .no_follow()
             .open(&path)
             .map_err(|error| io_error("open scale4 layer for verification", &path, error))?;
-        let opened = file
-            .metadata()
+        let opened = sys_fs::fstat(&file)
             .map_err(|error| io_error("stat opened scale4 layer", &path, error))?;
         if source_identity(&opened) != observed_identity {
             return Err(invalid(format!(
@@ -287,8 +286,7 @@ impl Scale4Manifest {
                 )));
             }
         }
-        let after = file
-            .metadata()
+        let after = sys_fs::fstat(&file)
             .map_err(|error| io_error("restat verified scale4 layer", &path, error))?;
         if source_identity(&after) != observed_identity {
             return Err(invalid(format!(

@@ -14,7 +14,41 @@
 #include <string_view>
 #include <vector>
 
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
+
 namespace {
+
+// Storage aligned to `alignment`, released the way its allocator requires:
+// `free` after posix_memalign, `_aligned_free` after `_aligned_malloc` (the
+// Windows CRT cannot free an aligned block through `free`).
+struct AlignedRelease {
+  void operator()(std::uint8_t* pointer) const noexcept {
+#if defined(_WIN32)
+    _aligned_free(pointer);
+#else
+    std::free(pointer);
+#endif
+  }
+};
+using AlignedBytes = std::unique_ptr<std::uint8_t, AlignedRelease>;
+
+AlignedBytes allocate_aligned_bytes(const std::size_t alignment,
+                                    const std::size_t bytes) {
+#if defined(_WIN32)
+  void* raw = _aligned_malloc(bytes, alignment);
+  if (raw == nullptr) {
+    return AlignedBytes();
+  }
+#else
+  void* raw = nullptr;
+  if (posix_memalign(&raw, alignment, bytes) != 0 || raw == nullptr) {
+    return AlignedBytes();
+  }
+#endif
+  return AlignedBytes(static_cast<std::uint8_t*>(raw));
+}
 
 struct Options {
   std::uint32_t device = DELTAFIN_PROVIDER_DEVICE_AUTO_V1;
@@ -815,14 +849,11 @@ void run_spine_binding(const Options& options) {
             .device;
     constexpr std::size_t iterations = 8;
     for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
-      void* raw_source = nullptr;
-      if (posix_memalign(&raw_source, 256, 512) != 0 ||
-          raw_source == nullptr) {
+      AlignedBytes source = allocate_aligned_bytes(256, 512);
+      if (source == nullptr) {
         throw std::runtime_error(
             "allocate aligned selected-device BF16 source failed");
       }
-      std::unique_ptr<std::uint8_t, decltype(&std::free)> source(
-          static_cast<std::uint8_t*>(raw_source), &std::free);
       std::memset(source.get(), 0, 512);
       const bool alternate = (iteration & 1U) != 0;
       const std::uint16_t positive = alternate ? 0x3f00 : 0x3f80;
@@ -852,14 +883,11 @@ void run_spine_binding(const Options& options) {
 
       std::memset(source.get(), UINT8_C(0xa5), 512);
       source.reset();
-      void* raw_reused = nullptr;
-      if (posix_memalign(&raw_reused, 256, 512) != 0 ||
-          raw_reused == nullptr) {
+      AlignedBytes reused = allocate_aligned_bytes(256, 512);
+      if (reused == nullptr) {
         throw std::runtime_error(
             "allocate aligned selected-device BF16 reuse failed");
       }
-      std::unique_ptr<std::uint8_t, decltype(&std::free)> reused(
-          static_cast<std::uint8_t*>(raw_reused), &std::free);
       std::memset(reused.get(), UINT8_C(0x5a), 512);
       std::vector<at::Tensor> device_churn;
       device_churn.reserve(32);

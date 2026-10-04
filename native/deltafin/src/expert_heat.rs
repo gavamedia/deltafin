@@ -22,10 +22,8 @@
 
 use std::alloc::Layout;
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::Read;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -38,6 +36,7 @@ use crate::provider::ROUTE_TOP_K;
 use crate::routing::{K3_EXPERTS, ROUTED_EXPERTS};
 use crate::storage::BUFFER_ALIGNMENT;
 use crate::trusted_download::{fsync_directory, secure_create_new};
+use crate::sys::fs::{self as sys_fs, Open};
 
 pub(crate) const EXPERT_HEAT_FILE_NAME: &str = "expert_heat.v1.bin";
 const EXPERT_HEAT_LOCK_NAME: &str = "expert_heat.v1.lock";
@@ -309,9 +308,9 @@ fn encode_snapshot(snapshot: &ExpertHeatSnapshot) -> Vec<u8> {
 /// version, dimensions, checksum, or non-finite/negative values — is an error
 /// the caller treats as "no history".
 fn load_snapshot(path: &Path) -> crate::error::Result<ExpertHeatSnapshot> {
-    let mut file = match OpenOptions::new()
+    let mut file = match Open::new()
         .read(true)
-        .custom_flags(open_nofollow_cloexec())
+        .no_follow()
         .open(path)
     {
         Ok(file) => file,
@@ -324,8 +323,7 @@ fn load_snapshot(path: &Path) -> crate::error::Result<ExpertHeatSnapshot> {
             )));
         }
     };
-    let metadata = file
-        .metadata()
+    let metadata = sys_fs::fstat(&file)
         .map_err(|error| crate::error::DeltafinError::new(format!("stat expert-heat: {error}")))?;
     if !metadata.is_file() || metadata.len() != HEAT_FILE_BYTES as u64 {
         return Err(crate::error::DeltafinError::new(
@@ -382,19 +380,18 @@ struct HeatFileLock {
 
 impl HeatFileLock {
     fn acquire(path: &Path) -> crate::error::Result<Self> {
-        let file = OpenOptions::new()
+        let file = Open::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .custom_flags(open_nofollow_cloexec())
+            .no_follow()
             .open(path)
             .map_err(|error| {
                 crate::error::DeltafinError::new(format!("open expert-heat lock: {error}"))
             })?;
-        if !file
-            .metadata()
+        if !sys_fs::fstat(&file)
             .map_err(|error| {
                 crate::error::DeltafinError::new(format!("stat expert-heat lock: {error}"))
             })?
@@ -404,8 +401,9 @@ impl HeatFileLock {
                 "expert-heat lock is not regular",
             ));
         }
-        // SAFETY: `file` owns a live descriptor and flock does not retain it.
-        if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+        if !sys_fs::try_lock_exclusive(&file)
+            .map_err(|error| crate::error::DeltafinError::new(format!("acquire expert-heat lock: {error}")))?
+        {
             return Err(crate::error::DeltafinError::new(
                 "another process is flushing expert heat",
             ));
@@ -416,26 +414,8 @@ impl HeatFileLock {
 
 impl Drop for HeatFileLock {
     fn drop(&mut self) {
-        // SAFETY: the descriptor remains live for the duration of this call.
-        let _ = unsafe { flock(self.file.as_raw_fd(), LOCK_UN) };
+        sys_fs::unlock(&self.file);
     }
-}
-
-unsafe extern "C" {
-    fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
-}
-
-const LOCK_EX: i32 = 2;
-const LOCK_NB: i32 = 4;
-const LOCK_UN: i32 = 8;
-
-#[cfg(target_os = "macos")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x0100_0100
-}
-#[cfg(target_os = "linux")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x000a_0000
 }
 
 /// One expert span in a heap allocation aligned to the reader-arena boundary.
@@ -484,6 +464,56 @@ unsafe impl Send for PageAlignedSpan {}
 // SAFETY: shared access is read-only.
 unsafe impl Sync for PageAlignedSpan {}
 
+/// Every (layer, expert) slot that clears the confidence ramp and frequency
+/// floor, ranked hottest-first with deterministic ties. Empty when history is
+/// too thin to trust. Shared by explicit-budget planning and auto sizing so
+/// the two can never disagree about what qualifies.
+fn qualifying_candidates(snapshot: &ExpertHeatSnapshot) -> Vec<(f32, u32)> {
+    if snapshot.heats.len() != HEAT_SLOTS || snapshot.total_weight < MIN_WEIGHT_PASSES {
+        return Vec::new();
+    }
+    let floor = FLOOR_MULT * snapshot.total_weight * (ROUTED_EXPERTS as f64 / K3_EXPERTS as f64);
+    let mut ranked: Vec<(f32, u32)> = snapshot
+        .heats
+        .iter()
+        .enumerate()
+        .filter(|&(_, &heat)| f64::from(heat) >= floor)
+        .map(|(slot, &heat)| (heat, slot as u32))
+        .collect();
+    ranked.sort_unstable_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    ranked
+}
+
+/// Free host memory the automatic tier budget must leave untouched. The tier
+/// takes only what remains above this line, so a squeezed host resolves to a
+/// trimmed roster or to zero instead of competing with the spine, the page
+/// cache, or context growth. The 2 GB explicit budget this floor typically
+/// reproduces on the 64 GiB reference host is the configuration the 60-run
+/// five-prompt campaign measured: +15–19% on expert-read-bound natural
+/// language, neutral elsewhere, including its residency cost.
+pub(crate) const AUTO_PIN_HEADROOM_BYTES: u64 = 8 << 30;
+
+/// Resolve `K3_EXPERT_PIN_GB=auto` (the default) into a byte budget: exactly
+/// what the qualifying roster needs, never more than free memory minus the
+/// reserved headroom. Zero — tier off — when history is thin, nothing
+/// qualifies, or the host is too tight. Unknown free memory fails closed.
+pub(crate) fn resolve_auto_pin_budget(
+    snapshot: &ExpertHeatSnapshot,
+    span_bytes: usize,
+    host_available_bytes: Option<u64>,
+) -> u64 {
+    let roster_bytes = qualifying_candidates(snapshot).len() as u64 * span_bytes as u64;
+    let spare = host_available_bytes
+        .unwrap_or(0)
+        .saturating_sub(AUTO_PIN_HEADROOM_BYTES);
+    roster_bytes.min(spare)
+}
+
 /// The permanent RAM tier. The candidate roster is frozen at construction, so
 /// residency can only grow toward `candidate_count × span_bytes ≤ budget` and
 /// no eviction logic exists. Promotion is sticky: an expert enters only when
@@ -506,27 +536,10 @@ impl ExpertPinTier {
         span_bytes: usize,
         budget_bytes: u64,
     ) -> Option<Self> {
-        if budget_bytes == 0 || span_bytes == 0 || snapshot.heats.len() != HEAT_SLOTS {
+        if budget_bytes == 0 || span_bytes == 0 {
             return None;
         }
-        if snapshot.total_weight < MIN_WEIGHT_PASSES {
-            return None;
-        }
-        let floor =
-            FLOOR_MULT * snapshot.total_weight * (ROUTED_EXPERTS as f64 / K3_EXPERTS as f64);
-        let mut ranked: Vec<(f32, u32)> = snapshot
-            .heats
-            .iter()
-            .enumerate()
-            .filter(|&(_, &heat)| f64::from(heat) >= floor)
-            .map(|(slot, &heat)| (heat, slot as u32))
-            .collect();
-        ranked.sort_unstable_by(|left, right| {
-            right
-                .0
-                .total_cmp(&left.0)
-                .then_with(|| left.1.cmp(&right.1))
-        });
+        let mut ranked = qualifying_candidates(snapshot);
         let capacity = usize::try_from(budget_bytes / span_bytes as u64).unwrap_or(usize::MAX);
         ranked.truncate(capacity);
         if ranked.is_empty() {
@@ -775,7 +788,7 @@ mod tests {
         let target = root.0.join("target.bin");
         let original = encode_snapshot(&snapshot_with(&[(1, 3, 9.0)], 9.0));
         fs::write(&target, &original).unwrap();
-        std::os::unix::fs::symlink(&target, root.heat_path()).unwrap();
+        crate::sys::fs::symlink(&target, root.heat_path()).unwrap();
 
         // Loading refuses the symlink.
         assert!(load_snapshot(&root.heat_path()).is_err());
@@ -802,16 +815,21 @@ mod tests {
                         heat.observe_layer_routes(2, [&one_route(0)].into_iter());
                         heat.note_pass_committed();
                         // Contention restores deltas, so retry until merged.
+                        // The lock holder keeps the lock across a file and a
+                        // directory fsync, which under a loaded parallel test
+                        // run can outlast any fixed number of yields; bound
+                        // the retry by time and let the loser actually sleep.
+                        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
                         let mut merged = false;
-                        for _ in 0..1_000 {
+                        while std::time::Instant::now() < deadline {
                             heat.flush_best_effort();
                             if heat.pass_delta.load(Ordering::Relaxed) == 0 {
                                 merged = true;
                                 break;
                             }
-                            std::thread::yield_now();
+                            std::thread::sleep(std::time::Duration::from_millis(1));
                         }
-                        assert!(merged, "flush never acquired the heat lock");
+                        assert!(merged, "flush never acquired the heat lock within 30 s");
                     }
                 });
             }
@@ -925,6 +943,36 @@ mod tests {
         tier.maybe_promote(4, &[2], &other);
         assert_eq!(&tier.lookup(4, 2).unwrap()[..], &slab[..span]);
         assert_eq!(tier.resident_experts(), 2);
+    }
+
+    #[test]
+    fn auto_budget_is_roster_sized_and_headroom_capped() {
+        let span = 16_384_usize;
+        let hot = snapshot_with(&[(1, 7, 300.0), (2, 11, 280.0), (5, 100, 260.0)], 512.0);
+        let roster_bytes = 3 * span as u64;
+
+        // Spacious host: exactly what the roster needs, nothing more.
+        let spacious = Some(AUTO_PIN_HEADROOM_BYTES + 10 * span as u64);
+        assert_eq!(resolve_auto_pin_budget(&hot, span, spacious), roster_bytes);
+        // The resolved budget admits the complete roster through plan().
+        let tier = ExpertPinTier::plan(&hot, span, roster_bytes).unwrap();
+        assert_eq!(tier.candidate_count(), 3);
+
+        // Tight host: trimmed to whatever clears the headroom floor.
+        let tight = Some(AUTO_PIN_HEADROOM_BYTES + 2 * span as u64);
+        assert_eq!(resolve_auto_pin_budget(&hot, span, tight), 2 * span as u64);
+
+        // At or below the floor, or unknown: fail closed to off.
+        assert_eq!(resolve_auto_pin_budget(&hot, span, Some(AUTO_PIN_HEADROOM_BYTES)), 0);
+        assert_eq!(resolve_auto_pin_budget(&hot, span, Some(1)), 0);
+        assert_eq!(resolve_auto_pin_budget(&hot, span, None), 0);
+
+        // Thin history: zero regardless of how much memory is free.
+        let thin = snapshot_with(&[(1, 7, 300.0)], MIN_WEIGHT_PASSES - 1.0);
+        assert_eq!(resolve_auto_pin_budget(&thin, span, spacious), 0);
+        // Nothing clears the floor: likewise zero.
+        let cold = snapshot_with(&[(1, 7, 1.0)], 512.0);
+        assert_eq!(resolve_auto_pin_budget(&cold, span, spacious), 0);
     }
 
     #[test]

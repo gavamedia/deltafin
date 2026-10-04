@@ -3,6 +3,7 @@
 #include "provider_cuda_moe.h"
 #include "provider_device.h"
 #include "provider_dspark_model.h"
+#include "provider_eagle3.h"
 #include "provider_kda.h"
 #include "provider_mla.h"
 #include "provider_precision.h"
@@ -592,6 +593,11 @@ struct DSparkSnapshotSlot {
   deltafin::provider_internal::DSparkCacheSnapshot snapshot;
 };
 
+struct Eagle3SnapshotSlot {
+  DeltafinProviderEagle3HandleV1 model = 0;
+  deltafin::provider_internal::Eagle3Snapshot snapshot;
+};
+
 static_assert(std::is_nothrow_move_assignable_v<
                   deltafin::provider_internal::KdaState>,
               "KDA cache commit must remain a no-throw tensor-handle move");
@@ -626,7 +632,8 @@ struct Session {
     const std::size_t live = tensors.size() + caches.size() + tickets.size() +
         kda_caches.size() + kda_tickets.size() + mla_caches.size() +
         mla_tickets.size() + moe_plans.size() + dspark_models.size() +
-        dspark_snapshots.size() +
+        dspark_snapshots.size() + eagle3_models.size() +
+        eagle3_snapshots.size() +
         qwen_models.size() + spine_source_uses.size() +
         (target_state_branch == nullptr ? 0 : 1) +
         (target_position == nullptr ? 0 : 1) +
@@ -737,6 +744,12 @@ struct Session {
   std::unordered_map<DeltafinProviderDSparkSnapshotHandleV1,
                      DSparkSnapshotSlot>
       dspark_snapshots;
+  std::unordered_map<DeltafinProviderEagle3HandleV1,
+                     std::unique_ptr<deltafin::provider_internal::Eagle3Model>>
+      eagle3_models;
+  std::unordered_map<DeltafinProviderEagle3SnapshotHandleV1,
+                     Eagle3SnapshotSlot>
+      eagle3_snapshots;
   std::unordered_map<DeltafinProviderQwenHandleV1,
                      std::unique_ptr<deltafin::provider_internal::QwenModel>>
       qwen_models;
@@ -5892,7 +5905,8 @@ void publish_target_sequence_begin(
     Session& session, at::Tensor hidden_rows,
     const deltafin::provider_internal::TargetSequenceMode mode,
     const bool capture_dspark_rows, const bool full_commit_only,
-    DeltafinProviderTargetSequenceBeginReportV1* report) {
+    DeltafinProviderTargetSequenceBeginReportV1* report,
+    const bool capture_eagle3_rows = false) {
   require_target_session(session);
   if (session.selected.device.is_cuda()) {
     deltafin::provider_internal::enforce_authoritative_cuda_fp32_precision();
@@ -5937,7 +5951,7 @@ void publish_target_sequence_begin(
   auto sequence =
       std::make_unique<deltafin::provider_internal::TargetSequenceTape>(
           bindings, std::move(hidden_rows), mode, capture_dspark_rows,
-          full_commit_only);
+          full_commit_only, capture_eagle3_rows);
   const auto handle = session.allocate_resource();
   const std::uint32_t positions =
       static_cast<std::uint32_t>(sequence->position_count());
@@ -6885,7 +6899,8 @@ extern "C" int32_t deltafin_provider_target_sequence_begin_bf16_v1(
         request->positions > DELTAFIN_PROVIDER_ROUTE_MAX_POSITIONS_V1 ||
         (request->flags &
          ~(DELTAFIN_PROVIDER_TARGET_SEQUENCE_CAPTURE_DSPARK_V1 |
-           DELTAFIN_PROVIDER_TARGET_SEQUENCE_FULL_COMMIT_ONLY_V1)) != 0 ||
+           DELTAFIN_PROVIDER_TARGET_SEQUENCE_FULL_COMMIT_ONLY_V1 |
+           DELTAFIN_PROVIDER_TARGET_SEQUENCE_CAPTURE_EAGLE3_V1)) != 0 ||
         request->reserved0 != 0 ||
         !all_zero(request->reserved)) {
       throw std::invalid_argument(
@@ -6935,9 +6950,12 @@ extern "C" int32_t deltafin_provider_target_sequence_begin_bf16_v1(
     const bool capture_dspark_rows =
         (request->flags &
          DELTAFIN_PROVIDER_TARGET_SEQUENCE_CAPTURE_DSPARK_V1) != 0;
+    const bool capture_eagle3_rows =
+        (request->flags &
+         DELTAFIN_PROVIDER_TARGET_SEQUENCE_CAPTURE_EAGLE3_V1) != 0;
     publish_target_sequence_begin(*session, std::move(hidden_rows), mode,
                                   capture_dspark_rows, full_commit_only,
-                                  report);
+                                  report, capture_eagle3_rows);
   });
 }
 
@@ -7332,6 +7350,104 @@ deltafin_provider_target_sequence_finish_expert_spans_v1(
     produced.next_expert_row = request->first_row + request->row_count;
     produced.state =
         target_sequence_state_value(session->target_sequence->state());
+    *report = produced;
+  });
+}
+
+extern "C" int32_t
+deltafin_provider_target_sequence_stage_expert_spans_v1(
+    const DeltafinProviderTargetSequenceStageExpertSpansRequestV1* request,
+    DeltafinProviderTargetSequenceStageExpertSpansReportV1* report,
+    char* error, const size_t error_capacity) {
+  return ffi_guard(error, error_capacity, [&] {
+    if (request == nullptr || report == nullptr) {
+      throw std::invalid_argument(
+          "provider target-sequence staged expert request/report is null");
+    }
+    require_header(request->struct_size, sizeof(*request),
+                   request->abi_version,
+                   "provider target-sequence staged expert request");
+    if (report->struct_size != sizeof(*report) || request->flags != 0 ||
+        !all_zero(request->reserved) || request->spine_generation == 0 ||
+        request->expert_count == 0 ||
+        request->expert_count >
+            DELTAFIN_PROVIDER_TARGET_SEQUENCE_MAX_EXPERTS_V1) {
+      throw std::invalid_argument(
+          "provider target-sequence staged expert request has invalid bounds/flags/reserved fields");
+    }
+    for (std::size_t index = 0; index < request->expert_count; ++index) {
+      if (request->expert_ids[index] >= kK3Experts ||
+          (index != 0 && request->expert_ids[index - 1] >=
+                             request->expert_ids[index]) ||
+          request->expert_span_pointers[index] == nullptr) {
+        throw std::invalid_argument(
+            "provider target-sequence staged expert IDs/pointers are not canonical and non-null");
+      }
+    }
+    if (!std::all_of(
+            request->expert_ids + request->expert_count,
+            std::end(request->expert_ids),
+            [](const std::uint16_t value) { return value == 0; }) ||
+        !std::all_of(
+            request->expert_span_pointers + request->expert_count,
+            std::end(request->expert_span_pointers),
+            [](const std::uint8_t* value) { return value == nullptr; })) {
+      throw std::invalid_argument(
+          "provider target-sequence unused staged expert slots must be zero/null");
+    }
+    const auto expert_layout = decode_expert_layout(request->expert_layout);
+    const std::uint64_t expert_span = required_k3_expert_span(expert_layout);
+    if (request->expert_span_bytes != expert_span) {
+      throw std::invalid_argument(
+          "provider target-sequence staged expert span does not match its layout");
+    }
+
+    const auto session = find_session(request->session);
+    const c10::InferenceMode inference_guard;
+    std::lock_guard<std::mutex> lock(session->mutex);
+    session->require_open();
+    require_live_target_sequence(*session, request->sequence);
+
+    DeltafinProviderTargetSequenceStageExpertSpansReportV1 produced = {};
+    produced.struct_size = sizeof(produced);
+    produced.abi_version = DELTAFIN_PROVIDER_ABI_VERSION;
+    produced.sequence = request->sequence;
+    produced.spine_generation = request->spine_generation;
+    produced.layer_index = request->layer_index;
+    produced.first_row = request->first_row;
+    produced.expert_count = request->expert_count;
+    produced.staged = 0;
+
+    // Every structural mismatch below is a refusal rather than an error: this
+    // call only ever buys a head start, so declining it must cost nothing but
+    // the head start.
+    auto options = target_moe_options(*request, *session);
+    const bool eligible =
+        session->moe_plans.empty() &&
+        options.expert_backend ==
+            deltafin::provider_internal::MoeExpertBackend::MetalMxfp4 &&
+        request->layer_index ==
+            session->target_sequence->next_layer_index() &&
+        request->row_count == 1 && request->first_row == 0 &&
+        session->target_sequence->position_count() == 1;
+    if (eligible) {
+      const auto experts =
+          deltafin::provider_internal::CanonicalExpertPositionTileT1{
+              .expert_ids = std::span<const std::uint16_t>(
+                  request->expert_ids, request->expert_count),
+              .expert_major_bytes = {},
+              .layout = expert_layout,
+              .expert_span_bytes = expert_span,
+              .expert_span_pointers =
+                  std::span<const std::uint8_t* const>(
+                      request->expert_span_pointers, request->expert_count)};
+      produced.staged = session->target_sequence->stage_expert_spans(
+                            static_cast<std::uint16_t>(request->first_row),
+                            static_cast<std::uint16_t>(request->row_count),
+                            request->spine_generation, experts, options)
+                            ? 1U
+                            : 0U;
+    }
     *report = produced;
   });
 }
@@ -7868,15 +7984,18 @@ extern "C" int32_t deltafin_provider_target_sequence_dspark_rows_v1(
     std::lock_guard<std::mutex> lock(session->mutex);
     session->require_open();
     require_live_target_sequence(*session, request->resource);
+    // DSpark's five post-layer rows or EAGLE-3's three AttnRes taps; the
+    // tape already proved its roster matches the begin flag.
     at::Tensor rows = session->target_sequence->dspark_target_rows();
     if (!rows.defined() || rows.scalar_type() != at::kBFloat16 ||
         !rows.is_contiguous() || rows.dim() != 2 || rows.size(0) < 1 ||
         rows.size(0) > DELTAFIN_PROVIDER_ROUTE_MAX_POSITIONS_V1 ||
-        rows.size(1) != 5 * 7168 ||
+        (rows.size(1) != 5 * 7168 && rows.size(1) != 3 * 7168) ||
         rows.device() != session->selected.device) {
       throw std::logic_error(
-          "target-sequence DSpark capture returned an invalid provider tensor");
+          "target-sequence proposal capture returned an invalid provider tensor");
     }
+    const std::int64_t columns = rows.size(1);
     const auto handle = session->allocate_resource();
     const auto [ignored, inserted] =
         session->tensors.emplace(handle, std::move(rows));
@@ -7892,7 +8011,7 @@ extern "C" int32_t deltafin_provider_target_sequence_dspark_rows_v1(
     produced.tensor = handle;
     produced.rows = static_cast<std::uint64_t>(
         session->target_sequence->position_count());
-    produced.columns = 5 * 7168;
+    produced.columns = static_cast<std::uint64_t>(columns);
     *report = produced;
   });
 }
@@ -8573,6 +8692,381 @@ extern "C" int32_t deltafin_provider_dspark_propose_v1(
       produced.confidence_logits[row] = confidence_values[row];
     }
     *report = produced;
+  });
+}
+
+namespace {
+
+using deltafin::provider_internal::Eagle3Model;
+using deltafin::provider_internal::Eagle3Shape;
+using deltafin::provider_internal::Eagle3Weights;
+
+std::vector<std::int64_t> eagle3_slot_shape(const std::uint32_t slot,
+                                            const Eagle3Shape& shape) {
+  const std::int64_t h = shape.hidden_size;
+  switch (slot) {
+    case DELTAFIN_PROVIDER_EAGLE3_FC_V1:
+      return {h, shape.tap_width()};
+    case DELTAFIN_PROVIDER_EAGLE3_FC_NORM0_V1:
+    case DELTAFIN_PROVIDER_EAGLE3_FC_NORM1_V1:
+    case DELTAFIN_PROVIDER_EAGLE3_FC_NORM2_V1:
+    case DELTAFIN_PROVIDER_EAGLE3_HIDDEN_NORM_V1:
+    case DELTAFIN_PROVIDER_EAGLE3_INPUT_NORM_V1:
+    case DELTAFIN_PROVIDER_EAGLE3_POST_ATTENTION_NORM_V1:
+    case DELTAFIN_PROVIDER_EAGLE3_FINAL_NORM_V1:
+      return {h};
+    case DELTAFIN_PROVIDER_EAGLE3_QUERY_A_V1:
+      return {shape.q_lora_rank, 2 * h};
+    case DELTAFIN_PROVIDER_EAGLE3_QUERY_A_NORM_V1:
+      return {shape.q_lora_rank};
+    case DELTAFIN_PROVIDER_EAGLE3_QUERY_B_V1:
+      return {shape.num_heads * shape.query_head_dim(), shape.q_lora_rank};
+    case DELTAFIN_PROVIDER_EAGLE3_KEY_VALUE_A_V1:
+      return {shape.kv_lora_rank + shape.qk_rope_head_dim, 2 * h};
+    case DELTAFIN_PROVIDER_EAGLE3_KEY_VALUE_A_NORM_V1:
+      return {shape.kv_lora_rank};
+    case DELTAFIN_PROVIDER_EAGLE3_KEY_VALUE_B_V1:
+      return {shape.num_heads *
+                  (shape.qk_nope_head_dim + shape.value_head_dim),
+              shape.kv_lora_rank};
+    case DELTAFIN_PROVIDER_EAGLE3_OUTPUT_V1:
+      return {h, shape.num_heads * shape.value_head_dim};
+    case DELTAFIN_PROVIDER_EAGLE3_GATE_V1:
+    case DELTAFIN_PROVIDER_EAGLE3_UP_V1:
+      return {shape.intermediate_size, h};
+    case DELTAFIN_PROVIDER_EAGLE3_DOWN_V1:
+      return {h, shape.intermediate_size};
+    case DELTAFIN_PROVIDER_EAGLE3_HEAD_V1:
+      return {shape.vocabulary_size, h};
+    default:
+      throw std::invalid_argument("EAGLE-3 tensor slot is unknown");
+  }
+}
+
+Eagle3Weights bind_eagle3_roster(const DeltafinProviderEagle3CreateV1& request,
+                                  const Eagle3Shape& shape,
+                                  const at::Device& device) {
+  if (request.tensors == nullptr ||
+      request.tensor_count != DELTAFIN_PROVIDER_EAGLE3_TENSOR_COUNT_V1) {
+    throw std::invalid_argument("EAGLE-3 roster must name exactly 19 tensors");
+  }
+  std::array<at::Tensor, DELTAFIN_PROVIDER_EAGLE3_TENSOR_COUNT_V1 + 1> bound;
+  for (std::uint32_t index = 0; index < request.tensor_count; ++index) {
+    const DeltafinProviderDSparkTensorV1& descriptor = request.tensors[index];
+    const std::uint32_t slot = descriptor.slot;
+    if (slot < 1 || slot > DELTAFIN_PROVIDER_EAGLE3_TENSOR_COUNT_V1 ||
+        bound[slot].defined()) {
+      throw std::invalid_argument("EAGLE-3 tensor slot is invalid or repeated");
+    }
+    const std::vector<std::int64_t> expected = eagle3_slot_shape(slot, shape);
+    std::uint64_t elements = 1;
+    bool shape_matches =
+        descriptor.rank == expected.size() && descriptor.rank <= 2;
+    for (std::size_t axis = 0; shape_matches && axis < expected.size(); ++axis) {
+      shape_matches = descriptor.shape[axis] ==
+                      static_cast<std::uint64_t>(expected[axis]);
+      elements *= static_cast<std::uint64_t>(expected[axis]);
+    }
+    if (!shape_matches || descriptor.scalar_type != DELTAFIN_PROVIDER_DSPARK_BF16_V1 ||
+        descriptor.flags != 0 || descriptor.data == nullptr ||
+        descriptor.data_length != elements * 2 || !all_zero(descriptor.reserved)) {
+      throw std::invalid_argument("EAGLE-3 tensor slot " + std::to_string(slot) +
+                                  " violates its BF16 shape contract");
+    }
+    bound[slot] = copy_dspark_bf16(descriptor.data, expected, device);
+  }
+  return Eagle3Weights{
+      .fc = bound[DELTAFIN_PROVIDER_EAGLE3_FC_V1],
+      .fc_norm = {bound[DELTAFIN_PROVIDER_EAGLE3_FC_NORM0_V1],
+                  bound[DELTAFIN_PROVIDER_EAGLE3_FC_NORM1_V1],
+                  bound[DELTAFIN_PROVIDER_EAGLE3_FC_NORM2_V1]},
+      .hidden_norm = bound[DELTAFIN_PROVIDER_EAGLE3_HIDDEN_NORM_V1],
+      .input_norm = bound[DELTAFIN_PROVIDER_EAGLE3_INPUT_NORM_V1],
+      .attention =
+          deltafin::provider_internal::DSparkMlaWeights{
+              .query_a = bound[DELTAFIN_PROVIDER_EAGLE3_QUERY_A_V1],
+              .query_a_norm = bound[DELTAFIN_PROVIDER_EAGLE3_QUERY_A_NORM_V1],
+              .query_b = bound[DELTAFIN_PROVIDER_EAGLE3_QUERY_B_V1],
+              .key_value_a = bound[DELTAFIN_PROVIDER_EAGLE3_KEY_VALUE_A_V1],
+              .key_value_a_norm = bound[DELTAFIN_PROVIDER_EAGLE3_KEY_VALUE_A_NORM_V1],
+              .key_value_b = bound[DELTAFIN_PROVIDER_EAGLE3_KEY_VALUE_B_V1],
+              .output = bound[DELTAFIN_PROVIDER_EAGLE3_OUTPUT_V1],
+          },
+      .post_attention_norm = bound[DELTAFIN_PROVIDER_EAGLE3_POST_ATTENTION_NORM_V1],
+      .mlp =
+          deltafin::provider_internal::DSparkMlpWeights{
+              .gate = bound[DELTAFIN_PROVIDER_EAGLE3_GATE_V1],
+              .up = bound[DELTAFIN_PROVIDER_EAGLE3_UP_V1],
+              .down = bound[DELTAFIN_PROVIDER_EAGLE3_DOWN_V1],
+          },
+      .final_norm = bound[DELTAFIN_PROVIDER_EAGLE3_FINAL_NORM_V1],
+      .language_model_head = bound[DELTAFIN_PROVIDER_EAGLE3_HEAD_V1],
+  };
+}
+
+DeltafinProviderEagle3ReportV1 eagle3_report(
+    const DeltafinProviderEagle3HandleV1 handle, const Eagle3Model& model) {
+  DeltafinProviderEagle3ReportV1 report = {};
+  report.struct_size = sizeof(report);
+  report.abi_version = DELTAFIN_PROVIDER_ABI_VERSION;
+  report.model = handle;
+  report.token_count = static_cast<std::uint64_t>(model.token_count());
+  report.cache_length = static_cast<std::uint64_t>(model.length());
+  report.max_positions = static_cast<std::uint64_t>(model.shape().max_position);
+  report.flags = model.shape().is_exact_k3()
+                     ? 0u
+                     : static_cast<std::uint32_t>(
+                           DELTAFIN_PROVIDER_EAGLE3_SYNTHETIC_V1);
+  report.proposing = model.proposing() ? 1u : 0u;
+  return report;
+}
+
+std::unique_ptr<Eagle3Model>& require_eagle3_model(
+    Session& session, const DeltafinProviderEagle3HandleV1 handle) {
+  const auto found = session.eagle3_models.find(handle);
+  if (found == session.eagle3_models.end()) {
+    throw std::invalid_argument("EAGLE-3 model handle is stale or unknown");
+  }
+  return found->second;
+}
+
+}  // namespace
+
+extern "C" int32_t deltafin_provider_eagle3_create_v1(
+    const DeltafinProviderEagle3CreateV1* request,
+    DeltafinProviderEagle3ReportV1* report, char* error,
+    const size_t error_capacity) {
+  return ffi_guard(error, error_capacity, [&] {
+    if (request == nullptr || report == nullptr) {
+      throw std::invalid_argument("EAGLE-3 create request/report is null");
+    }
+    require_header(request->struct_size, sizeof(*request), request->abi_version,
+                   "EAGLE-3 create request");
+    if (report->struct_size != sizeof(*report) ||
+        (request->flags & ~DELTAFIN_PROVIDER_EAGLE3_SYNTHETIC_V1) != 0 ||
+        request->max_positions < 1 || request->max_positions > (1u << 20) ||
+        !all_zero(request->reserved)) {
+      throw std::invalid_argument(
+          "EAGLE-3 create report/flags/capacity/reserved fields are invalid");
+    }
+    const auto session = find_session(request->session);
+    const c10::InferenceMode inference_guard;
+    std::lock_guard<std::mutex> lock(session->mutex);
+    session->require_open();
+    const bool synthetic =
+        (request->flags & DELTAFIN_PROVIDER_EAGLE3_SYNTHETIC_V1) != 0;
+    Eagle3Shape shape = synthetic
+                            ? Eagle3Shape::small_canary()
+                            : Eagle3Shape::k3(static_cast<std::int64_t>(
+                                  request->max_positions));
+    shape.max_position = static_cast<std::int64_t>(request->max_positions);
+    Eagle3Weights weights =
+        bind_eagle3_roster(*request, shape, session->selected.device);
+    auto staged = std::make_unique<Eagle3Model>(shape, std::move(weights),
+                                                !synthetic);
+    const DeltafinProviderEagle3HandleV1 handle = session->allocate_resource();
+    const auto [ignored, inserted] =
+        session->eagle3_models.emplace(handle, std::move(staged));
+    static_cast<void>(ignored);
+    if (!inserted) {
+      throw std::runtime_error("EAGLE-3 model handle collision");
+    }
+    *report = eagle3_report(handle, *session->eagle3_models.at(handle));
+  });
+}
+
+extern "C" int32_t deltafin_provider_eagle3_destroy_v1(
+    const DeltafinProviderResourceRequestV1* request, char* error,
+    const size_t error_capacity) {
+  return ffi_guard(error, error_capacity, [&] {
+    require_resource_request(request, "EAGLE-3 destroy request");
+    const auto session = find_session(request->session);
+    std::lock_guard<std::mutex> lock(session->mutex);
+    for (const auto& [ignored, snapshot] : session->eagle3_snapshots) {
+      static_cast<void>(ignored);
+      if (snapshot.model == request->resource) {
+        throw std::invalid_argument(
+            "EAGLE-3 model cannot destroy while snapshots remain live");
+      }
+    }
+    if (session->eagle3_models.erase(request->resource) != 1) {
+      throw std::invalid_argument("EAGLE-3 model handle is stale or unknown");
+    }
+  });
+}
+
+extern "C" int32_t deltafin_provider_eagle3_advance_v1(
+    const DeltafinProviderEagle3AdvanceV1* request,
+    DeltafinProviderEagle3ReportV1* report, char* error,
+    const size_t error_capacity) {
+  return ffi_guard(error, error_capacity, [&] {
+    if (request == nullptr || report == nullptr) {
+      throw std::invalid_argument("EAGLE-3 advance request/report is null");
+    }
+    require_header(request->struct_size, sizeof(*request), request->abi_version,
+                   "EAGLE-3 advance request");
+    if (report->struct_size != sizeof(*report) || request->rows == 0 ||
+        request->rows > static_cast<std::uint64_t>(INT64_MAX) ||
+        request->input_embeddings_bf16 == nullptr ||
+        !all_zero(request->reserved)) {
+      throw std::invalid_argument("EAGLE-3 advance fields are invalid");
+    }
+    const auto session = find_session(request->session);
+    const c10::InferenceMode inference_guard;
+    std::lock_guard<std::mutex> lock(session->mutex);
+    session->require_open();
+    auto& model = require_eagle3_model(*session, request->model);
+    if (request->expected_token_count !=
+        static_cast<std::uint64_t>(model->token_count())) {
+      throw std::invalid_argument(
+          "EAGLE-3 advance expected token boundary is stale");
+    }
+    const auto found = session->tensors.find(request->target_rows);
+    if (found == session->tensors.end()) {
+      throw std::invalid_argument(
+          "EAGLE-3 target-rows tensor handle is stale or unknown");
+    }
+    const std::int64_t rows = static_cast<std::int64_t>(request->rows);
+    const at::Tensor& captured = found->second;
+    if (!captured.defined() || captured.scalar_type() != at::kBFloat16 ||
+        !captured.is_contiguous() ||
+        captured.device() != session->selected.device || captured.dim() != 2 ||
+        captured.size(0) < rows ||
+        captured.size(1) != model->shape().tap_width()) {
+      throw std::invalid_argument(
+          "EAGLE-3 target-rows tensor has invalid dtype/device/shape");
+    }
+    const std::int64_t hidden = model->shape().hidden_size;
+    if (request->input_embedding_bytes !=
+        static_cast<std::uint64_t>(rows) * static_cast<std::uint64_t>(hidden) * 2) {
+      throw std::invalid_argument("EAGLE-3 input embedding byte length is invalid");
+    }
+    const at::Tensor embeddings = copy_dspark_bf16(
+        request->input_embeddings_bf16, {rows, hidden}, session->selected.device);
+    model->advance(captured.narrow(0, 0, rows).contiguous(), embeddings);
+    *report = eagle3_report(request->model, *model);
+  });
+}
+
+extern "C" int32_t deltafin_provider_eagle3_step_v1(
+    const DeltafinProviderEagle3StepV1* request,
+    DeltafinProviderEagle3StepReportV1* report, char* error,
+    const size_t error_capacity) {
+  return ffi_guard(error, error_capacity, [&] {
+    if (request == nullptr || report == nullptr) {
+      throw std::invalid_argument("EAGLE-3 step request/report is null");
+    }
+    require_header(request->struct_size, sizeof(*request), request->abi_version,
+                   "EAGLE-3 step request");
+    const bool ending = request->phase == DELTAFIN_PROVIDER_EAGLE3_STEP_END_V1;
+    if (report->struct_size != sizeof(*report) || request->reserved32 != 0 ||
+        !all_zero(request->reserved) ||
+        (request->phase != DELTAFIN_PROVIDER_EAGLE3_STEP_BEGIN_V1 &&
+         request->phase != DELTAFIN_PROVIDER_EAGLE3_STEP_CONTINUE_V1 && !ending) ||
+        (ending != (request->embedding_bf16 == nullptr))) {
+      throw std::invalid_argument("EAGLE-3 step fields are invalid");
+    }
+    const auto session = find_session(request->session);
+    const c10::InferenceMode inference_guard;
+    std::lock_guard<std::mutex> lock(session->mutex);
+    auto& model = require_eagle3_model(*session, request->model);
+    DeltafinProviderEagle3StepReportV1 produced = {};
+    produced.struct_size = sizeof(produced);
+    produced.abi_version = DELTAFIN_PROVIDER_ABI_VERSION;
+    if (ending) {
+      if (request->embedding_bytes != 0) {
+        throw std::invalid_argument("EAGLE-3 chain end carries no embedding");
+      }
+      model->propose_end();
+      *report = produced;
+      return;
+    }
+    session->require_open();
+    const std::int64_t hidden = model->shape().hidden_size;
+    if (request->embedding_bytes != static_cast<std::uint64_t>(hidden) * 2) {
+      throw std::invalid_argument("EAGLE-3 step embedding byte length is invalid");
+    }
+    const at::Tensor embedding = copy_dspark_bf16(
+        request->embedding_bf16, {1, hidden}, session->selected.device);
+    const std::int64_t token =
+        request->phase == DELTAFIN_PROVIDER_EAGLE3_STEP_BEGIN_V1
+            ? model->propose_begin(embedding)
+            : model->propose_step(embedding);
+    if (token < 0 || token >= model->shape().vocabulary_size) {
+      model->propose_end();
+      throw std::runtime_error("EAGLE-3 proposal ID exceeds the vocabulary");
+    }
+    produced.token_id = static_cast<std::uint32_t>(token);
+    produced.drafts = 1;
+    *report = produced;
+  });
+}
+
+extern "C" int32_t deltafin_provider_eagle3_snapshot_v1(
+    const DeltafinProviderResourceRequestV1* request,
+    DeltafinProviderEagle3SnapshotReportV1* report, char* error,
+    const size_t error_capacity) {
+  return ffi_guard(error, error_capacity, [&] {
+    if (report == nullptr || report->struct_size != sizeof(*report)) {
+      throw std::invalid_argument("EAGLE-3 snapshot report is invalid");
+    }
+    require_resource_request(request, "EAGLE-3 snapshot request");
+    const auto session = find_session(request->session);
+    const c10::InferenceMode inference_guard;
+    std::lock_guard<std::mutex> lock(session->mutex);
+    auto& model = require_eagle3_model(*session, request->resource);
+    Eagle3SnapshotSlot slot{
+        .model = request->resource,
+        .snapshot = model->snapshot(),
+    };
+    const auto handle = session->allocate_resource();
+    session->eagle3_snapshots.emplace(handle, std::move(slot));
+    DeltafinProviderEagle3SnapshotReportV1 produced = {};
+    produced.struct_size = sizeof(produced);
+    produced.abi_version = DELTAFIN_PROVIDER_ABI_VERSION;
+    produced.snapshot = handle;
+    produced.token_count = static_cast<std::uint64_t>(model->token_count());
+    *report = produced;
+  });
+}
+
+extern "C" int32_t deltafin_provider_eagle3_restore_v1(
+    const DeltafinProviderEagle3RestoreV1* request,
+    DeltafinProviderEagle3ReportV1* report, char* error,
+    const size_t error_capacity) {
+  return ffi_guard(error, error_capacity, [&] {
+    if (request == nullptr || report == nullptr) {
+      throw std::invalid_argument("EAGLE-3 restore request/report is null");
+    }
+    require_header(request->struct_size, sizeof(*request), request->abi_version,
+                   "EAGLE-3 restore request");
+    if (report->struct_size != sizeof(*report) || !all_zero(request->reserved)) {
+      throw std::invalid_argument("EAGLE-3 restore fields are invalid");
+    }
+    const auto session = find_session(request->session);
+    const c10::InferenceMode inference_guard;
+    std::lock_guard<std::mutex> lock(session->mutex);
+    auto& model = require_eagle3_model(*session, request->model);
+    const auto found = session->eagle3_snapshots.find(request->snapshot);
+    if (found == session->eagle3_snapshots.end() ||
+        found->second.model != request->model) {
+      throw std::invalid_argument("EAGLE-3 snapshot is stale or belongs elsewhere");
+    }
+    model->restore(found->second.snapshot);
+    *report = eagle3_report(request->model, *model);
+  });
+}
+
+extern "C" int32_t deltafin_provider_eagle3_snapshot_destroy_v1(
+    const DeltafinProviderResourceRequestV1* request, char* error,
+    const size_t error_capacity) {
+  return ffi_guard(error, error_capacity, [&] {
+    require_resource_request(request, "EAGLE-3 snapshot destroy request");
+    const auto session = find_session(request->session);
+    std::lock_guard<std::mutex> lock(session->mutex);
+    if (session->eagle3_snapshots.erase(request->resource) != 1) {
+      throw std::invalid_argument("EAGLE-3 snapshot handle is stale or unknown");
+    }
   });
 }
 

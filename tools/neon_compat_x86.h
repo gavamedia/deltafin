@@ -19,11 +19,18 @@
 #include <immintrin.h>
 #include <stdint.h>
 
+// MSVC has no per-feature predefined macros and accepts every intrinsic
+// regardless of /arch, so this baseline cannot be asserted at compile time
+// there.  build_native.py compiles Windows with /arch:AVX for the same VEX
+// baseline, and the loader refuses a CPU without AVX/FMA3/SSSE3 before the
+// library is used.
+#if !defined(_MSC_VER) || defined(__clang__)
 #if !defined(__SSSE3__)
 #error "The x86-64 MXFP4 kernel requires SSSE3 (build with -mssse3 or -march=native)"
 #endif
 #if !defined(__FMA__)
 #error "The x86-64 MXFP4 kernel requires FMA3 (build with -mfma or -march=native)"
+#endif
 #endif
 
 typedef __m128  float32x4_t;
@@ -130,8 +137,8 @@ static inline uint8x16_t vzip2q_u8(uint8x16_t a, uint8x16_t b) {
 static inline uint8x16_t vuzp1q_u8(uint8x16_t a, uint8x16_t b) {
     const __m128i even = _mm_setr_epi8(
         0, 2, 4, 6, 8, 10, 12, 14,
-        (char)0x80, (char)0x80, (char)0x80, (char)0x80,
-        (char)0x80, (char)0x80, (char)0x80, (char)0x80);
+        (char)-128, (char)-128, (char)-128, (char)-128,
+        (char)-128, (char)-128, (char)-128, (char)-128);
     __m128i lo = _mm_shuffle_epi8(a, even);
     __m128i hi = _mm_slli_si128(_mm_shuffle_epi8(b, even), 8);
     return _mm_or_si128(lo, hi);
@@ -140,8 +147,8 @@ static inline uint8x16_t vuzp1q_u8(uint8x16_t a, uint8x16_t b) {
 static inline uint8x16_t vuzp2q_u8(uint8x16_t a, uint8x16_t b) {
     const __m128i odd = _mm_setr_epi8(
         1, 3, 5, 7, 9, 11, 13, 15,
-        (char)0x80, (char)0x80, (char)0x80, (char)0x80,
-        (char)0x80, (char)0x80, (char)0x80, (char)0x80);
+        (char)-128, (char)-128, (char)-128, (char)-128,
+        (char)-128, (char)-128, (char)-128, (char)-128);
     __m128i lo = _mm_shuffle_epi8(a, odd);
     __m128i hi = _mm_slli_si128(_mm_shuffle_epi8(b, odd), 8);
     return _mm_or_si128(lo, hi);

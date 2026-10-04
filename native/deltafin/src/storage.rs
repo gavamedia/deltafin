@@ -10,21 +10,26 @@
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(unix)]
 use std::ffi::CStr;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::FileExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::error::{DeltafinError, Result};
+use crate::sys::fs::{self as sys_fs, FileExt, Open, Stat};
+use crate::storage_homes::StorageHomes;
+use crate::sys::limits::{
+    count_open_descriptors, descriptor_limits, set_soft_descriptor_limit, soft_descriptor_limit,
+};
 use crate::packfile::DigestState;
 
 #[cfg(target_os = "macos")]
@@ -229,109 +234,6 @@ pub fn prepare_persistent_descriptor_capacity(required: usize, reserve: usize) -
     Ok(())
 }
 
-#[repr(C)]
-struct NativeRlimit {
-    current: u64,
-    maximum: u64,
-}
-
-fn soft_descriptor_limit() -> Option<usize> {
-    descriptor_limits().map(|limits| limits.0)
-}
-
-fn descriptor_limits() -> Option<(usize, usize)> {
-    #[cfg(target_os = "linux")]
-    const RLIMIT_NOFILE: i32 = 7;
-    #[cfg(target_os = "macos")]
-    const RLIMIT_NOFILE: i32 = 8;
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    return None;
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    unsafe extern "C" {
-        fn getrlimit(resource: i32, limits: *mut NativeRlimit) -> i32;
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        let mut limits = NativeRlimit {
-            current: 0,
-            maximum: 0,
-        };
-        // SAFETY: `limits` points to writable storage with the platform's
-        // two-rlim_t layout; Linux and Darwin use 64-bit rlim_t on supported
-        // x86-64/aarch64 targets.
-        if unsafe { getrlimit(RLIMIT_NOFILE, &mut limits) } != 0 {
-            return None;
-        }
-        Some((
-            usize::try_from(limits.current).ok()?,
-            usize::try_from(limits.maximum).ok()?,
-        ))
-    }
-}
-
-fn set_soft_descriptor_limit(soft: usize) -> bool {
-    #[cfg(target_os = "linux")]
-    const RLIMIT_NOFILE: i32 = 7;
-    #[cfg(target_os = "macos")]
-    const RLIMIT_NOFILE: i32 = 8;
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    return false;
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    unsafe extern "C" {
-        fn setrlimit(resource: i32, limits: *const NativeRlimit) -> i32;
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        let Some((_, hard)) = descriptor_limits() else {
-            return false;
-        };
-        if soft > hard {
-            return false;
-        }
-        let limits = NativeRlimit {
-            current: soft as u64,
-            maximum: hard as u64,
-        };
-        // SAFETY: `limits` has the supported platform's two-rlim_t layout and
-        // remains live for the duration of this process-local syscall.
-        unsafe { setrlimit(RLIMIT_NOFILE, &limits) == 0 }
-    }
-}
-
-fn count_open_descriptors() -> Option<usize> {
-    #[cfg(target_os = "linux")]
-    const FD_DIRECTORIES: [&str; 2] = ["/proc/self/fd", "/dev/fd"];
-    #[cfg(not(target_os = "linux"))]
-    const FD_DIRECTORIES: [&str; 2] = ["/dev/fd", "/proc/self/fd"];
-
-    for directory in FD_DIRECTORIES {
-        let Ok(entries) = std::fs::read_dir(directory) else {
-            continue;
-        };
-        let mut count = 0_usize;
-        let mut complete = true;
-        for entry in entries {
-            if entry.is_err() {
-                complete = false;
-                break;
-            }
-            let Some(next) = count.checked_add(1) else {
-                complete = false;
-                break;
-            };
-            count = next;
-        }
-        if complete {
-            return Some(count);
-        }
-    }
-    None
-}
-
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum BufferKind {
     Quantized,
@@ -435,6 +337,7 @@ impl DeferredSourceName {
         })
     }
 
+    #[cfg(unix)]
     fn as_c_str(&self) -> &CStr {
         // Construction rejects interior NULs and the fixed trailing byte is
         // zero, so this prefix is always exactly one valid C string.
@@ -465,6 +368,32 @@ struct DeferredExactCatalogInner {
     sources: Box<[DeferredSourceName]>,
     exact_source_length: u64,
     cache_policy: CachePolicy,
+}
+
+fn open_catalog_directory(directory: &Path) -> Result<File> {
+    let directory_file = Open::new()
+        .read(true)
+        .directory()
+        .no_follow()
+        .hold_in_place()
+        .open(directory)
+        .map_err(|error| {
+            io_error(
+                "open deferred source directory without following symlinks",
+                directory,
+                error,
+            )
+        })?;
+    let metadata = directory_file
+        .metadata()
+        .map_err(|error| io_error("stat deferred source directory", directory, error))?;
+    if !metadata.is_dir() {
+        return Err(DeltafinError::new(format!(
+            "deferred source catalog root is not a directory: {}",
+            directory.display()
+        )));
+    }
+    Ok(directory_file)
 }
 
 /// Immutable directory-relative source catalog for repeated whole-file reads.
@@ -498,26 +427,7 @@ impl DeferredExactCatalog {
                 "a deferred source catalog needs at least one source",
             ));
         }
-        let directory_file = OpenOptions::new()
-            .read(true)
-            .custom_flags(open_cloexec_nofollow())
-            .open(directory)
-            .map_err(|error| {
-                io_error(
-                    "open deferred source directory without following symlinks",
-                    directory,
-                    error,
-                )
-            })?;
-        let metadata = directory_file
-            .metadata()
-            .map_err(|error| io_error("stat deferred source directory", directory, error))?;
-        if !metadata.is_dir() {
-            return Err(DeltafinError::new(format!(
-                "deferred source catalog root is not a directory: {}",
-                directory.display()
-            )));
-        }
+        let directory_file = open_catalog_directory(directory)?;
         Ok(Self {
             inner: Arc::new(DeferredExactCatalogInner {
                 directory: directory_file,
@@ -851,7 +761,7 @@ struct Source {
     /// entire immutable plan lifetime. `OnceLock<Result<_>>` also pins a
     /// first-use failure, so a path replacement can never turn a rejected
     /// source into a different inode inside the published plan.
-    persistent_file: Option<OnceLock<Result<File>>>,
+    persistent_file: Option<OnceLock<Result<OpenedSource>>>,
     length: u64,
     expected_identity: Option<DeferredSourceIdentity>,
     verifications: Box<[SourceVerification]>,
@@ -862,6 +772,53 @@ struct Source {
     /// the retained ranges.
     scatter_extents: Vec<SourceScatter>,
     cache_policy: CachePolicy,
+}
+
+/// A source descriptor plus the drive it was opened on: device 0 is the
+/// model root's own drive, anything else a storage home's copy at `path`.
+#[derive(Debug)]
+struct OpenedSource {
+    file: File,
+    device: u8,
+    path: Option<PathBuf>,
+}
+
+impl std::ops::Deref for OpenedSource {
+    type Target = File;
+
+    fn deref(&self) -> &File {
+        &self.file
+    }
+}
+
+/// Only sources opened lazily by path and not pinned to one file identity
+/// may be read from another drive's copy.
+fn redirectable(source: &Source) -> bool {
+    source.file.is_none() && source.expected_identity.is_none()
+}
+
+/// Charge one read attempt to `device` and run it, through the diagnostic
+/// device emulator when one is configured.
+fn attempt_device_read(
+    homes: Option<&StorageHomes>,
+    device: u8,
+    file: &File,
+    path: &Path,
+    bytes: usize,
+    read: &mut dyn FnMut(&File, &Path) -> Result<()>,
+) -> Result<()> {
+    let charge = homes.map(|homes| homes.begin(device, bytes as u64));
+    let result = crate::storage_emulation::begin(path, bytes)
+        .map_err(|error| io_error("emulated device read", path, error))
+        .and_then(|emulated| {
+            read(file, path)?;
+            crate::storage_emulation::end(emulated);
+            Ok(())
+        });
+    if let Some(charge) = charge {
+        charge.finish(result.is_ok());
+    }
+    result
 }
 
 #[derive(Debug)]
@@ -944,7 +901,7 @@ enum BatchSources {
         /// positional jobs; sharing the validated descriptor removes repeated
         /// open/stat/cache-policy calls and guarantees every chunk observes
         /// the same inode. Persistent plans leave this absent.
-        deferred_files: Option<Box<[OnceLock<Result<File>>]>>,
+        deferred_files: Option<Box<[OnceLock<Result<OpenedSource>>]>>,
     },
     DeferredCatalog(Arc<DeferredExactCatalogInner>),
 }
@@ -2152,6 +2109,65 @@ impl BufferArena {
         self.available.notify_all();
     }
 
+    /// Drop every retained slab from slots with no live lease and report the
+    /// bytes returned to the host. Free slots keep their slabs indefinitely
+    /// for reuse, which is the right steady-state default but the wrong
+    /// choice under live memory pressure when the slabs are purely advisory
+    /// (speculative prefetch): they re-grow lazily on the next read, so
+    /// shedding them trades a little future latency for immediate headroom.
+    ///
+    /// Ordering mirrors `acquire`'s growth path: slabs are first detached
+    /// under the lock (no new lease can reach them), then the retire hook
+    /// proves no external no-copy wrapper still aliases them, and only then
+    /// are they freed. On a hook failure nothing unproven is freed: each
+    /// detached slab is restored to its slot when that slot is still free and
+    /// empty, and deliberately leaked otherwise, matching the arena's
+    /// retain-rather-than-free-unproven policy everywhere else.
+    fn release_free_slabs(&self) -> Result<u64> {
+        let detached: Vec<(usize, Arc<SharedBuffers>, BufferLengths)> = {
+            let mut slots = self.inner.lock().unwrap();
+            slots
+                .iter_mut()
+                .enumerate()
+                .filter(|(_, slot)| !slot.in_use && slot.buffers.is_some())
+                .map(|(index, slot)| {
+                    let buffers = slot.buffers.take().expect("filtered on Some");
+                    let capacities = std::mem::take(&mut slot.capacities);
+                    (index, buffers, capacities)
+                })
+                .collect()
+        };
+        if detached.is_empty() {
+            return Ok(0);
+        }
+        if let Some(retire_hook) = self.retire_hook.as_ref()
+            && let Err(error) = invoke_buffer_retire_hook(retire_hook)
+        {
+            let mut slots = self.inner.lock().unwrap();
+            for (index, buffers, capacities) in detached {
+                let slot = &mut slots[index];
+                if !slot.in_use && slot.buffers.is_none() {
+                    slot.buffers = Some(buffers);
+                    slot.capacities = capacities;
+                } else {
+                    // The slot was re-acquired while detached and now owns a
+                    // fresh slab; the old one may still be aliased externally.
+                    std::mem::forget(buffers);
+                }
+            }
+            self.available.notify_all();
+            return Err(DeltafinError::new(format!(
+                "storage arena kept its cached slabs because the retire hook failed: {error}"
+            )));
+        }
+        let mut released = 0_u64;
+        for (_, buffers, capacities) in detached {
+            released = released.saturating_add(shared_allocation_len(capacities).unwrap_or(0));
+            drop(buffers);
+        }
+        Ok(released)
+    }
+
     /// Complete allocation which a new request may add at its next arena
     /// admission boundary. A fitting free slot needs no allocation. Growth
     /// charges the complete replacement slab, not merely its delta, because a
@@ -2420,6 +2436,12 @@ pub enum ReadPriority {
 // never touches the lease) and lets worker_main drop its Arc<Batch> first.
 struct BatchCompletion {
     remaining: AtomicUsize,
+    /// Bit `i` is set once job `i` has written its destination range without
+    /// error. Only batches of at most 64 jobs are tracked -- which covers
+    /// every expert union, the one caller that consumes partial progress --
+    /// so this costs one atomic word and no allocation. Larger plans simply
+    /// report no partial visibility and are waited on whole, as before.
+    completed: AtomicU64,
     cancelled: AtomicBool,
     first_error: Mutex<Option<DeltafinError>>,
     lock: Mutex<()>,
@@ -2430,12 +2452,14 @@ impl BatchCompletion {
     fn new(jobs: usize) -> Self {
         Self {
             remaining: AtomicUsize::new(jobs),
+            completed: AtomicU64::new(0),
             cancelled: AtomicBool::new(false),
             first_error: Mutex::new(None),
             lock: Mutex::new(()),
             condvar: Condvar::new(),
         }
     }
+
 }
 
 struct Batch {
@@ -2447,6 +2471,11 @@ struct Batch {
     priority: ReadPriority,
     next_job: AtomicUsize,
     completion: Arc<BatchCompletion>,
+    /// Drives holding byte-identical copies, shared by every reader so each
+    /// read can be charged to, and steered between, physical devices.
+    homes: Option<Arc<StorageHomes>>,
+    /// The owning reader's count of bytes successfully read from storage.
+    bytes_read: Arc<AtomicU64>,
 }
 
 /// Requeue: unclaimed jobs remain, push this Arc<Batch> back onto the queue.
@@ -2460,14 +2489,23 @@ enum QuantumOutcome {
 }
 
 impl Batch {
-    fn new(plan: &ReadPlan, lease: Arc<BufferLeaseInner>, priority: ReadPriority) -> Self {
+    fn new(
+        plan: &ReadPlan,
+        lease: Arc<BufferLeaseInner>,
+        priority: ReadPriority,
+        homes: Option<Arc<StorageHomes>>,
+        bytes_read: Arc<AtomicU64>,
+    ) -> Self {
+        // One lazily opened descriptor per (source, drive): with storage
+        // homes each job may read its range from a different copy.
+        let drives = homes.as_ref().map_or(1, |homes| homes.device_count());
         let deferred_files = plan
             .sources
             .values
             .iter()
-            .any(|source| source.file.is_none() && source.persistent_file.is_none())
+            .any(|source| source.file.is_none() && (source.persistent_file.is_none() || drives > 1))
             .then(|| {
-                (0..plan.sources.values.len())
+                (0..plan.sources.values.len() * drives)
                     .map(|_| OnceLock::new())
                     .collect::<Vec<_>>()
                     .into_boxed_slice()
@@ -2484,6 +2522,8 @@ impl Batch {
             priority,
             next_job: AtomicUsize::new(0),
             completion: Arc::new(BatchCompletion::new(plan.jobs.len())),
+            homes,
+            bytes_read,
         }
     }
 
@@ -2494,6 +2534,8 @@ impl Batch {
         source_length: usize,
         lease: Arc<BufferLeaseInner>,
         priority: ReadPriority,
+        homes: Option<Arc<StorageHomes>>,
+        bytes_read: Arc<AtomicU64>,
     ) -> Self {
         debug_assert!(!source_indices.is_empty());
         debug_assert!(source_indices.len() <= MAX_INLINE_DEFERRED_FILES);
@@ -2522,6 +2564,8 @@ impl Batch {
             priority,
             next_job: AtomicUsize::new(0),
             completion: Arc::new(BatchCompletion::new(source_indices.len())),
+            homes,
+            bytes_read,
         }
     }
 
@@ -2535,10 +2579,27 @@ impl Batch {
             let Some(job) = self.jobs.get(index) else {
                 return QuantumOutcome::Idle;
             };
-            if let Err(error) = self.run_job(job) {
-                let mut first_error = self.completion.first_error.lock().unwrap();
-                if first_error.is_none() {
-                    *first_error = Some(error);
+            match self.run_job(job) {
+                // Release-publish this job's bytes before anyone may observe
+                // the bit. A failed job is deliberately never published: a
+                // partial-progress reader must not be able to see a range no
+                // one successfully wrote.
+                Ok(()) if index < u64::BITS as usize => {
+                    self.completion
+                        .completed
+                        .fetch_or(1_u64 << index, Ordering::Release);
+                    // Taking the lock after the store is what makes the wake
+                    // reliable: a waiter that read the old set still holds the
+                    // lock until it parks, so this notify cannot slip past it.
+                    let _guard = self.completion.lock.lock().unwrap();
+                    self.completion.condvar.notify_all();
+                }
+                Ok(()) => {}
+                Err(error) => {
+                    let mut first_error = self.completion.first_error.lock().unwrap();
+                    if first_error.is_none() {
+                        *first_error = Some(error);
+                    }
                 }
             }
             if self.completion.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
@@ -2625,7 +2686,7 @@ impl Batch {
             } => {
                 let BatchSources::Plan {
                     sources,
-                    deferred_files,
+                    ..
                 } = &self.sources
                 else {
                     return Err(DeltafinError::new(
@@ -2642,69 +2703,54 @@ impl Batch {
                         "authenticated source was incorrectly routed through a double-read file job",
                     ));
                 }
-                let file = if let Some(file) = source.file.as_ref() {
-                    file
-                } else if let Some(slot) = source.persistent_file.as_ref() {
-                    match slot.get_or_init(|| open_deferred_source(source)) {
-                        Ok(file) => file,
-                        Err(error) => return Err(error.clone()),
+                let length = destination.len();
+                self.read_source(source, source_index, length, &mut |file, path| {
+                    let mut completed = 0_usize;
+                    while completed < destination.len() {
+                        let count = match file.read_at(
+                            &mut destination[completed..],
+                            source_offset + completed as u64,
+                        ) {
+                            Ok(count) => count,
+                            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                            Err(error) => return Err(io_error("pread", path, error)),
+                        };
+                        if count == 0 {
+                            return Err(DeltafinError::new(format!(
+                                "short pread {}/{} from {} at {}",
+                                completed,
+                                destination.len(),
+                                path.display(),
+                                source_offset
+                            )));
+                        }
+                        completed += count;
                     }
-                } else {
-                    let slot = deferred_files
-                        .as_ref()
-                        .and_then(|files| files.get(source_index))
-                        .ok_or_else(|| {
-                            DeltafinError::new("deferred read source has no batch descriptor slot")
-                        })?;
-                    match slot.get_or_init(|| open_deferred_source(source)) {
-                        Ok(file) => file,
-                        Err(error) => return Err(error.clone()),
-                    }
-                };
-                let mut completed = 0_usize;
-                while completed < destination.len() {
-                    let count = match file.read_at(
-                        &mut destination[completed..],
-                        source_offset + completed as u64,
+                    if let (true, Some(expected), Some(index)) = (
+                        verify_after_read,
+                        job.expected_digest,
+                        job.verification_index,
                     ) {
-                        Ok(count) => count,
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(error) => return Err(io_error("pread", &source.path, error)),
-                    };
-                    if count == 0 {
-                        return Err(DeltafinError::new(format!(
-                            "short pread {}/{} from {} at {}",
-                            completed,
-                            destination.len(),
-                            source.path.display(),
-                            source_offset
-                        )));
+                        let verified = self
+                            .verified_extents
+                            .as_ref()
+                            .and_then(|extents| extents.get(index))
+                            .ok_or_else(|| {
+                                DeltafinError::new("read job refers to an unknown verification slot")
+                            })?;
+                        let actual = crate::packfile::digest_bytes(destination);
+                        if actual != expected {
+                            return Err(DeltafinError::new(format!(
+                                "authenticated read from {} at {} failed SHA-256 verification",
+                                path.display(),
+                                source_offset,
+                            )));
+                        }
+                        verified.store(true, Ordering::Release);
                     }
-                    completed += count;
-                }
-                if let (true, Some(expected), Some(index)) = (
-                    verify_after_read,
-                    job.expected_digest,
-                    job.verification_index,
-                ) {
-                    let verified = self
-                        .verified_extents
-                        .as_ref()
-                        .and_then(|extents| extents.get(index))
-                        .ok_or_else(|| {
-                            DeltafinError::new("read job refers to an unknown verification slot")
-                        })?;
-                    let actual = crate::packfile::digest_bytes(destination);
-                    if actual != expected {
-                        return Err(DeltafinError::new(format!(
-                            "authenticated read from {} at {} failed SHA-256 verification",
-                            source.path.display(),
-                            source_offset,
-                        )));
-                    }
-                    verified.store(true, Ordering::Release);
-                }
-                drop_completed_cache(file, source.cache_policy, source_offset, job.length);
+                    drop_completed_cache(file, source.cache_policy, source_offset, job.length);
+                    Ok(())
+                })?;
             }
             JobSource::AuthenticatedScatter { .. } => unreachable!(
                 "authenticated scatter jobs are handled before creating one destination slice"
@@ -2721,29 +2767,30 @@ impl Batch {
                 let source_name = catalog.sources.get(source as usize).ok_or_else(|| {
                     DeltafinError::new("catalog read job refers to an unknown source")
                 })?;
-                let file = open_deferred_catalog_source(catalog, source_name)?;
-                let mut completed = 0_usize;
-                while completed < destination.len() {
-                    let count = match file.read_at(&mut destination[completed..], completed as u64)
-                    {
-                        Ok(count) => count,
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(error) => {
-                            return Err(catalog_io_error("pread", catalog, source_name, error));
+                let length = destination.len();
+                self.read_catalog_source(catalog, source_name, length, &mut |file, path| {
+                    let mut completed = 0_usize;
+                    while completed < destination.len() {
+                        let count = match file
+                            .read_at(&mut destination[completed..], completed as u64)
+                        {
+                            Ok(count) => count,
+                            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                            Err(error) => return Err(io_error("pread", path, error)),
+                        };
+                        if count == 0 {
+                            return Err(DeltafinError::new(format!(
+                                "short pread {}/{} from {} at 0",
+                                completed,
+                                destination.len(),
+                                path.display(),
+                            )));
                         }
-                    };
-                    if count == 0 {
-                        return Err(DeltafinError::new(format!(
-                            "short pread {}/{} from {}/{} at 0",
-                            completed,
-                            destination.len(),
-                            catalog.directory_path.display(),
-                            source_name.as_str(),
-                        )));
+                        completed += count;
                     }
-                    completed += count;
-                }
-                drop_completed_cache(&file, catalog.cache_policy, 0, job.length);
+                    drop_completed_cache(file, catalog.cache_policy, 0, job.length);
+                    Ok(())
+                })?;
             }
         }
         Ok(())
@@ -2757,7 +2804,7 @@ impl Batch {
     ) -> Result<()> {
         let BatchSources::Plan {
             sources,
-            deferred_files,
+            ..
         } = &self.sources
         else {
             return Err(DeltafinError::new(
@@ -2784,146 +2831,68 @@ impl Batch {
                 "vectored job has an invalid destination count",
             ));
         }
-        let file = if let Some(file) = source.file.as_ref() {
-            file
-        } else if let Some(slot) = source.persistent_file.as_ref() {
-            match slot.get_or_init(|| open_deferred_source(source)) {
-                Ok(file) => file,
-                Err(error) => return Err(error.clone()),
+        let length = scatter
+            .destinations
+            .iter()
+            .try_fold(0_usize, |sum, destination| sum.checked_add(destination.length))
+            .ok_or_else(|| DeltafinError::new("vectored read length overflows usize"))?;
+        // Each attempt rebuilds its own vector table: a failed attempt may
+        // have advanced the previous one part of the way.
+        self.read_source(source, source_index, length, &mut |file, path| {
+            // A fixed stack table avoids an allocation for every routed expert.
+            // validate_destinations proved these arena regions are bounded and
+            // globally disjoint; the batch remains private until every job ends.
+            let mut parts = [(std::ptr::null_mut::<u8>(), 0_usize); MAX_VECTORED_DESTINATIONS];
+            for (part, destination) in parts.iter_mut().zip(scatter.destinations.iter()) {
+                *part = (
+                    self.lease
+                        .buffers()
+                        .get(destination.destination)
+                        .pointer_at(destination.destination_offset, destination.length),
+                    destination.length,
+                );
             }
-        } else {
-            let slot = deferred_files
-                .as_ref()
-                .and_then(|files| files.get(source_index))
-                .ok_or_else(|| {
-                    DeltafinError::new("vectored read source has no batch descriptor slot")
-                })?;
-            match slot.get_or_init(|| open_deferred_source(source)) {
-                Ok(file) => file,
-                Err(error) => return Err(error.clone()),
-            }
-        };
-
-        // A fixed stack table avoids an allocation for every routed expert.
-        // validate_destinations proved these arena regions are bounded and
-        // globally disjoint; the batch remains private until every job ends.
-        let mut vectors: [libc::iovec; MAX_VECTORED_DESTINATIONS] = unsafe { std::mem::zeroed() };
-        let mut total = 0_usize;
-        for (vector, destination) in vectors.iter_mut().zip(scatter.destinations.iter()) {
-            let pointer = self
-                .lease
-                .buffers()
-                .get(destination.destination)
-                .pointer_at(destination.destination_offset, destination.length);
-            vector.iov_base = pointer.cast();
-            vector.iov_len = destination.length;
-            total = total
-                .checked_add(destination.length)
-                .ok_or_else(|| DeltafinError::new("vectored read length overflows usize"))?;
-        }
-        if total > isize::MAX as usize {
-            return Err(DeltafinError::new(
-                "vectored read exceeds the platform syscall length",
-            ));
-        }
-        let mut first = 0_usize;
-        let mut remaining = total;
-        let mut file_offset = i64::try_from(scatter.source_offset)
-            .map_err(|_| DeltafinError::new("vectored source offset exceeds off_t"))?;
-        while remaining != 0 {
-            let count = i32::try_from(scatter.destinations.len() - first)
-                .map_err(|_| DeltafinError::new("vectored destination count exceeds c_int"))?;
-            // SAFETY: every iovec points into a live, private, prevalidated
-            // arena range. `file` remains open for the syscall, `count` is
-            // bounded, and preadv does not retain either pointer or descriptor.
-            let read = unsafe {
-                libc::preadv(
-                    file.as_raw_fd(),
-                    vectors[first..].as_ptr(),
-                    count,
-                    file_offset,
-                )
-            };
-            if read == -1 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
+            read_scattered(
+                file,
+                path,
+                &parts[..scatter.destinations.len()],
+                scatter.source_offset,
+            )?;
+            if let Some(expected) = expected_digest {
+                // Unlike persistent ordinary extents, deferred vectored
+                // sources can reopen on every batch. Hash every verified job;
+                // higher-level immutable identity caches omit the digest from
+                // later plans instead of storing a plan-local qualification
+                // that might cross descriptor generations.
+                let mut digest = DigestState::new();
+                for destination in &scatter.destinations {
+                    let pointer = self
+                        .lease
+                        .buffers()
+                        .get(destination.destination)
+                        .pointer_at(destination.destination_offset, destination.length);
+                    // SAFETY: destination validation proved this complete
+                    // range is bounded. Its read job has finished filling it,
+                    // and every other in-flight job owns a disjoint range.
+                    let bytes =
+                        unsafe { std::slice::from_raw_parts(pointer.cast_const(), destination.length) };
+                    digest.update(bytes);
                 }
-                return Err(io_error("preadv", &source.path, error));
-            }
-            if read == 0 {
-                return Err(DeltafinError::new(format!(
-                    "short preadv {}/{} from {} at {}",
-                    total - remaining,
-                    total,
-                    source.path.display(),
-                    scatter.source_offset,
-                )));
-            }
-            let read = usize::try_from(read)
-                .map_err(|_| DeltafinError::new("preadv returned a negative byte count"))?;
-            if read > remaining {
-                return Err(DeltafinError::new("preadv exceeded its destination length"));
-            }
-            remaining -= read;
-            file_offset = file_offset
-                .checked_add(read as i64)
-                .ok_or_else(|| DeltafinError::new("vectored source offset overflows off_t"))?;
-
-            let mut consumed = read;
-            while consumed != 0 {
-                let length = vectors[first].iov_len;
-                if consumed >= length {
-                    consumed -= length;
-                    first += 1;
-                } else {
-                    // SAFETY: `consumed < iov_len`, so advancing the pointer
-                    // remains inside the same validated destination range.
-                    vectors[first].iov_base =
-                        unsafe { vectors[first].iov_base.cast::<u8>().add(consumed).cast() };
-                    vectors[first].iov_len -= consumed;
-                    consumed = 0;
+                if digest.finalize() != expected {
+                    return Err(DeltafinError::new(format!(
+                        "authenticated vectored read from {} at {} failed SHA-256 verification",
+                        path.display(),
+                        scatter.source_offset,
+                    )));
                 }
             }
-        }
-        if let Some(expected) = expected_digest {
-            // Unlike persistent ordinary extents, deferred vectored
-            // sources can reopen on every batch. Hash every verified job;
-            // higher-level immutable identity caches omit the digest from
-            // later plans instead of storing a plan-local qualification
-            // that might cross descriptor generations.
-            let mut digest = DigestState::new();
-            for destination in &scatter.destinations {
-                let pointer = self
-                    .lease
-                    .buffers()
-                    .get(destination.destination)
-                    .pointer_at(destination.destination_offset, destination.length);
-                // SAFETY: destination validation proved this complete
-                // range is bounded. Its read job has finished filling it,
-                // and every other in-flight job owns a disjoint range.
-                let bytes =
-                    unsafe { std::slice::from_raw_parts(pointer.cast_const(), destination.length) };
-                digest.update(bytes);
-            }
-            if digest.finalize() != expected {
-                return Err(DeltafinError::new(format!(
-                    "authenticated vectored read from {} at {} failed SHA-256 verification",
-                    source.path.display(),
-                    scatter.source_offset,
-                )));
-            }
-        }
-        drop_completed_cache(file, source.cache_policy, scatter.source_offset, total);
-        Ok(())
+            drop_completed_cache(file, source.cache_policy, scatter.source_offset, length);
+            Ok(())
+        })
     }
 
     fn run_authenticated_scatter(&self, source_index: usize) -> Result<()> {
-        let BatchSources::Plan {
-            sources,
-            deferred_files,
-            ..
-        } = &self.sources
+        let BatchSources::Plan { sources, .. } = &self.sources
         else {
             return Err(DeltafinError::new(
                 "authenticated scatter job is attached to the wrong source set",
@@ -2938,26 +2907,201 @@ impl Batch {
                 "authenticated scatter source has an incomplete plan",
             ));
         }
-        let file = if let Some(file) = source.file.as_ref() {
-            file
-        } else if let Some(slot) = source.persistent_file.as_ref() {
-            match slot.get_or_init(|| open_deferred_source(source)) {
-                Ok(file) => file,
-                Err(error) => return Err(error.clone()),
+        let length = usize::try_from(source.length).unwrap_or(usize::MAX);
+        self.read_source(source, source_index, length, &mut |file, _path| {
+            authenticate_and_scatter_source(file, source, &self.lease)
+        })
+    }
+
+    /// Read one job's range of a plan source. With storage homes the drive is
+    /// chosen for this job alone -- the holder whose queue of in-flight reads
+    /// will finish it soonest -- so the chunks of one large file spread over
+    /// every drive holding it and no drive builds a backlog the others cannot
+    /// help with. The read is charged to its drive while it runs; if it fails
+    /// there, the next-best copy is read and the failing drive sits out.
+    fn read_source(
+        &self,
+        source: &Source,
+        source_index: usize,
+        bytes: usize,
+        read: &mut dyn FnMut(&File, &Path) -> Result<()>,
+    ) -> Result<()> {
+        self.read_source_once(source, source_index, bytes, read)?;
+        self.bytes_read.fetch_add(bytes as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn read_source_once(
+        &self,
+        source: &Source,
+        source_index: usize,
+        bytes: usize,
+        read: &mut dyn FnMut(&File, &Path) -> Result<()>,
+    ) -> Result<()> {
+        let homes = self.homes.as_deref();
+        if let Some(file) = source.file.as_ref() {
+            return attempt_device_read(homes, 0, file, &source.path, bytes, read);
+        }
+        let located = homes.and_then(|homes| {
+            redirectable(source)
+                .then(|| homes.locate(&source.path))
+                .flatten()
+                .map(|(tree, name)| (homes, tree, name))
+        });
+        let Some((homes, tree, name)) = located else {
+            let file = self.source_descriptor(source, source_index, 0, None)?;
+            return attempt_device_read(homes, 0, file, &source.path, bytes, read);
+        };
+        let mut tried = 0_u32;
+        let mut last = None;
+        while let Some(device) = homes.choose(tree, name, bytes as u64, tried) {
+            tried |= 1_u32 << device;
+            let outcome = match self.source_descriptor(source, source_index, device, Some((homes, tree, name))) {
+                Ok(file) => {
+                    let path = file.path.as_deref().unwrap_or(&source.path);
+                    attempt_device_read(Some(homes), device, file, path, bytes, read)
+                }
+                Err(error) => {
+                    homes.strike(device);
+                    Err(error)
+                }
+            };
+            match outcome {
+                Ok(()) => return Ok(()),
+                Err(error) => last = Some(error),
             }
-        } else {
-            let slot = deferred_files
-                .as_ref()
-                .and_then(|files| files.get(source_index))
-                .ok_or_else(|| {
-                    DeltafinError::new("authenticated scatter source has no batch descriptor slot")
+        }
+        Err(last.unwrap_or_else(|| {
+            DeltafinError::new(format!("no drive holds {}", source.path.display()))
+        }))
+    }
+
+    /// The batch's descriptor for `source` on `device`, opened on first use.
+    /// Batch-scoped slots exist per (source, drive); a plan-lifetime
+    /// persistent slot only ever holds the model root's own copy.
+    fn source_descriptor<'a>(
+        &'a self,
+        source: &'a Source,
+        source_index: usize,
+        device: u8,
+        mirror: Option<(&StorageHomes, usize, &str)>,
+    ) -> Result<&'a OpenedSource> {
+        let open = || {
+            if device == 0 {
+                open_deferred_source(source).map(|file| OpenedSource {
+                    file,
+                    device,
+                    path: None,
+                })
+            } else {
+                let (homes, tree, name) = mirror.ok_or_else(|| {
+                    DeltafinError::new("a storage-home read lost its mirror")
                 })?;
-            match slot.get_or_init(|| open_deferred_source(source)) {
-                Ok(file) => file,
-                Err(error) => return Err(error.clone()),
+                let path = homes.file_path(tree, device, name, &source.path);
+                open_validated(&path, source.length, source.cache_policy).map(|file| OpenedSource {
+                    file,
+                    device,
+                    path: Some(path),
+                })
             }
         };
-        authenticate_and_scatter_source(file, source, &self.lease)
+        let BatchSources::Plan { deferred_files, .. } = &self.sources else {
+            return Err(DeltafinError::new(
+                "plan read job is attached to the wrong source set",
+            ));
+        };
+        let slot = match (device, source.persistent_file.as_ref()) {
+            (0, Some(slot)) => slot,
+            _ => deferred_files
+                .as_ref()
+                .and_then(|files| files.get(source_index * self.drive_count() + usize::from(device)))
+                .ok_or_else(|| DeltafinError::new("deferred read source has no batch descriptor slot"))?,
+        };
+        slot.get_or_init(open).as_ref().map_err(Clone::clone)
+    }
+
+    fn drive_count(&self) -> usize {
+        self.homes.as_ref().map_or(1, |homes| homes.device_count())
+    }
+
+    /// [`Self::read_source`] for one inline catalog entry: each read opens
+    /// the copy on the drive with the earliest expected finish.
+    fn read_catalog_source(
+        &self,
+        catalog: &DeferredExactCatalogInner,
+        name: &DeferredSourceName,
+        bytes: usize,
+        read: &mut dyn FnMut(&File, &Path) -> Result<()>,
+    ) -> Result<()> {
+        self.read_catalog_source_once(catalog, name, bytes, read)?;
+        self.bytes_read.fetch_add(bytes as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn read_catalog_source_once(
+        &self,
+        catalog: &DeferredExactCatalogInner,
+        name: &DeferredSourceName,
+        bytes: usize,
+        read: &mut dyn FnMut(&File, &Path) -> Result<()>,
+    ) -> Result<()> {
+        let homes = self.homes.as_deref();
+        let located = homes.and_then(|homes| {
+            homes
+                .locate_in(&catalog.directory_path, name.as_str())
+                .map(|(tree, _)| (homes, tree))
+        });
+        let Some((homes, tree)) = located else {
+            let file = open_catalog_entry(
+                &catalog.directory,
+                &catalog.directory_path,
+                name,
+                catalog.exact_source_length,
+                catalog.cache_policy,
+            )?;
+            let path = catalog.directory_path.join(name.as_str());
+            return attempt_device_read(homes, 0, &file, &path, bytes, read);
+        };
+        let mut tried = 0_u32;
+        let mut last = None;
+        while let Some(device) =
+            homes.choose(tree, name.as_str(), catalog.exact_source_length, tried)
+        {
+            tried |= 1_u32 << device;
+            let (directory, directory_path) = if device == 0 {
+                (&catalog.directory, catalog.directory_path.as_path())
+            } else {
+                match homes.mirror_directory(tree, device) {
+                    Some(directory) => directory,
+                    None => continue,
+                }
+            };
+            let path = directory_path.join(name.as_str());
+            let outcome = match open_catalog_entry(
+                directory,
+                directory_path,
+                name,
+                catalog.exact_source_length,
+                catalog.cache_policy,
+            ) {
+                Ok(file) => attempt_device_read(Some(homes), device, &file, &path, bytes, read),
+                Err(error) => {
+                    homes.strike(device);
+                    Err(error)
+                }
+            };
+            match outcome {
+                Ok(()) => return Ok(()),
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            DeltafinError::new(format!(
+                "no drive holds {}/{}",
+                catalog.directory_path.display(),
+                name.as_str()
+            ))
+        }))
     }
 
     fn wait_for_completion(&self) {
@@ -2966,6 +3110,106 @@ impl Batch {
             guard = self.completion.condvar.wait(guard).unwrap();
         }
         drop(guard);
+    }
+
+    /// Block until some job finishes that had not finished when the caller
+    /// last looked, or the whole batch settles. Returns the current completed
+    /// set. Waiting rather than spinning keeps the reader workers -- and the
+    /// storage device -- uncontended while a caller consumes partial progress.
+    fn wait_for_job_progress(&self, seen: u64) -> u64 {
+        let mut guard = self.completion.lock.lock().unwrap();
+        loop {
+            let completed = self.completion.completed.load(Ordering::Acquire);
+            if completed != seen || self.completion.remaining.load(Ordering::Acquire) == 0 {
+                return completed;
+            }
+            guard = self.completion.condvar.wait(guard).unwrap();
+        }
+    }
+
+    /// Which fixed-size slots of `destination` are completely written, as a
+    /// bitmask over `0..slots`.
+    ///
+    /// A slot qualifies only when every job that writes any byte of it has
+    /// finished successfully, so a set bit means those bytes are final and
+    /// readable while the rest of the batch is still in flight. Returns zero
+    /// -- "nothing observable yet" -- rather than guessing whenever the plan
+    /// does not partition cleanly into slots: more than 64 jobs or slots, a
+    /// job touching another buffer or straddling the end, a scatter whose
+    /// destination map this batch does not own, or a slot no job covers.
+    fn completed_destination_slots(
+        &self,
+        destination: BufferKind,
+        span: usize,
+        slots: usize,
+    ) -> u64 {
+        let job_count = self.jobs.len();
+        if span == 0
+            || slots == 0
+            || slots > u64::BITS as usize
+            || job_count > u64::BITS as usize
+        {
+            return 0;
+        }
+        let finished = self.completion.completed.load(Ordering::Acquire);
+        let mut covered = 0_u64;
+        let mut pending = 0_u64;
+        for index in 0..job_count {
+            let Some(job) = self.jobs.get(index) else {
+                return 0;
+            };
+            let mut touched = 0_u64;
+            let mut mark = |kind: BufferKind, offset: usize, length: usize| -> bool {
+                if kind != destination || length == 0 {
+                    return false;
+                }
+                let Some(end) = offset.checked_add(length - 1) else {
+                    return false;
+                };
+                let (first, last) = (offset / span, end / span);
+                if last >= slots {
+                    return false;
+                }
+                for slot in first..=last {
+                    touched |= 1_u64 << slot;
+                }
+                true
+            };
+            let mapped = match job.source {
+                JobSource::Vectored { scatter, .. } => {
+                    match self
+                        .vectored_reads
+                        .as_ref()
+                        .and_then(|reads| reads.get(scatter))
+                    {
+                        Some(read) => read.destinations.iter().all(|target| {
+                            mark(target.destination, target.destination_offset, target.length)
+                        }),
+                        None => false,
+                    }
+                }
+                // The destination map for an authenticated scatter lives on
+                // its source, not on the job; no partial view is offered.
+                JobSource::AuthenticatedScatter { .. } => false,
+                _ => mark(job.destination, job.destination_offset, job.length),
+            };
+            if !mapped {
+                return 0;
+            }
+            covered |= touched;
+            if finished & (1_u64 << index) == 0 {
+                pending |= touched;
+            }
+        }
+        let all = if slots == u64::BITS as usize {
+            u64::MAX
+        } else {
+            (1_u64 << slots) - 1
+        };
+        if covered != all {
+            return 0;
+        }
+        all & !pending
     }
 
     fn validate_deferred_source_identities(&self) -> Result<()> {
@@ -2995,7 +3239,7 @@ impl Batch {
             } else {
                 let slot = deferred_files
                     .as_ref()
-                    .and_then(|files| files.get(source_index))
+                    .and_then(|files| files.get(source_index * self.drive_count()))
                     .ok_or_else(|| {
                         DeltafinError::new("identity-pinned deferred source has no descriptor slot")
                     })?;
@@ -3042,6 +3286,59 @@ pub struct ReadTicket {
 impl ReadTicket {
     pub fn is_ready(&self) -> bool {
         self.batch.completion.remaining.load(Ordering::Acquire) == 0
+    }
+
+    /// Block until this batch makes progress past `seen` jobs, or settles.
+    /// `seen` is the raw job set, which callers obtain from
+    /// [`Self::completed_jobs`].
+    pub fn wait_for_job_progress(&self, seen: u64) -> u64 {
+        self.batch.wait_for_job_progress(seen)
+    }
+
+    pub fn completed_jobs(&self) -> u64 {
+        self.batch.completion.completed.load(Ordering::Acquire)
+    }
+
+    /// Bitmask of the equally sized `destination` slots whose bytes are
+    /// already final, for a caller that can use part of a batch before the
+    /// rest of it lands. See [`Batch::completed_destination_slots`] for the
+    /// conditions under which no partial view is offered.
+    pub fn completed_destination_slots(
+        &self,
+        destination: BufferKind,
+        span: usize,
+        slots: usize,
+    ) -> u64 {
+        self.batch
+            .completed_destination_slots(destination, span, slots)
+    }
+
+    /// Borrow the destination bytes of one already-completed slot.
+    ///
+    /// # Safety
+    /// `slot` must have been reported complete by
+    /// [`Self::completed_destination_slots`] on this same ticket, and the
+    /// returned slice must be dropped before the ticket is waited on or
+    /// cancelled. Only that pairing guarantees no worker is still writing the
+    /// range, and the acquire load behind the completion bit is what
+    /// publishes those writes to this thread.
+    pub unsafe fn destination_slot(
+        &self,
+        destination: BufferKind,
+        span: usize,
+        slot: usize,
+    ) -> Option<&[u8]> {
+        let offset = slot.checked_mul(span)?;
+        let end = offset.checked_add(span)?;
+        let buffer = self.batch.lease.buffers().get(destination);
+        if span == 0 || end > buffer.capacity {
+            return None;
+        }
+        let pointer = buffer.pointer_at(offset, span);
+        // SAFETY: the caller proved this slot is complete, so no worker holds
+        // a mutable view of it; every other job writes a disjoint range, which
+        // `ReadPlan::open` already established.
+        Some(unsafe { std::slice::from_raw_parts(pointer.cast_const(), span) })
     }
 
     pub fn wait(self) -> Result<(LayerBuffers, ReadStats)> {
@@ -3140,6 +3437,8 @@ pub struct Reader {
     state: Arc<PoolState>,
     arena: Arc<BufferArena>,
     threads: Vec<JoinHandle<()>>,
+    homes: Option<Arc<StorageHomes>>,
+    bytes_read: Arc<AtomicU64>,
 }
 
 impl Reader {
@@ -3193,7 +3492,27 @@ impl Reader {
             state,
             arena,
             threads,
+            homes: None,
+            bytes_read: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Bytes this reader has successfully read from storage since it was
+    /// created: physical reads only, so RAM-resident and cached data never
+    /// count.
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read.load(Ordering::Relaxed)
+    }
+
+    /// Let this reader's reads use, and be charged to, the drives in `homes`.
+    /// Every reader of one model should share the same set so spine, demand
+    /// and prefetch traffic all count against the same physical devices.
+    pub fn set_storage_homes(&mut self, homes: Option<Arc<StorageHomes>>) {
+        self.homes = homes;
+    }
+
+    pub fn storage_homes(&self) -> Option<&Arc<StorageHomes>> {
+        self.homes.as_ref()
     }
 
     pub fn workers(&self) -> usize {
@@ -3206,6 +3525,15 @@ impl Reader {
 
     pub(crate) fn reserve_capacity(&self, lengths: BufferLengths) -> Result<()> {
         self.arena.reserve_capacity(lengths)
+    }
+
+    /// Return every cached, currently unleased arena slab to the host and
+    /// report the bytes freed. Intended for advisory readers (speculative
+    /// prefetch) under live memory pressure: their slabs re-grow lazily on
+    /// the next read, so this trades a little future read latency for
+    /// immediate headroom. In-flight leases are untouched.
+    pub(crate) fn release_cached_slabs(&self) -> Result<u64> {
+        self.arena.release_free_slabs()
     }
 
     pub fn read(&self, plan: &ReadPlan) -> Result<(LayerBuffers, ReadStats)> {
@@ -3266,6 +3594,8 @@ impl Reader {
             source_length,
             lease,
             priority,
+            self.homes.clone(),
+            Arc::clone(&self.bytes_read),
         ));
         let participating = self.workers().min(source_indices.len());
         let mut inner = self.state.inner.lock().unwrap();
@@ -3315,7 +3645,13 @@ impl Reader {
         else {
             return Ok(None);
         };
-        let batch = Arc::new(Batch::new(plan, lease, priority));
+        let batch = Arc::new(Batch::new(
+            plan,
+            lease,
+            priority,
+            self.homes.clone(),
+            Arc::clone(&self.bytes_read),
+        ));
         let participating = self.workers().min(plan.jobs.len());
         if participating != 0 {
             let mut inner = self.state.inner.lock().unwrap();
@@ -3427,7 +3763,124 @@ pub struct DeferredSourceIdentity {
     changed_nanoseconds: i64,
 }
 
-fn metadata_identity(metadata: &std::fs::Metadata) -> DeferredSourceIdentity {
+/// Fill `parts` (disjoint, validated destination ranges) in order from one
+/// contiguous source range starting at `source_offset`: one `preadv(2)` per
+/// attempt, resumed after a short read, without temporary buffers.
+#[cfg(unix)]
+fn read_scattered(
+    file: &File,
+    path: &Path,
+    parts: &[(*mut u8, usize)],
+    source_offset: u64,
+) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut vectors: [libc::iovec; MAX_VECTORED_DESTINATIONS] = unsafe { std::mem::zeroed() };
+    let mut total = 0_usize;
+    for (vector, &(pointer, length)) in vectors.iter_mut().zip(parts.iter()) {
+        vector.iov_base = pointer.cast();
+        vector.iov_len = length;
+        total = total
+            .checked_add(length)
+            .ok_or_else(|| DeltafinError::new("vectored read length overflows usize"))?;
+    }
+    if total > isize::MAX as usize {
+        return Err(DeltafinError::new(
+            "vectored read exceeds the platform syscall length",
+        ));
+    }
+    let mut first = 0_usize;
+    let mut remaining = total;
+    let mut file_offset = i64::try_from(source_offset)
+        .map_err(|_| DeltafinError::new("vectored source offset exceeds off_t"))?;
+    while remaining != 0 {
+        let count = i32::try_from(parts.len() - first)
+            .map_err(|_| DeltafinError::new("vectored destination count exceeds c_int"))?;
+        // SAFETY: every iovec points into a live, private, prevalidated
+        // arena range. `file` remains open for the syscall, `count` is
+        // bounded, and preadv does not retain either pointer or descriptor.
+        let read = unsafe {
+            libc::preadv(
+                file.as_raw_fd(),
+                vectors[first..].as_ptr(),
+                count,
+                file_offset,
+            )
+        };
+        if read == -1 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(io_error("preadv", path, error));
+        }
+        if read == 0 {
+            return Err(DeltafinError::new(format!(
+                "short preadv {}/{} from {} at {}",
+                total - remaining,
+                total,
+                path.display(),
+                source_offset,
+            )));
+        }
+        let read = usize::try_from(read)
+            .map_err(|_| DeltafinError::new("preadv returned a negative byte count"))?;
+        if read > remaining {
+            return Err(DeltafinError::new("preadv exceeded its destination length"));
+        }
+        remaining -= read;
+        file_offset = file_offset
+            .checked_add(read as i64)
+            .ok_or_else(|| DeltafinError::new("vectored source offset overflows off_t"))?;
+
+        let mut consumed = read;
+        while consumed != 0 {
+            let length = vectors[first].iov_len;
+            if consumed >= length {
+                consumed -= length;
+                first += 1;
+            } else {
+                // SAFETY: `consumed < iov_len`, so advancing the pointer
+                // remains inside the same validated destination range.
+                vectors[first].iov_base =
+                    unsafe { vectors[first].iov_base.cast::<u8>().add(consumed).cast() };
+                vectors[first].iov_len -= consumed;
+                consumed = 0;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Windows has no `preadv`: the same contiguous source range is read into each
+/// destination in turn with positional reads, which cost one call per
+/// destination (at most sixteen per expert, each many megabytes).
+#[cfg(windows)]
+fn read_scattered(
+    file: &File,
+    path: &Path,
+    parts: &[(*mut u8, usize)],
+    source_offset: u64,
+) -> Result<()> {
+    let mut offset = source_offset;
+    for &(pointer, length) in parts {
+        // SAFETY: each part is a live, private, prevalidated arena range that
+        // no other job touches until the whole batch completes.
+        let destination = unsafe { std::slice::from_raw_parts_mut(pointer, length) };
+        file.read_exact_at(destination, offset).map_err(|error| {
+            io_error(
+                &format!("short vectored read of {length} bytes at {offset} from"),
+                path,
+                error,
+            )
+        })?;
+        offset = offset
+            .checked_add(length as u64)
+            .ok_or_else(|| DeltafinError::new("vectored source offset overflows u64"))?;
+    }
+    Ok(())
+}
+
+fn metadata_identity(metadata: &Stat) -> DeferredSourceIdentity {
     DeferredSourceIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
@@ -3440,8 +3893,7 @@ fn metadata_identity(metadata: &std::fs::Metadata) -> DeferredSourceIdentity {
 }
 
 fn descriptor_identity(file: &File, path: &Path) -> Result<DeferredSourceIdentity> {
-    let metadata = file
-        .metadata()
+    let metadata = sys_fs::fstat(file)
         .map_err(|error| io_error("stat authenticated source", path, error))?;
     Ok(metadata_identity(&metadata))
 }
@@ -3450,13 +3902,12 @@ fn capture_deferred_source_identity(
     path: &Path,
     exact_source_length: u64,
 ) -> Result<DeferredSourceIdentity> {
-    let file = OpenOptions::new()
+    let file = Open::new()
         .read(true)
-        .custom_flags(open_cloexec_nofollow())
+        .no_follow()
         .open(path)
         .map_err(|error| io_error("open deferred identity source", path, error))?;
-    let metadata = file
-        .metadata()
+    let metadata = sys_fs::fstat(&file)
         .map_err(|error| io_error("stat deferred identity source", path, error))?;
     if !metadata.is_file() || metadata.len() != exact_source_length {
         return Err(DeltafinError::new(format!(
@@ -3621,38 +4072,10 @@ fn authenticate_and_scatter_source(
 }
 
 fn open_deferred_source(source: &Source) -> Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(open_cloexec_nofollow())
-        .open(&source.path)
-        .map_err(|error| {
-            if matches!(error.raw_os_error(), Some(23 | 24)) {
-                DeltafinError::new(format!(
-                    "open deferred source {} without following symlinks: descriptor limit exhausted",
-                    source.path.display()
-                ))
-            } else {
-                io_error("open deferred non-symlink source", &source.path, error)
-            }
-        })?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| io_error("stat deferred source", &source.path, error))?;
-    if !metadata.is_file() {
-        return Err(DeltafinError::new(format!(
-            "deferred source is not a regular file: {}",
-            source.path.display()
-        )));
-    }
-    if metadata.len() != source.length {
-        return Err(DeltafinError::new(format!(
-            "deferred source {} is {} bytes; expected exact length {}",
-            source.path.display(),
-            metadata.len(),
-            source.length,
-        )));
-    }
+    let file = open_validated(&source.path, source.length, source.cache_policy)?;
     if let Some(expected) = source.expected_identity {
+        let metadata = sys_fs::fstat(&file)
+            .map_err(|error| io_error("stat deferred source", &source.path, error))?;
         let actual = metadata_identity(&metadata);
         if actual != expected {
             return Err(DeltafinError::new(format!(
@@ -3661,24 +4084,65 @@ fn open_deferred_source(source: &Source) -> Result<File> {
             )));
         }
     }
-    configure_cache_policy(&file, &source.path, source.cache_policy)?;
+    Ok(file)
+}
+
+/// Open `path` without following symlinks and prove it is a regular file of
+/// exactly `length` bytes before any byte is read from it.
+fn open_validated(path: &Path, length: u64, cache_policy: CachePolicy) -> Result<File> {
+    let file = Open::new()
+        .read(true)
+        .no_follow()
+        .open(path)
+        .map_err(|error| {
+            if sys_fs::is_descriptor_exhaustion(&error) {
+                DeltafinError::new(format!(
+                    "open deferred source {} without following symlinks: descriptor limit exhausted",
+                    path.display()
+                ))
+            } else {
+                io_error("open deferred non-symlink source", path, error)
+            }
+        })?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| io_error("stat deferred source", path, error))?;
+    if !metadata.is_file() {
+        return Err(DeltafinError::new(format!(
+            "deferred source is not a regular file: {}",
+            path.display()
+        )));
+    }
+    if metadata.len() != length {
+        return Err(DeltafinError::new(format!(
+            "deferred source {} is {} bytes; expected exact length {}",
+            path.display(),
+            metadata.len(),
+            length,
+        )));
+    }
+    configure_cache_policy(&file, path, cache_policy)?;
     Ok(file)
 }
 
 // Resolved from the active target ABI, never a literal: O_NOFOLLOW is 0x20000
 // on x86_64 Linux but 0x8000 on aarch64, so an x86-derived literal decodes to
 // O_LARGEFILE there and silently opens these sources through symlinks.
+#[cfg(unix)]
 const fn open_cloexec_nofollow() -> i32 {
     libc::O_CLOEXEC | libc::O_NOFOLLOW
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-compile_error!("Deltafin native storage currently supports macOS and Linux");
-
-fn open_deferred_catalog_source(
-    catalog: &DeferredExactCatalogInner,
+/// Open one direct child of the catalog directory without following a final
+/// symlink. Unix opens relative to the held directory descriptor (`openat`),
+/// so a swapped parent path cannot redirect the open.
+#[cfg(unix)]
+fn open_entry_no_follow(
+    directory: &File,
+    _directory_path: &Path,
     source: &DeferredSourceName,
-) -> Result<File> {
+) -> io::Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
     unsafe extern "C" {
         // `c_char` is signed on x86_64 and unsigned on aarch64; spelling the
         // C types keeps this declaration valid on both.
@@ -3689,67 +4153,101 @@ fn open_deferred_catalog_source(
             ...
         ) -> libc::c_int;
     }
-    // SAFETY: the catalog retains a live directory descriptor, `source` is a
+    // SAFETY: the caller retains a live directory descriptor, `source` is a
     // validated NUL-terminated direct child name, and no mode argument is
     // required because these flags never create a file.
     let descriptor = unsafe {
         openat(
-            catalog.directory.as_raw_fd(),
+            directory.as_raw_fd(),
             source.as_c_str().as_ptr(),
             open_cloexec_nofollow(),
         )
     };
     if descriptor < 0 {
-        let error = io::Error::last_os_error();
-        if matches!(error.raw_os_error(), Some(23 | 24)) {
-            return Err(DeltafinError::new(format!(
-                "open deferred source {}/{} without following symlinks: descriptor limit exhausted",
-                catalog.directory_path.display(),
-                source.as_str(),
-            )));
-        }
-        return Err(catalog_io_error(
-            "open deferred non-symlink source",
-            catalog,
-            source,
-            error,
-        ));
+        return Err(io::Error::last_os_error());
     }
     // SAFETY: `openat` returned a new owned descriptor. This is its unique
     // owner and `File` closes it on every subsequent success/error path.
-    let file = unsafe { File::from_raw_fd(descriptor) };
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+/// Windows has no `openat`. The catalog's directory handle is opened without
+/// delete sharing, so while the catalog lives that directory (and so every
+/// ancestor of it) cannot be renamed or replaced, and opening a child through
+/// its path cannot be redirected. The child is opened for overlapped I/O so
+/// worker reads on it can be in flight together.
+#[cfg(windows)]
+fn open_entry_no_follow(
+    _directory: &File,
+    directory_path: &Path,
+    source: &DeferredSourceName,
+) -> io::Result<File> {
+    Open::new()
+        .read(true)
+        .no_follow()
+        .concurrent_reads()
+        .open(&directory_path.join(source.as_str()))
+}
+
+/// Open one catalogued source inside `directory` -- the catalog's own or a
+/// storage home holding a byte-identical copy -- and validate it.
+fn open_catalog_entry(
+    directory: &File,
+    directory_path: &Path,
+    source: &DeferredSourceName,
+    exact_length: u64,
+    cache_policy: CachePolicy,
+) -> Result<File> {
+    let file = match open_entry_no_follow(directory, directory_path, source) {
+        Ok(file) => file,
+        Err(error) => {
+            if sys_fs::is_descriptor_exhaustion(&error) {
+                return Err(DeltafinError::new(format!(
+                    "open deferred source {}/{} without following symlinks: descriptor limit exhausted",
+                    directory_path.display(),
+                    source.as_str(),
+                )));
+            }
+            return Err(catalog_io_error(
+                "open deferred non-symlink source",
+                directory_path,
+                source,
+                error,
+            ));
+        }
+    };
     let metadata = file
         .metadata()
-        .map_err(|error| catalog_io_error("stat deferred source", catalog, source, error))?;
+        .map_err(|error| catalog_io_error("stat deferred source", directory_path, source, error))?;
     if !metadata.is_file() {
         return Err(DeltafinError::new(format!(
             "deferred source is not a regular file: {}/{}",
-            catalog.directory_path.display(),
+            directory_path.display(),
             source.as_str(),
         )));
     }
-    if metadata.len() != catalog.exact_source_length {
+    if metadata.len() != exact_length {
         return Err(DeltafinError::new(format!(
             "deferred source {}/{} is {} bytes; expected exact length {}",
-            catalog.directory_path.display(),
+            directory_path.display(),
             source.as_str(),
             metadata.len(),
-            catalog.exact_source_length,
+            exact_length,
         )));
     }
-    configure_catalog_cache_policy(&file, catalog, source)?;
+    configure_catalog_cache_policy(&file, cache_policy, directory_path, source)?;
     Ok(file)
 }
 
 fn catalog_io_error(
     operation: &str,
-    catalog: &DeferredExactCatalogInner,
+    directory: &Path,
     source: &DeferredSourceName,
     error: io::Error,
 ) -> DeltafinError {
     DeltafinError::new(format!(
         "{operation} {}/{}: {error}",
-        catalog.directory_path.display(),
+        directory.display(),
         source.as_str(),
     ))
 }
@@ -3757,10 +4255,11 @@ fn catalog_io_error(
 #[cfg(target_os = "macos")]
 fn configure_catalog_cache_policy(
     file: &File,
-    catalog: &DeferredExactCatalogInner,
+    cache_policy: CachePolicy,
+    directory: &Path,
     source: &DeferredSourceName,
 ) -> Result<()> {
-    if catalog.cache_policy != CachePolicy::Streaming {
+    if cache_policy != CachePolicy::Streaming {
         return Ok(());
     }
     const F_NOCACHE: i32 = 48;
@@ -3771,7 +4270,7 @@ fn configure_catalog_cache_policy(
     if unsafe { fcntl(file.as_raw_fd(), F_NOCACHE, 1) } == -1 {
         return Err(catalog_io_error(
             "enable F_NOCACHE",
-            catalog,
+            directory,
             source,
             io::Error::last_os_error(),
         ));
@@ -3782,7 +4281,8 @@ fn configure_catalog_cache_policy(
 #[cfg(not(target_os = "macos"))]
 fn configure_catalog_cache_policy(
     _file: &File,
-    _catalog: &DeferredExactCatalogInner,
+    _cache_policy: CachePolicy,
+    _directory: &Path,
     _source: &DeferredSourceName,
 ) -> Result<()> {
     Ok(())
@@ -3841,6 +4341,31 @@ mod tests {
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[test]
+    fn a_reader_counts_only_bytes_it_physically_read() {
+        let directory = TestDirectory::new();
+        let path = directory.0.join("source.bin");
+        fs::write(&path, [9_u8; 4096]).unwrap();
+        let plan = ReadPlan::open_deferred_manifest(
+            [Extent::new(&path, 0, BufferKind::Other, 0, 4096)],
+            BufferLengths::new(0, 0, 4096),
+            1024,
+            CachePolicy::Streaming,
+        )
+        .unwrap();
+        let reader = Reader::with_arena_capacity(2, 1).unwrap();
+        assert_eq!(reader.bytes_read(), 0);
+        let (buffers, _) = reader.read(&plan).unwrap();
+        assert_eq!(buffers.other(), &[9_u8; 4096]);
+        drop(buffers);
+        assert_eq!(reader.bytes_read(), 4096);
+        // A source that fails validation contributes nothing.
+        fs::write(&path, [9_u8; 10]).unwrap();
+        assert!(reader.read(&plan).is_err());
+        assert_eq!(reader.bytes_read(), 4096);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn deferred_source_open_flags_keep_the_symlink_guard() {
         // Asserted as bits, not a literal: O_NOFOLLOW's value differs between
@@ -4216,7 +4741,7 @@ mod tests {
 
     #[test]
     fn deferred_exact_source_never_follows_a_symlink() {
-        use std::os::unix::fs::symlink;
+        use crate::sys::fs::symlink;
 
         let directory = TestDirectory::new();
         let target = directory.write("target", &[1, 2, 3, 4]);
@@ -4310,6 +4835,78 @@ mod tests {
     }
 
     #[test]
+    fn partial_slot_visibility_only_reports_fully_written_slots() {
+        let directory = TestDirectory::new();
+        let span = 4_usize;
+        let slots = 3_usize;
+        let mut extents = Vec::new();
+        let mut sources = Vec::new();
+        for slot in 0..slots {
+            // Two reads per slot, so a slot only qualifies once both land --
+            // the same shape scale4 experts have.
+            let path = directory.write(
+                &format!("slot-{slot}"),
+                &[slot as u8, slot as u8 + 16, slot as u8 + 32, slot as u8 + 48],
+            );
+            extents.push(Extent::new(&path, 0, BufferKind::Other, slot * span, 2));
+            extents.push(Extent::new(&path, 2, BufferKind::Other, slot * span + 2, 2));
+            sources.push(DeferredSourceLength::new(&path, span as u64));
+        }
+        let plan = ReadPlan::open_deferred_ranges(
+            extents,
+            sources,
+            BufferLengths::new(0, 0, slots * span),
+            0,
+            CachePolicy::Streaming,
+        )
+        .unwrap();
+        let reader = Reader::with_arena_capacity(2, 1).unwrap();
+        let ticket = reader.submit(&plan, ReadPriority::Demand).unwrap();
+
+        // Whatever this reports mid-flight must be a subset of "all", and any
+        // slot it does report must already hold its final bytes.
+        let mut seen = 0_u64;
+        while !ticket.is_ready() {
+            let ready = ticket.completed_destination_slots(BufferKind::Other, span, slots);
+            assert_eq!(ready & !((1 << slots) - 1), 0, "reported an unknown slot");
+            for slot in 0..slots {
+                if ready & (1 << slot) == 0 {
+                    continue;
+                }
+                // SAFETY: the mask just reported this slot complete, and the
+                // borrow ends before the ticket is waited on.
+                let bytes = unsafe { ticket.destination_slot(BufferKind::Other, span, slot) }
+                    .expect("a reported slot must be borrowable");
+                assert_eq!(
+                    bytes,
+                    &[slot as u8, slot as u8 + 16, slot as u8 + 32, slot as u8 + 48],
+                    "slot {slot} was reported complete with unfinished bytes"
+                );
+            }
+            seen = ticket.wait_for_job_progress(seen);
+        }
+        let all = ticket.completed_destination_slots(BufferKind::Other, span, slots);
+        assert_eq!(all, (1 << slots) - 1, "a settled batch must report every slot");
+
+        // A span the plan does not partition into, and a slot count no job
+        // covers, both mean "no partial view" rather than a guess.
+        assert_eq!(
+            ticket.completed_destination_slots(BufferKind::Other, span * 2, slots),
+            0
+        );
+        assert_eq!(
+            ticket.completed_destination_slots(BufferKind::Other, span, slots + 1),
+            0
+        );
+        assert_eq!(
+            ticket.completed_destination_slots(BufferKind::Quantized, span, slots),
+            0
+        );
+        let (buffers, _) = ticket.wait().unwrap();
+        assert_eq!(buffers.other().len(), slots * span);
+    }
+
+    #[test]
     fn identity_pinned_deferred_range_rejects_same_length_path_replacement() {
         let directory = TestDirectory::new();
         let original = [1_u8, 2, 3, 4];
@@ -4367,7 +4964,7 @@ mod tests {
 
     #[test]
     fn identity_pinned_deferred_range_rechecks_descriptor_after_read_completion() {
-        use std::os::unix::fs::FileExt;
+        use crate::sys::fs::FileExt;
 
         let directory = TestDirectory::new();
         let bytes = [1_u8, 2, 3, 4];
@@ -4518,7 +5115,7 @@ mod tests {
 
     #[test]
     fn deferred_vectored_read_retains_live_exact_length_and_no_follow_contracts() {
-        use std::os::unix::fs::symlink;
+        use crate::sys::fs::symlink;
 
         let directory = TestDirectory::new();
         let target = directory.write("vectored-target", &[1, 2, 3, 4, 5]);
@@ -4680,7 +5277,7 @@ mod tests {
 
     #[test]
     fn persistent_manifest_first_open_never_follows_a_symlink() {
-        use std::os::unix::fs::symlink;
+        use crate::sys::fs::symlink;
 
         let directory = TestDirectory::new();
         let target = directory.write("persistent-target", &[1, 2, 3, 4]);
@@ -4780,7 +5377,7 @@ mod tests {
 
     #[test]
     fn deferred_manifest_never_follows_a_symlink() {
-        use std::os::unix::fs::symlink;
+        use crate::sys::fs::symlink;
 
         let directory = TestDirectory::new();
         let target = directory.write("manifest-target", &[1, 2, 3, 4]);
@@ -4872,7 +5469,7 @@ mod tests {
 
     #[test]
     fn deferred_catalog_openat_never_follows_source_or_directory_symlinks() {
-        use std::os::unix::fs::symlink;
+        use crate::sys::fs::symlink;
 
         let directory = TestDirectory::new();
         directory.write("target.bin", &[1, 2, 3, 4]);
@@ -5410,6 +6007,87 @@ mod tests {
     }
 
     #[test]
+    fn released_free_slabs_return_bytes_and_leave_live_leases_untouched() {
+        let arena = BufferArena::new(2).unwrap();
+        let lengths = BufferLengths::new(64, 0, 0);
+        // Hold one lease live in the first slot, then materialize and free a
+        // second slab. (Order matters: a later acquire prefers reusing a warm
+        // free slab over an empty slot, so the free-then-hold order would put
+        // the live lease onto the very slab this test wants to shed.)
+        let live = arena
+            .acquire(lengths, false, ReadPriority::Demand)
+            .unwrap()
+            .unwrap();
+        drop(
+            arena
+                .acquire(lengths, false, ReadPriority::Demand)
+                .unwrap()
+                .unwrap(),
+        );
+        let expected = shared_allocation_len(lengths).unwrap();
+        assert_eq!(arena.release_free_slabs().unwrap(), expected);
+        // Nothing left to free while the only remaining slab is leased.
+        assert_eq!(arena.release_free_slabs().unwrap(), 0);
+        assert!(live.buffers.is_some());
+        drop(live);
+        assert_eq!(arena.release_free_slabs().unwrap(), expected);
+        // A shed slot re-grows lazily exactly like a never-used one.
+        let regrown = arena
+            .acquire(lengths, false, ReadPriority::Demand)
+            .unwrap()
+            .unwrap();
+        assert_eq!(regrown.lengths.quantized, 64);
+    }
+
+    #[test]
+    fn release_free_slabs_flushes_the_retire_hook_before_freeing() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let fail = Arc::new(AtomicBool::new(false));
+        let hook_flushes = Arc::clone(&flushes);
+        let hook_fail = Arc::clone(&fail);
+        let hook: BufferRetireHook = Arc::new(move || {
+            hook_flushes.fetch_add(1, Ordering::SeqCst);
+            if hook_fail.load(Ordering::SeqCst) {
+                Err(DeltafinError::new("simulated aliased wrapper"))
+            } else {
+                Ok(())
+            }
+        });
+        let arena = BufferArena::new_with_retire_hook(1, Some(hook)).unwrap();
+        let lengths = BufferLengths::new(64, 0, 0);
+
+        // An empty arena frees nothing and must not flush anything.
+        assert_eq!(arena.release_free_slabs().unwrap(), 0);
+        assert_eq!(flushes.load(Ordering::SeqCst), 0);
+
+        drop(
+            arena
+                .acquire(lengths, false, ReadPriority::Demand)
+                .unwrap()
+                .unwrap(),
+        );
+        // A failing flush keeps the slab: fail closed, report the cause.
+        fail.store(true, Ordering::SeqCst);
+        assert!(
+            arena
+                .release_free_slabs()
+                .unwrap_err()
+                .to_string()
+                .contains("retire hook failed")
+        );
+        assert_eq!(flushes.load(Ordering::SeqCst), 1);
+        // Once the flush succeeds the restored slab is freed after the hook.
+        fail.store(false, Ordering::SeqCst);
+        assert_eq!(
+            arena.release_free_slabs().unwrap(),
+            shared_allocation_len(lengths).unwrap()
+        );
+        assert_eq!(flushes.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn demand_preempts_prefetch_but_prefetch_cannot_starve() {
         let mut queues = PriorityQueues::new();
         queues.push(ReadPriority::Prefetch, 10_000);
@@ -5447,7 +6125,13 @@ mod tests {
             .acquire(plan.buffer_lengths, false, ReadPriority::Demand)
             .unwrap()
             .unwrap();
-        let batch = Batch::new(&plan, Arc::clone(&lease), ReadPriority::Prefetch);
+        let batch = Batch::new(
+            &plan,
+            Arc::clone(&lease),
+            ReadPriority::Prefetch,
+            None,
+            Arc::new(AtomicU64::new(0)),
+        );
         assert!(matches!(batch.run_quantum(), QuantumOutcome::Requeue));
         assert_eq!(batch.next_job.load(Ordering::Relaxed), WORK_QUANTUM);
         assert_eq!(
@@ -5482,7 +6166,13 @@ mod tests {
             .acquire(plan.buffer_lengths, false, ReadPriority::Demand)
             .unwrap()
             .unwrap();
-        let batch = Batch::new(&plan, Arc::clone(&lease), ReadPriority::Prefetch);
+        let batch = Batch::new(
+            &plan,
+            Arc::clone(&lease),
+            ReadPriority::Prefetch,
+            None,
+            Arc::new(AtomicU64::new(0)),
+        );
         assert!(matches!(batch.run_quantum(), QuantumOutcome::Requeue));
         batch.cancel_unclaimed();
         assert_eq!(batch.completion.remaining.load(Ordering::Acquire), 0);

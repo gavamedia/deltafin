@@ -6,15 +6,13 @@
 //! no dequantization, floating-point conversion, caching, or device transfer;
 //! the returned bytes are the exact on-disk BF16 bit patterns.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
-#[cfg(test)]
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::ptr;
 
 use crate::error::{DeltafinError, Result};
+use crate::sys::fs::{self as sys_fs, FileExt, Open};
 
 pub const K3_EMBEDDING_RELATIVE_PATH: &str =
     "k3-resident/tensors/language_model.model.embed_tokens.weight";
@@ -97,9 +95,9 @@ impl EmbeddingTable {
 
     pub fn open_exact(path: impl AsRef<Path>, spec: EmbeddingSpec) -> Result<Self> {
         let path = path.as_ref();
-        let file = OpenOptions::new()
+        let file = Open::new()
             .read(true)
-            .custom_flags(open_cloexec_nofollow())
+            .no_follow()
             .open(path)
             .map_err(|error| {
                 io_error(
@@ -239,9 +237,7 @@ impl EmbeddingTable {
     fn validate_open_descriptor(&self) -> Result<()> {
         // `File::metadata` is `fstat(2)` on the already-open descriptor.  This
         // validates the object actually read, not a racy path lookup.
-        let metadata = self
-            .file
-            .metadata()
+        let metadata = sys_fs::fstat(&self.file)
             .map_err(|error| io_error("stat opened BF16 embedding", &self.path, error))?;
         if !metadata.is_file() {
             return Err(DeltafinError::new(format!(
@@ -272,8 +268,9 @@ impl EmbeddingTable {
             .ok_or_else(|| DeltafinError::new("embedding source offset overflow"))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn descriptor(&self) -> i32 {
+        use std::os::fd::AsRawFd;
         self.file.as_raw_fd()
     }
 }
@@ -526,26 +523,12 @@ fn io_error(operation: &str, path: &Path, error: io::Error) -> DeltafinError {
     DeltafinError::new(format!("{operation} {}: {error}", path.display()))
 }
 
-#[cfg(target_os = "macos")]
-const fn open_cloexec_nofollow() -> i32 {
-    // Darwin O_CLOEXEC | O_NOFOLLOW.
-    0x0100_0100
-}
-
-#[cfg(target_os = "linux")]
-const fn open_cloexec_nofollow() -> i32 {
-    // Linux O_CLOEXEC | O_NOFOLLOW.
-    0x000a_0000
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-compile_error!("Deltafin native embedding storage currently supports macOS and Linux");
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
     use std::io::Write;
-    use std::os::unix::fs::symlink;
+    use crate::sys::fs::symlink;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -743,6 +726,7 @@ mod tests {
         assert!(error.to_string().contains("without following symlinks"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn one_persistent_descriptor_is_reused_and_closed_without_a_read_leak() {
         unsafe extern "C" {

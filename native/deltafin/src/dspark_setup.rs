@@ -6,10 +6,8 @@
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -22,6 +20,7 @@ use crate::dspark_checkpoint::{
     strict_json, validate_official_config_bytes, validate_official_safetensors_prefix,
 };
 use crate::error::{DeltafinError, Result};
+use crate::sys::fs::{self as sys_fs, Open};
 use crate::trusted_download::{
     ByteRange, NativeHttpsTransport, Request, ResponseMeta, TimeoutPolicy, Transport,
     fsync_directory, publish_hard_link, read_bounded, rename_noreplace, secure_create_new,
@@ -121,7 +120,7 @@ pub(crate) fn exact_install_bytes() -> Result<u64> {
 /// staging remains resumable but is conservatively ignored by capacity plans.
 pub(crate) fn audited_installed_bytes(root: &Path) -> Result<u64> {
     let destination = root.join("k3-draft-dspark");
-    match fs::symlink_metadata(&destination) {
+    match sys_fs::lstat(&destination) {
         Ok(_) => {
             audit_local(&destination, true)?;
             exact_install_bytes()
@@ -313,7 +312,7 @@ fn install(destination: &Path, transport: &mut dyn Transport) -> Result<()> {
         .ok_or_else(|| DeltafinError::new("DSpark destination must have a parent directory"))?;
     require_real_directory(parent)?;
     let _lock = InstallationLock::acquire(&destination)?;
-    match fs::symlink_metadata(&destination) {
+    match sys_fs::lstat(&destination) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
             ensure_spotlight_marker(&destination)?;
             audit_local(&destination, true)?;
@@ -334,12 +333,12 @@ fn install(destination: &Path, transport: &mut dyn Transport) -> Result<()> {
     }
     audit_remote(transport)?;
     let staging = suffix_path(&destination, ".installing")?;
-    match fs::symlink_metadata(&staging) {
+    match sys_fs::lstat(&staging) {
         Ok(_) => require_real_directory(&staging)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             fs::create_dir(&staging)
                 .map_err(|error| io_error("create DSpark staging directory", &staging, error))?;
-            fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))
+            sys_fs::restrict_to_owner(&staging)
                 .map_err(|error| io_error("secure DSpark staging directory", &staging, error))?;
             fsync_directory(parent)?;
         }
@@ -362,14 +361,14 @@ fn install(destination: &Path, transport: &mut dyn Transport) -> Result<()> {
     }
     download_pinned_file(&FILE_SPECS[4], &staging, transport)?;
     let manifest = staging.join(MANIFEST_NAME);
-    if fs::symlink_metadata(&manifest).is_ok() {
+    if sys_fs::lstat(&manifest).is_ok() {
         audit_local(&staging, true)?;
     } else {
         audit_local(&staging, false)?;
         write_manifest(&staging)?;
     }
     audit_local(&staging, true)?;
-    if fs::symlink_metadata(&destination).is_ok() {
+    if sys_fs::lstat(&destination).is_ok() {
         return Err(DeltafinError::new(format!(
             "refusing to publish over path that appeared: {}",
             destination.display()
@@ -388,7 +387,7 @@ fn download_pinned_file(
     transport: &mut dyn Transport,
 ) -> Result<()> {
     let final_path = directory.join(spec.name);
-    match fs::symlink_metadata(&final_path) {
+    match sys_fs::lstat(&final_path) {
         Ok(_) => {
             validate_file(&final_path, spec)?;
             if spec.name == CHECKPOINT_BASENAME {
@@ -605,7 +604,7 @@ fn expected_manifest() -> Value {
 fn write_manifest(directory: &Path) -> Result<()> {
     let final_path = directory.join(MANIFEST_NAME);
     let part = suffix_path(&final_path, ".part")?;
-    match fs::symlink_metadata(&part) {
+    match sys_fs::lstat(&part) {
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
             fs::remove_file(&part)
                 .map_err(|error| io_error("remove stale manifest partial", &part, error))?;
@@ -633,7 +632,7 @@ fn ensure_spotlight_marker(directory: &Path) -> Result<()> {
         return Ok(());
     }
     let marker = directory.join(SPOTLIGHT_MARKER);
-    match fs::symlink_metadata(&marker) {
+    match sys_fs::lstat(&marker) {
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(()),
         Ok(_) => Err(DeltafinError::new(format!(
             "unsafe Spotlight exclusion marker {}",
@@ -719,7 +718,7 @@ struct OpenIdentity {
 }
 
 fn open_regular(path: &Path, expected_size: Option<u64>) -> Result<(File, OpenIdentity)> {
-    let before = fs::symlink_metadata(path)
+    let before = sys_fs::lstat(path)
         .map_err(|error| io_error("inspect regular file", path, error))?;
     if before.file_type().is_symlink() || !before.is_file() {
         return Err(DeltafinError::new(format!(
@@ -735,9 +734,9 @@ fn open_regular(path: &Path, expected_size: Option<u64>) -> Result<(File, OpenId
             expected_size.unwrap_or_default()
         )));
     }
-    let file = OpenOptions::new()
+    let file = Open::new()
         .read(true)
-        .custom_flags(open_nofollow_cloexec())
+        .no_follow()
         .open(path)
         .map_err(|error| io_error("open regular file without following symlinks", path, error))?;
     let identity = OpenIdentity {
@@ -754,8 +753,7 @@ fn validate_open_identity(
     size: u64,
     path: &Path,
 ) -> Result<()> {
-    let metadata = file
-        .metadata()
+    let metadata = sys_fs::fstat(&file)
         .map_err(|error| io_error("stat opened regular file", path, error))?;
     if !metadata.is_file()
         || metadata.dev() != identity.device
@@ -779,8 +777,7 @@ fn read_regular_limited(path: &Path, maximum: u64) -> Result<Vec<u8>> {
 
 fn read_regular_prefix(path: &Path, length: u64) -> Result<Vec<u8>> {
     let (mut file, identity) = open_regular(path, None)?;
-    if file
-        .metadata()
+    if sys_fs::fstat(&file)
         .map_err(|error| io_error("stat file", path, error))?
         .len()
         < length
@@ -790,8 +787,7 @@ fn read_regular_prefix(path: &Path, length: u64) -> Result<Vec<u8>> {
     let mut raw = vec![0; length as usize];
     file.read_exact(&mut raw)
         .map_err(|error| io_error("read pinned file prefix", path, error))?;
-    let size = file
-        .metadata()
+    let size = sys_fs::fstat(&file)
         .map_err(|error| io_error("stat file", path, error))?
         .len();
     validate_open_identity(&file, identity, size, path)?;
@@ -799,7 +795,7 @@ fn read_regular_prefix(path: &Path, length: u64) -> Result<Vec<u8>> {
 }
 
 fn existing_part_size(path: &Path, maximum: u64) -> Result<u64> {
-    match fs::symlink_metadata(path) {
+    match sys_fs::lstat(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
             Err(DeltafinError::new(format!(
                 "refusing unsafe partial download {}",
@@ -817,15 +813,14 @@ fn existing_part_size(path: &Path, maximum: u64) -> Result<u64> {
 }
 
 fn open_part_append(path: &Path, expected_size: u64) -> Result<(File, OpenIdentity)> {
-    let file = OpenOptions::new()
+    let file = Open::new()
         .create(true)
         .append(true)
         .mode(0o600)
-        .custom_flags(open_nofollow_cloexec())
+        .no_follow()
         .open(path)
         .map_err(|error| io_error("open partial download safely", path, error))?;
-    let metadata = file
-        .metadata()
+    let metadata = sys_fs::fstat(&file)
         .map_err(|error| io_error("stat partial download", path, error))?;
     if !metadata.is_file() || metadata.len() != expected_size {
         return Err(DeltafinError::new(format!(
@@ -844,7 +839,7 @@ fn open_part_append(path: &Path, expected_size: u64) -> Result<(File, OpenIdenti
 
 fn require_real_directory(path: &Path) -> Result<()> {
     let metadata =
-        fs::symlink_metadata(path).map_err(|error| io_error("inspect directory", path, error))?;
+        sys_fs::lstat(path).map_err(|error| io_error("inspect directory", path, error))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(DeltafinError::new(format!(
             "{} is not a real directory",
@@ -880,16 +875,15 @@ struct InstallationLock {
 impl InstallationLock {
     fn acquire(destination: &Path) -> Result<Self> {
         let path = suffix_path(destination, ".install.lock")?;
-        let file = OpenOptions::new()
+        let file = Open::new()
             .read(true)
             .write(true)
             .create(true)
             .mode(0o600)
-            .custom_flags(open_nofollow_cloexec())
+            .no_follow()
             .open(&path)
             .map_err(|error| io_error("open DSpark installation lock", &path, error))?;
-        if !file
-            .metadata()
+        if !sys_fs::fstat(&file)
             .map_err(|error| io_error("stat DSpark installation lock", &path, error))?
             .is_file()
         {
@@ -897,8 +891,9 @@ impl InstallationLock {
                 "DSpark installation lock is not regular",
             ));
         }
-        // SAFETY: `file` owns a live descriptor and flock does not retain the pointer/state.
-        if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+        if !sys_fs::try_lock_exclusive(&file)
+            .map_err(|error| io_error("acquire DSpark installation lock", &path, error))?
+        {
             return Err(DeltafinError::new(format!(
                 "another DSpark installer is active for {}",
                 destination.display()
@@ -910,27 +905,10 @@ impl InstallationLock {
 
 impl Drop for InstallationLock {
     fn drop(&mut self) {
-        // SAFETY: the descriptor remains live for the duration of this call.
-        let _ = unsafe { flock(self.file.as_raw_fd(), LOCK_UN) };
+        sys_fs::unlock(&self.file);
     }
 }
 
-unsafe extern "C" {
-    fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
-}
-
-const LOCK_EX: i32 = 2;
-const LOCK_NB: i32 = 4;
-const LOCK_UN: i32 = 8;
-
-#[cfg(target_os = "macos")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x0100_0100
-}
-#[cfg(target_os = "linux")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x000a_0000
-}
 fn io_error(operation: &str, path: &Path, error: std::io::Error) -> DeltafinError {
     DeltafinError::new(format!("{operation} {}: {error}", path.display()))
 }
@@ -1080,7 +1058,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir(&root).unwrap();
-        std::os::unix::fs::symlink("missing", root.join("config.json")).unwrap();
+        crate::sys::fs::symlink("missing", root.join("config.json")).unwrap();
         assert!(validate_directory_names(&root, true, false).is_err());
         fs::remove_file(root.join("config.json")).unwrap();
         File::create(root.join("payload.pkl")).unwrap();

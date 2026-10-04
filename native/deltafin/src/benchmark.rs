@@ -6,12 +6,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::ffi::{CStr, CString, OsStr, OsString};
-use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::ffi::{CStr, CString};
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -28,6 +34,7 @@ use crate::error::{DeltafinError, Result};
 use crate::packfile::DigestState;
 use crate::run_events::{EVENT_SCHEMA, MAX_EVENT_STREAM_BYTES};
 use crate::trusted_download::{fsync_directory, secure_create_new};
+use crate::sys::fs::{self as sys_fs, Open};
 
 pub const BENCHMARK_SCHEMA: &str = "deltafin.benchmark.v1";
 const MAX_EVENT_LINE_BYTES: usize = 16 * 1024 * 1024;
@@ -496,7 +503,7 @@ where
 
 fn read_events(path: &Path) -> (Vec<Value>, Vec<String>) {
     let mut errors = Vec::new();
-    let metadata = match fs::symlink_metadata(path) {
+    let metadata = match sys_fs::lstat(path) {
         Ok(metadata) => metadata,
         Err(error) => {
             return (
@@ -522,9 +529,9 @@ fn read_events(path: &Path) -> (Vec<Value>, Vec<String>) {
             )],
         );
     }
-    let file = match OpenOptions::new()
+    let file = match Open::new()
         .read(true)
-        .custom_flags(open_nofollow_cloexec())
+        .no_follow()
         .open(path)
     {
         Ok(file) => file,
@@ -535,7 +542,7 @@ fn read_events(path: &Path) -> (Vec<Value>, Vec<String>) {
             );
         }
     };
-    let opened = match file.metadata() {
+    let opened = match sys_fs::fstat(&file) {
         Ok(opened) => opened,
         Err(error) => {
             return (
@@ -624,7 +631,7 @@ fn read_events(path: &Path) -> (Vec<Value>, Vec<String>) {
         }
         events.push(event);
     }
-    let final_metadata = match reader.into_inner().metadata() {
+    let final_metadata = match sys_fs::fstat(&reader.into_inner()) {
         Ok(metadata) => metadata,
         Err(error) => {
             errors.push(format!("cannot restat events.jsonl after parsing: {error}"));
@@ -1162,13 +1169,13 @@ fn validate_options(options: &BenchmarkOptions) -> Result<(PathBuf, PathBuf)> {
         }
         parse_environment_delta(&arm.environment_spec)?;
     }
-    let repository_root = fs::canonicalize(&options.repository_root).map_err(|error| {
+    let repository_root = crate::sys::fs::canonicalize(&options.repository_root).map_err(|error| {
         DeltafinError::new(format!(
             "resolve benchmark repository/model root {}: {error}",
             options.repository_root.display()
         ))
     })?;
-    let root_metadata = fs::symlink_metadata(&repository_root).map_err(|error| {
+    let root_metadata = sys_fs::lstat(&repository_root).map_err(|error| {
         DeltafinError::new(format!(
             "inspect benchmark repository/model root {}: {error}",
             repository_root.display()
@@ -1190,7 +1197,7 @@ fn verify_native_executable(path: &Path) -> Result<PathBuf> {
 }
 
 fn open_verified_native_executable(path: &Path) -> Result<(PathBuf, File, NativeFileIdentity)> {
-    let supplied_metadata = fs::symlink_metadata(path).map_err(|error| {
+    let supplied_metadata = sys_fs::lstat(path).map_err(|error| {
         DeltafinError::new(format!(
             "inspect compiled Deltafin benchmark runner {}: {error}",
             path.display()
@@ -1202,13 +1209,13 @@ fn open_verified_native_executable(path: &Path) -> Result<(PathBuf, File, Native
             path.display()
         )));
     }
-    let path = fs::canonicalize(path).map_err(|error| {
+    let path = crate::sys::fs::canonicalize(path).map_err(|error| {
         DeltafinError::new(format!(
             "resolve compiled Deltafin benchmark runner {}: {error}",
             path.display()
         ))
     })?;
-    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+    let metadata = sys_fs::lstat(&path).map_err(|error| {
         DeltafinError::new(format!(
             "inspect compiled Deltafin benchmark runner {}: {error}",
             path.display()
@@ -1220,15 +1227,15 @@ fn open_verified_native_executable(path: &Path) -> Result<(PathBuf, File, Native
             path.display()
         )));
     }
-    if metadata.permissions().mode() & 0o111 == 0 {
+    if metadata.mode() & 0o111 == 0 {
         return Err(DeltafinError::new(format!(
             "benchmark runner is not executable: {}",
             path.display()
         )));
     }
-    let mut file = OpenOptions::new()
+    let mut file = Open::new()
         .read(true)
-        .custom_flags(open_nofollow_cloexec())
+        .no_follow()
         .open(&path)
         .map_err(|error| {
             DeltafinError::new(format!(
@@ -1236,7 +1243,7 @@ fn open_verified_native_executable(path: &Path) -> Result<(PathBuf, File, Native
                 path.display()
             ))
         })?;
-    let opened_metadata = file.metadata().map_err(|error| {
+    let opened_metadata = sys_fs::fstat(&file).map_err(|error| {
         DeltafinError::new(format!(
             "inspect opened Deltafin benchmark runner {}: {error}",
             path.display()
@@ -1272,7 +1279,7 @@ fn open_verified_native_executable(path: &Path) -> Result<(PathBuf, File, Native
     Ok((path, file, opened_identity))
 }
 
-fn native_file_identity(metadata: &fs::Metadata) -> NativeFileIdentity {
+fn native_file_identity(metadata: &sys_fs::Stat) -> NativeFileIdentity {
     NativeFileIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
@@ -1315,7 +1322,7 @@ fn pin_native_executable(runner: &Path, output_dir: &Path) -> Result<PinnedRunne
             DeltafinError::new("pinned benchmark runner byte count overflowed u64")
         })?;
     }
-    let final_source_identity = native_file_identity(&source.metadata().map_err(|error| {
+    let final_source_identity = native_file_identity(&sys_fs::fstat(&source).map_err(|error| {
         DeltafinError::new(format!(
             "reinspect benchmark runner after pinning {}: {error}",
             original_path.display()
@@ -1327,6 +1334,7 @@ fn pin_native_executable(runner: &Path, output_dir: &Path) -> Result<PinnedRunne
             original_path.display()
         )));
     }
+    #[cfg(unix)]
     destination
         .set_permissions(fs::Permissions::from_mode(0o500))
         .map_err(|error| {
@@ -1469,9 +1477,7 @@ fn make_output_dir(repository_root: &Path, requested: Option<&Path>) -> Result<P
         ))
     })?;
     create_real_directory_tree(parent)?;
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&path)
+    sys_fs::create_private_directory(&path)
         .map_err(|error| {
             DeltafinError::new(format!(
                 "exclusively create benchmark evidence directory {}: {error}",
@@ -1479,7 +1485,7 @@ fn make_output_dir(repository_root: &Path, requested: Option<&Path>) -> Result<P
             ))
         })?;
     fsync_directory(parent)?;
-    fs::canonicalize(&path).map_err(|error| {
+    crate::sys::fs::canonicalize(&path).map_err(|error| {
         DeltafinError::new(format!(
             "resolve benchmark evidence directory {}: {error}",
             path.display()
@@ -1491,7 +1497,7 @@ fn normalize_output_path(path: &Path) -> Result<PathBuf> {
     let mut cursor = path;
     let mut missing = Vec::new();
     while !cursor.exists() {
-        if fs::symlink_metadata(cursor).is_ok() {
+        if sys_fs::lstat(cursor).is_ok() {
             return Err(DeltafinError::new(format!(
                 "benchmark output path contains a dangling symlink: {}",
                 cursor.display()
@@ -1511,7 +1517,7 @@ fn normalize_output_path(path: &Path) -> Result<PathBuf> {
             ))
         })?;
     }
-    let mut normalized = fs::canonicalize(cursor).map_err(|error| {
+    let mut normalized = crate::sys::fs::canonicalize(cursor).map_err(|error| {
         DeltafinError::new(format!(
             "resolve existing benchmark output ancestor {}: {error}",
             cursor.display()
@@ -1531,9 +1537,7 @@ fn create_real_directory_tree(path: &Path) -> Result<()> {
         DeltafinError::new(format!("directory has no parent: {}", path.display()))
     })?;
     create_real_directory_tree(parent)?;
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(path)
+    sys_fs::create_private_directory(path)
         .map_err(|error| {
             DeltafinError::new(format!("create directory {}: {error}", path.display()))
         })?;
@@ -1543,7 +1547,7 @@ fn create_real_directory_tree(path: &Path) -> Result<()> {
 
 fn validate_real_directory_chain(path: &Path) -> Result<()> {
     for ancestor in path.ancestors() {
-        let metadata = fs::symlink_metadata(ancestor).map_err(|error| {
+        let metadata = sys_fs::lstat(ancestor).map_err(|error| {
             DeltafinError::new(format!("inspect directory {}: {error}", ancestor.display()))
         })?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -1557,9 +1561,7 @@ fn validate_real_directory_chain(path: &Path) -> Result<()> {
 }
 
 fn create_run_directory(path: &Path) -> Result<()> {
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(path)
+    sys_fs::create_private_directory(path)
         .map_err(|error| {
             DeltafinError::new(format!(
                 "exclusively create benchmark run directory {}: {error}",
@@ -1676,16 +1678,6 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
-#[cfg(target_os = "macos")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x0100_0000 | 0x0000_0100
-}
-
-#[cfg(target_os = "linux")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x0008_0000 | 0x0002_0000
-}
-
 fn wait_for_runner(
     child: &mut Child,
     timeout: Duration,
@@ -1737,7 +1729,7 @@ fn wait_for_runner(
 }
 
 fn live_event_stream_error(path: &Path, limit: u64) -> io::Result<Option<String>> {
-    let metadata = match fs::symlink_metadata(path) {
+    let metadata = match sys_fs::lstat(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
@@ -1756,6 +1748,23 @@ fn live_event_stream_error(path: &Path, limit: u64) -> io::Result<Option<String>
     Ok(None)
 }
 
+#[cfg(windows)]
+fn terminate_process_group(child: &mut Child) {
+    let _ = child.kill();
+}
+
+/// The signal that ended a child, where the platform has signals.
+#[cfg(unix)]
+fn exit_signal(status: &ExitStatus) -> Option<i32> {
+    status.signal()
+}
+
+#[cfg(windows)]
+fn exit_signal(_status: &ExitStatus) -> Option<i32> {
+    None
+}
+
+#[cfg(unix)]
 fn terminate_process_group(child: &mut Child) {
     let process_id = child.id();
     if process_id <= i32::MAX as u32 {
@@ -1768,8 +1777,10 @@ fn terminate_process_group(child: &mut Child) {
     let _ = child.kill();
 }
 
+#[cfg(unix)]
 const SIGKILL: i32 = 9;
 
+#[cfg(unix)]
 unsafe extern "C" {
     fn kill(process_or_group: i32, signal: i32) -> i32;
 }
@@ -1821,6 +1832,7 @@ fn execute_runner_with_limits(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
     command.process_group(0);
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -2016,7 +2028,7 @@ fn stderr_tail(path: &Path, maximum_bytes: u64) -> String {
     let Ok(mut file) = File::open(path) else {
         return String::new();
     };
-    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+    let Ok(length) = sys_fs::fstat(&file).map(|metadata| metadata.len()) else {
         return String::new();
     };
     let start = length.saturating_sub(maximum_bytes);
@@ -2054,8 +2066,17 @@ fn lightweight_state(path: &Path) -> Value {
     state
 }
 
+#[cfg(windows)]
 fn filesystem_state(path: &Path) -> Option<Value> {
-    let canonical = fs::canonicalize(path).ok()?;
+    let canonical = crate::sys::fs::canonicalize(path).ok()?;
+    let directory = sys_fs::Open::new().read(true).directory().open(&canonical).ok()?;
+    let free = sys_fs::available_space(&directory, &canonical).ok()?;
+    Some(json!({ "free_bytes": free }))
+}
+
+#[cfg(unix)]
+fn filesystem_state(path: &Path) -> Option<Value> {
+    let canonical = crate::sys::fs::canonicalize(path).ok()?;
     let path = CString::new(canonical.as_os_str().as_bytes()).ok()?;
     // SAFETY: `path` is a live NUL-terminated string and `statvfs` initializes
     // the complete output structure before returning success.
@@ -2101,6 +2122,10 @@ fn load_average() -> Option<Value> {
         // `getloadavg` writes no more than the supplied element count.
         let count = unsafe { libc::getloadavg(values.as_mut_ptr(), values.len() as libc::c_int) };
         (count == values.len() as libc::c_int).then(|| json!(values))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
     }
 }
 
@@ -2203,7 +2228,7 @@ fn read_direct_repository_state(repository_root: &Path) -> Result<Value> {
 
 fn resolve_git_directory(repository_root: &Path) -> Result<Option<PathBuf>> {
     let dot_git = repository_root.join(".git");
-    let metadata = match fs::symlink_metadata(&dot_git) {
+    let metadata = match sys_fs::lstat(&dot_git) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
@@ -2273,7 +2298,7 @@ fn resolve_git_common_directory(git_directory: &Path) -> Result<PathBuf> {
 }
 
 fn canonical_git_directory(path: &Path, label: &str) -> Result<PathBuf> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
+    let metadata = sys_fs::lstat(path).map_err(|error| {
         DeltafinError::new(format!("inspect {label} {}: {error}", path.display()))
     })?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -2282,7 +2307,7 @@ fn canonical_git_directory(path: &Path, label: &str) -> Result<PathBuf> {
             path.display()
         )));
     }
-    fs::canonicalize(path)
+    crate::sys::fs::canonicalize(path)
         .map_err(|error| DeltafinError::new(format!("resolve {label} {}: {error}", path.display())))
 }
 
@@ -2376,7 +2401,7 @@ fn resolve_git_reference(
 }
 
 fn read_bounded_git_file(path: &Path, maximum_bytes: u64, label: &str) -> Result<Option<Vec<u8>>> {
-    let metadata = match fs::symlink_metadata(path) {
+    let metadata = match sys_fs::lstat(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
@@ -2393,12 +2418,12 @@ fn read_bounded_git_file(path: &Path, maximum_bytes: u64, label: &str) -> Result
         )));
     }
     let expected = native_file_identity(&metadata);
-    let mut file = OpenOptions::new()
+    let mut file = Open::new()
         .read(true)
-        .custom_flags(open_nofollow_cloexec())
+        .no_follow()
         .open(path)
         .map_err(|error| DeltafinError::new(format!("open {label} {}: {error}", path.display())))?;
-    if native_file_identity(&file.metadata().map_err(|error| {
+    if native_file_identity(&sys_fs::fstat(&file).map_err(|error| {
         DeltafinError::new(format!(
             "inspect opened {label} {}: {error}",
             path.display()
@@ -2421,7 +2446,7 @@ fn read_bounded_git_file(path: &Path, maximum_bytes: u64, label: &str) -> Result
             path.display()
         )));
     }
-    let final_identity = native_file_identity(&file.metadata().map_err(|error| {
+    let final_identity = native_file_identity(&sys_fs::fstat(&file).map_err(|error| {
         DeltafinError::new(format!(
             "reinspect opened {label} {}: {error}",
             path.display()
@@ -2474,6 +2499,12 @@ fn system_state(repository_root: &Path, runner: &PinnedRunner) -> Value {
     state
 }
 
+#[cfg(windows)]
+fn uname_state() -> Option<String> {
+    None
+}
+
+#[cfg(unix)]
 fn uname_state() -> Option<String> {
     // SAFETY: `uname` initializes the complete `utsname` structure before
     // returning success.
@@ -3145,10 +3176,10 @@ fn run_once(
         .map(|error| error.to_string());
     let state_after = lightweight_state(repository_root);
     if events_path.exists() {
-        let event_file = OpenOptions::new()
+        let event_file = Open::new()
             .read(true)
             .write(true)
-            .custom_flags(open_nofollow_cloexec())
+            .no_follow()
             .open(&events_path)
             .map_err(|error| {
                 DeltafinError::new(format!(
@@ -3181,7 +3212,7 @@ fn run_once(
         ));
     } else if let Some(status) = outcome.status {
         if !status.success() {
-            match (status.code(), status.signal()) {
+            match (status.code(), exit_signal(&status)) {
                 (Some(code), _) => errors.push(format!("runner exited with status {code}")),
                 (_, Some(signal)) => errors.push(format!("runner exited after signal {signal}")),
                 _ => errors.push("runner exited unsuccessfully".into()),
@@ -3219,7 +3250,7 @@ fn run_once(
         ))
     })?;
     let return_code = outcome.status.and_then(|status| status.code());
-    let exit_signal = outcome.status.and_then(|status| status.signal());
+    let exit_signal = outcome.status.and_then(|status| exit_signal(&status));
     let valid = errors.is_empty();
     let value = json!({
         "schema": BENCHMARK_SCHEMA,
@@ -3522,7 +3553,16 @@ fn print_summary(summary: &Value, arms: &[BenchmarkArm]) {
 /// Execute an interleaved native benchmark campaign and durably persist all
 /// evidence. A successful return describes both valid and invalid campaigns;
 /// use [`BenchmarkReport::succeeded`] for the CLI exit-status decision.
+#[cfg_attr(windows, allow(unreachable_code, unused_variables))]
 pub fn run_campaign(options: &BenchmarkOptions) -> Result<BenchmarkReport> {
+    // The campaign pins an exec-bit-protected private copy of the runner and
+    // supervises it as a Unix process group, and a Windows runner cannot find
+    // its DLLs from a copy elsewhere. Refuse rather than measure something
+    // different from what the evidence claims.
+    #[cfg(windows)]
+    return Err(DeltafinError::new(
+        "`deltafin benchmark` is not supported on Windows yet; run the compiled binary directly with --stats",
+    ));
     // Cargo injects a DYLD fallback path into this crate's macOS test harness
     // so the test executable can find LibTorch. Production binaries never
     // receive this cfg exemption; the pure loader-audit tests cover the exact
@@ -3678,9 +3718,12 @@ pub fn run_campaign(options: &BenchmarkOptions) -> Result<BenchmarkReport> {
     })
 }
 
-#[cfg(test)]
+// The harness pins a private copy of the runner (exec-bit and process-group
+// semantics) and so does not run on Windows yet; its tests are Unix-only.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT_TEMP: AtomicUsize = AtomicUsize::new(0);

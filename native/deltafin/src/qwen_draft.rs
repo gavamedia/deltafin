@@ -1,8 +1,6 @@
 //! Raw-completion translation policy for untrusted Qwen proposals.
 
-use std::fs::OpenOptions;
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -13,6 +11,7 @@ use crate::error::{DeltafinError, Result};
 use crate::packfile::{Digest, digest_bytes};
 use crate::qwen_provider::{NativeQwen, NativeQwenGeneration};
 use crate::tokenizer::K3Tokenizer;
+use crate::sys::fs::{self as sys_fs, Open};
 
 const TOKENIZER_BYTES: u64 = 7_031_645;
 const TOKENIZER_SHA256: Digest = [
@@ -187,13 +186,12 @@ pub struct QwenTokenizer {
 impl QwenTokenizer {
     pub fn load(model_directory: &Path) -> Result<Self> {
         let path = model_directory.join("tokenizer.json");
-        let mut file = OpenOptions::new()
+        let mut file = Open::new()
             .read(true)
-            .custom_flags(open_nofollow_cloexec())
+            .no_follow()
             .open(&path)
             .map_err(|error| DeltafinError::new(format!("open pinned Qwen tokenizer: {error}")))?;
-        let metadata = file
-            .metadata()
+        let metadata = sys_fs::fstat(&file)
             .map_err(|error| DeltafinError::new(format!("stat pinned Qwen tokenizer: {error}")))?;
         if !metadata.is_file() || metadata.len() != TOKENIZER_BYTES {
             return Err(DeltafinError::new(
@@ -203,14 +201,11 @@ impl QwenTokenizer {
         let mut bytes = Vec::with_capacity(TOKENIZER_BYTES as usize);
         file.read_to_end(&mut bytes)
             .map_err(|error| DeltafinError::new(format!("read pinned Qwen tokenizer: {error}")))?;
-        let final_metadata = file.metadata().map_err(|error| {
+        let final_metadata = sys_fs::fstat(&file).map_err(|error| {
             DeltafinError::new(format!("restat pinned Qwen tokenizer: {error}"))
         })?;
         if metadata.len() != final_metadata.len()
-            || std::os::unix::fs::MetadataExt::dev(&metadata)
-                != std::os::unix::fs::MetadataExt::dev(&final_metadata)
-            || std::os::unix::fs::MetadataExt::ino(&metadata)
-                != std::os::unix::fs::MetadataExt::ino(&final_metadata)
+            || metadata.id() != final_metadata.id()
             || digest_bytes(&bytes) != TOKENIZER_SHA256
         {
             return Err(DeltafinError::new(
@@ -441,15 +436,6 @@ where
         self.propose_with_outcome(target_history, maximum)
             .map(QwenDraftProposal::into_token_ids)
     }
-}
-
-#[cfg(target_os = "macos")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x0100_0100
-}
-#[cfg(target_os = "linux")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x000a_0000
 }
 
 #[cfg(test)]

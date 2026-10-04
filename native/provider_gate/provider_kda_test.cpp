@@ -248,6 +248,7 @@ void require_batched_sequence_equal(const at::Device& device,
         "KDA exact dependent projections changed live dispatch order");
   }
 
+  deltafin::provider_internal::KdaRecurrenceRecord record;
   deltafin::provider_internal::KdaPositionsRecurrentResult recurrence =
       deltafin::provider_internal::kda_recur_convolved_positions(
           hidden, weights,
@@ -258,7 +259,30 @@ void require_batched_sequence_equal(const at::Device& device,
               .feature_b = dependent.feature_b,
               .beta = dependent.beta,
           },
-          true, true);
+          true, true, &record);
+  // A verify commit of any prefix replays the recorded rows. It must
+  // reproduce the boundary the loop held there bit for bit.
+  if (record.positions != static_cast<std::int64_t>(positions) ||
+      recurrence.boundaries.size() != positions) {
+    throw std::runtime_error("KDA recurrence record lost its row count");
+  }
+  for (std::uint32_t prefix = 1; prefix <= positions; ++prefix) {
+    const KdaState replayed =
+        deltafin::provider_internal::kda_replay_recorded_state(
+            record, static_cast<std::int64_t>(prefix));
+    const KdaState& boundary = recurrence.boundaries[prefix - 1];
+    if (!at::equal(replayed.recurrent, boundary.recurrent) ||
+        !at::equal(replayed.query_convolution, boundary.query_convolution) ||
+        !at::equal(replayed.key_convolution, boundary.key_convolution) ||
+        !at::equal(replayed.value_convolution, boundary.value_convolution)) {
+      throw std::runtime_error(
+          "KDA prefix replay differs from the recurrence's own boundary");
+    }
+  }
+  if (!at::equal(recurrence.boundaries.back().recurrent,
+                 recurrence.final_state.recurrent)) {
+    throw std::runtime_error("KDA final boundary is not the final state");
+  }
   const deltafin::provider_internal::KdaBatchOutputProjection output =
       deltafin::provider_internal::kda_finish_output_batch(
           hidden, recurrence.recurrent_output_rows, weights, true);

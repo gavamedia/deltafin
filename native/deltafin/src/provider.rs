@@ -84,6 +84,7 @@ const TARGET_SEQUENCE_PREFILL: u32 = 1;
 const TARGET_SEQUENCE_VERIFY: u32 = 2;
 const TARGET_SEQUENCE_CAPTURE_DSPARK: u32 = 1 << 0;
 const TARGET_SEQUENCE_FULL_COMMIT_ONLY: u32 = 1 << 1;
+const TARGET_SEQUENCE_CAPTURE_EAGLE3: u32 = 1 << 2;
 const TARGET_SEQUENCE_STATE_ACTIVE: u32 = 1;
 const TARGET_SEQUENCE_STATE_WAITING_FOR_EXPERTS: u32 = 2;
 const TARGET_SEQUENCE_STATE_READY_FOR_TAIL: u32 = 3;
@@ -92,6 +93,32 @@ const TARGET_SEQUENCE_STATE_COMMITTED: u32 = 5;
 const TARGET_SEQUENCE_STATE_CANCELLED: u32 = 6;
 const TARGET_SEQUENCE_STATE_POISONED: u32 = 7;
 pub(crate) const ROUTE_TOP_K: usize = 16;
+
+/// The K3 rows a target sequence captures on the device for the proposal
+/// model in the engine's draft slot.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ProposalCapture {
+    /// DSpark's five post-layer hidden states, BF16 [T, 5H].
+    DSpark,
+    /// EAGLE-3's AttnRes stream after layers 1, 45 and 89, BF16 [T, 3H].
+    Eagle3,
+}
+
+impl ProposalCapture {
+    const fn flag(self) -> u32 {
+        match self {
+            Self::DSpark => TARGET_SEQUENCE_CAPTURE_DSPARK,
+            Self::Eagle3 => TARGET_SEQUENCE_CAPTURE_EAGLE3,
+        }
+    }
+
+    pub(crate) const fn columns(self) -> usize {
+        match self {
+            Self::DSpark => 5 * 7_168,
+            Self::Eagle3 => 3 * 7_168,
+        }
+    }
+}
 pub(crate) const PILOT_MAX_PREFETCH: usize = 32;
 const ROUTE_MAX_POSITIONS: usize = 64;
 const ROUTE_MAX_EDGES: usize = ROUTE_TOP_K * ROUTE_MAX_POSITIONS;
@@ -1418,6 +1445,49 @@ struct TargetSequenceFinishExpertSpansRequestV1 {
     reserved: [u64; 4],
 }
 
+/// Expert early drain. Carries only the experts whose bytes have landed, so
+/// the provider can start their independent work while the rest of the layer
+/// is still being read. Advisory: a refusal is reported, never raised, and
+/// anything accepted is still recomputed by the finish call unless the staged
+/// state lines up exactly. The reduction stays entirely inside the finish
+/// call, in the router's order.
+#[repr(C)]
+struct TargetSequenceStageExpertSpansRequestV1 {
+    struct_size: u32,
+    abi_version: u32,
+    session: u64,
+    sequence: u64,
+    spine_generation: u64,
+    layer_index: u32,
+    first_row: u32,
+    row_count: u32,
+    expert_backend: u32,
+    cpu_threads: u32,
+    expert_count: u32,
+    flags: u32,
+    expert_layout: u32,
+    expert_ids: [u16; TARGET_SEQUENCE_MAX_EXPERTS],
+    expert_span_pointers: [*const u8; TARGET_SEQUENCE_MAX_EXPERTS],
+    metal_shader_path: *const c_char,
+    metal_shader_path_length: u64,
+    expert_span_bytes: u64,
+    reserved: [u64; 4],
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct TargetSequenceStageExpertSpansReportV1 {
+    struct_size: u32,
+    abi_version: u32,
+    sequence: u64,
+    spine_generation: u64,
+    layer_index: u32,
+    first_row: u32,
+    expert_count: u32,
+    staged: u32,
+    reserved: [u64; 2],
+}
+
 /// Additive wide-union request. V1 remains the byte-for-byte hot ABI for up
 /// to 64 experts; V2 replaces its fixed arrays with synchronously borrowed
 /// pointers and is used only for exact 65..=256 CPU/Metal route unions.
@@ -2154,6 +2224,12 @@ unsafe extern "C" {
     fn deltafin_provider_target_sequence_finish_expert_spans_v1(
         request: *const TargetSequenceFinishExpertSpansRequestV1,
         report: *mut TargetSequenceFinishExpertsReportV1,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> i32;
+    fn deltafin_provider_target_sequence_stage_expert_spans_v1(
+        request: *const TargetSequenceStageExpertSpansRequestV1,
+        report: *mut TargetSequenceStageExpertSpansReportV1,
         error: *mut c_char,
         error_capacity: usize,
     ) -> i32;
@@ -4817,16 +4893,17 @@ impl NativeProviderSession {
         positions: usize,
         mode: TargetSequenceMode,
     ) -> Result<TargetSequence> {
-        self.begin_target_sequence_bf16_options(rows, positions, mode, false, false)
+        self.begin_target_sequence_bf16_options(rows, positions, mode, None, false)
     }
 
-    pub fn begin_target_sequence_bf16_capturing_dspark(
+    pub(crate) fn begin_target_sequence_bf16_capturing(
         &self,
         rows: &[u8],
         positions: usize,
         mode: TargetSequenceMode,
+        capture: ProposalCapture,
     ) -> Result<TargetSequence> {
-        self.begin_target_sequence_bf16_options(rows, positions, mode, true, false)
+        self.begin_target_sequence_bf16_options(rows, positions, mode, Some(capture), false)
     }
 
     /// Begin an exact Verify transaction whose speculative cache state can
@@ -4834,17 +4911,17 @@ impl NativeProviderSession {
     /// contract lets the compiled provider omit prefix-recovery state without
     /// weakening ordinary Verify transactions. A mismatch must cancel this
     /// sequence and rerun its accepted prefix as a new full-commit sequence.
-    pub fn begin_target_sequence_bf16_verify_full_commit_only(
+    pub(crate) fn begin_target_sequence_bf16_verify_full_commit_only(
         &self,
         rows: &[u8],
         positions: usize,
-        capture_dspark: bool,
+        capture: Option<ProposalCapture>,
     ) -> Result<TargetSequence> {
         self.begin_target_sequence_bf16_options(
             rows,
             positions,
             TargetSequenceMode::Verify,
-            capture_dspark,
+            capture,
             true,
         )
     }
@@ -4854,7 +4931,7 @@ impl NativeProviderSession {
         rows: &[u8],
         positions: usize,
         mode: TargetSequenceMode,
-        capture_dspark: bool,
+        capture: Option<ProposalCapture>,
         full_commit_only: bool,
     ) -> Result<TargetSequence> {
         if !(1..=ROUTE_MAX_POSITIONS).contains(&positions) {
@@ -4879,11 +4956,8 @@ impl NativeProviderSession {
             byte_length: rows.len() as u64,
             positions: positions as u32,
             mode: mode.abi_value(),
-            flags: (if capture_dspark {
-                TARGET_SEQUENCE_CAPTURE_DSPARK
-            } else {
-                0
-            }) | (if full_commit_only {
+            flags: capture.map_or(0, ProposalCapture::flag)
+                | (if full_commit_only {
                 TARGET_SEQUENCE_FULL_COMMIT_ONLY
             } else {
                 0
@@ -4914,7 +4988,7 @@ impl NativeProviderSession {
             report,
             positions,
             mode,
-            capture_dspark,
+            capture,
             full_commit_only,
         )
     }
@@ -5148,7 +5222,7 @@ fn target_sequence_from_report(
     report: TargetSequenceBeginReportV1,
     positions: usize,
     mode: TargetSequenceMode,
-    capture_dspark: bool,
+    capture: Option<ProposalCapture>,
     full_commit_only: bool,
 ) -> Result<TargetSequence> {
     if report.struct_size as usize != size_of::<TargetSequenceBeginReportV1>()
@@ -5183,7 +5257,7 @@ fn target_sequence_from_report(
         state: TargetSequenceState::Active,
         waiting: None,
         expert_plan: None,
-        capture_dspark,
+        capture,
         full_commit_only,
     })
 }
@@ -5841,7 +5915,7 @@ pub struct TargetSequence {
     state: TargetSequenceState,
     waiting: Option<TargetSequenceWaiting>,
     expert_plan: Option<Arc<TargetSequenceExpertPlanLease>>,
-    capture_dspark: bool,
+    capture: Option<ProposalCapture>,
     full_commit_only: bool,
 }
 
@@ -6436,6 +6510,121 @@ impl TargetSequence {
         )
     }
 
+    /// Start the independent per-expert work for experts whose bytes have
+    /// landed, without waiting for the rest of this layer's reads.
+    ///
+    /// `arrived` pairs unique ascending expert IDs with one complete
+    /// authenticated span each; every span must stay live until the layer's
+    /// `finish_expert_span_tile`. Returns whether the provider took the offer.
+    ///
+    /// This buys scheduling only. The provider still owns the route, the fp32
+    /// weights, and the single reduction over every edge in the router's
+    /// order, all of which happen in the finish call — so a declined offer, a
+    /// partial offer, and no offer at all produce identical output bytes.
+    /// Errors are deliberately not raised: a staging failure is reported as
+    /// `false` so it can never fail a generation.
+    pub fn stage_expert_spans(
+        &mut self,
+        mailbox: &TargetSequenceMailbox,
+        first_row: usize,
+        row_count: usize,
+        arrived: &[(u16, &[u8])],
+        expert_layout: ExpertStorageLayout,
+        backend: TargetExpertBackend,
+        cpu_threads: usize,
+        metal_shader_path: Option<&str>,
+    ) -> bool {
+        let Some(waiting) = self.waiting else {
+            return false;
+        };
+        let (expert_layout_abi, expert_span_bytes) = expert_layout_abi(expert_layout);
+        let Ok(expert_span_len) = usize::try_from(expert_span_bytes) else {
+            return false;
+        };
+        if self.handle == 0
+            || self.has_live_expert_plan()
+            || self.state != TargetSequenceState::WaitingForExperts
+            || waiting.layer_index != mailbox.layer_index
+            || waiting.spine_generation != mailbox.spine_generation
+            || mailbox.position_count() != self.position_count
+            || first_row != waiting.next_row
+            || row_count != 1
+            || self.position_count != 1
+            || arrived.is_empty()
+            || arrived.len() > TARGET_SEQUENCE_MAX_EXPERTS
+        {
+            return false;
+        }
+        let mut expert_ids = [0_u16; TARGET_SEQUENCE_MAX_EXPERTS];
+        let mut expert_span_pointers = [ptr::null(); TARGET_SEQUENCE_MAX_EXPERTS];
+        for (index, (expert, span)) in arrived.iter().enumerate() {
+            if *expert >= 896
+                || span.len() != expert_span_len
+                || (index != 0 && arrived[index - 1].0 >= *expert)
+            {
+                return false;
+            }
+            expert_ids[index] = *expert;
+            expert_span_pointers[index] = span.as_ptr();
+        }
+        let Ok(cpu_threads) = u32::try_from(cpu_threads) else {
+            return false;
+        };
+        if cpu_threads == 0 || cpu_threads > 1024 {
+            return false;
+        }
+        let shader_bytes = metal_shader_path
+            .filter(|path| !path.is_empty())
+            .map(str::as_bytes)
+            .unwrap_or_default();
+        if shader_bytes.contains(&0) || shader_bytes.len() > 4096 {
+            return false;
+        }
+        let shader_pointer = if shader_bytes.is_empty() {
+            ptr::null()
+        } else {
+            shader_bytes.as_ptr().cast()
+        };
+        let request = TargetSequenceStageExpertSpansRequestV1 {
+            struct_size: size_of::<TargetSequenceStageExpertSpansRequestV1>() as u32,
+            abi_version: ABI_VERSION,
+            session: self.session.handle,
+            sequence: self.handle,
+            spine_generation: waiting.spine_generation,
+            layer_index: waiting.layer_index,
+            first_row: first_row as u32,
+            row_count: row_count as u32,
+            expert_backend: backend.abi_value(),
+            cpu_threads,
+            expert_count: arrived.len() as u32,
+            flags: 0,
+            expert_layout: expert_layout_abi,
+            expert_ids,
+            expert_span_pointers,
+            metal_shader_path: shader_pointer,
+            metal_shader_path_length: shader_bytes.len() as u64,
+            expert_span_bytes,
+            reserved: [0; 4],
+        };
+        let mut report = TargetSequenceStageExpertSpansReportV1 {
+            struct_size: size_of::<TargetSequenceStageExpertSpansReportV1>() as u32,
+            ..Default::default()
+        };
+        let mut error = [0 as c_char; ERROR_CAPACITY];
+        // SAFETY: every arrived span and the shader selector remain live for
+        // this synchronous call, and the caller holds each span's lease until
+        // the layer's finish call returns.
+        let status = unsafe {
+            deltafin_provider_target_sequence_stage_expert_spans_v1(
+                &request,
+                &mut report,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        status == 0 && report.staged == 1
+    }
+
     /// Finish one authoritative tile from individually owned expert spans.
     /// This is the no-copy partial-prefetch reuse boundary: slot i must be one
     /// complete authenticated span for canonical_expert_ids[i]. The provider
@@ -6874,19 +7063,19 @@ impl TargetSequence {
             .into_boxed_slice())
     }
 
-    /// Materialize the five exact post-layer K3 hidden-state rows as one
+    /// Materialize the captured K3 rows for the proposal model (DSpark's
+    /// five post-layer hidden states or EAGLE-3's three AttnRes taps) as one
     /// provider-owned BF16 tensor. No activation bytes cross into Rust; the
-    /// returned opaque tensor is intended only for the compiled DSpark cache
+    /// returned opaque tensor is intended only for that model's cache
     /// adapter and remains independently releasable if target commit fails.
     pub fn dspark_target_rows(&mut self) -> Result<ProviderTensor> {
-        if self.handle == 0
-            || self.state != TargetSequenceState::ReadyToCommit
-            || !self.capture_dspark
-        {
+        let Some(capture) = self.capture.filter(|_| {
+            self.handle != 0 && self.state == TargetSequenceState::ReadyToCommit
+        }) else {
             return Err(DeltafinError::new(
-                "target sequence has no completed DSpark auxiliary capture",
+                "target sequence has no completed proposal-model capture",
             ));
-        }
+        };
         let request = ResourceRequestV1::new(self.session.handle, self.handle);
         let mut report = TensorReportV1::request();
         let mut error = [0 as c_char; ERROR_CAPACITY];
@@ -6910,7 +7099,7 @@ impl TargetSequence {
             || report.abi_version != ABI_VERSION
             || report.tensor == 0
             || report.rows as usize != self.position_count
-            || report.columns != 5 * 7_168
+            || report.columns as usize != capture.columns()
             || report.reserved != [0; 4]
         {
             if report.tensor != 0 {
@@ -6922,14 +7111,14 @@ impl TargetSequence {
                 );
             }
             return Err(DeltafinError::new(
-                "native provider returned an invalid DSpark target-row tensor",
+                "native provider returned an invalid proposal-model target-row tensor",
             ));
         }
         Ok(ProviderTensor {
             session: Arc::clone(&self.session),
             handle: report.tensor,
             rows: self.position_count,
-            columns: 5 * 7_168,
+            columns: capture.columns(),
         })
     }
 
@@ -8406,6 +8595,10 @@ mod tests {
         assert_eq!(TARGET_EXPERT_RETAIN_METAL_WRAPPERS, 1);
         assert_eq!(TARGET_SEQUENCE_CAPTURE_DSPARK, 1);
         assert_eq!(TARGET_SEQUENCE_FULL_COMMIT_ONLY, 2);
+        assert_eq!(TARGET_SEQUENCE_CAPTURE_EAGLE3, 4);
+        assert_eq!(ProposalCapture::DSpark.flag(), TARGET_SEQUENCE_CAPTURE_DSPARK);
+        assert_eq!(ProposalCapture::Eagle3.flag(), TARGET_SEQUENCE_CAPTURE_EAGLE3);
+        assert_eq!(ProposalCapture::Eagle3.columns(), 21_504);
         assert_eq!(
             TARGET_SEQUENCE_CAPTURE_DSPARK | TARGET_SEQUENCE_FULL_COMMIT_ONLY,
             3
@@ -8858,12 +9051,17 @@ mod tests {
         );
         assert_eq!(report.sequence, 0);
 
-        // Both bit combinations are accepted for Verify and reach the next
-        // independent admission gate. This session deliberately has no huge
-        // immutable target globals, so no transaction or cache is allocated.
-        for capture_dspark in [false, true] {
+        // Every capture combination is accepted for Verify and reaches the
+        // next independent admission gate. This session deliberately has no
+        // huge immutable target globals, so no transaction or cache is
+        // allocated.
+        for capture in [
+            None,
+            Some(ProposalCapture::DSpark),
+            Some(ProposalCapture::Eagle3),
+        ] {
             let error = session
-                .begin_target_sequence_bf16_verify_full_commit_only(&rows, 1, capture_dspark)
+                .begin_target_sequence_bf16_verify_full_commit_only(&rows, 1, capture)
                 .unwrap_err();
             assert!(error.to_string().contains("global groups"));
         }
@@ -8924,7 +9122,7 @@ mod tests {
             state: TargetSequenceState::ReadyToCommit,
             waiting: None,
             expert_plan: None,
-            capture_dspark: false,
+            capture: None,
             full_commit_only: true,
         };
         let error = sequence.commit_prefix(3).unwrap_err();
@@ -8934,7 +9132,7 @@ mod tests {
         // the same real session still admits the next independent request.
         let rows = [0_u8; 7_168 * 2];
         let error = session
-            .begin_target_sequence_bf16_verify_full_commit_only(&rows, 1, false)
+            .begin_target_sequence_bf16_verify_full_commit_only(&rows, 1, None)
             .unwrap_err();
         assert!(error.to_string().contains("global groups"));
     }

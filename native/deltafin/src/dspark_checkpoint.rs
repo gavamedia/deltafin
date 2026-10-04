@@ -9,10 +9,9 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt::{self, Formatter};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Read;
 use std::ops::Range;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -21,6 +20,7 @@ use serde_json::{Map, Number, Value, json};
 
 use crate::error::{DeltafinError, Result};
 use crate::packfile::{Digest, digest_bytes, digest_open_file};
+use crate::sys::fs::{self as sys_fs, Open};
 
 pub const OFFICIAL_MODEL_ID: &str = "Inferact/Kimi-K3-DSpark";
 pub const OFFICIAL_REVISION: &str = "cf6b8244620e7ea4b0651d214f28e89eac75bed6";
@@ -376,8 +376,10 @@ fn validate_official_header(raw_header: &[u8]) -> Result<(Vec<DSparkTensor>, u64
     Ok((tensors, data_start))
 }
 
+/// Identity of an admitted proposal-model file, checked again around every
+/// read so a swapped or rewritten file is refused. Shared with EAGLE-3.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct FileIdentity {
+pub(crate) struct FileIdentity {
     device: u64,
     inode: u64,
     length: u64,
@@ -386,7 +388,7 @@ struct FileIdentity {
 }
 
 impl FileIdentity {
-    fn from(metadata: &std::fs::Metadata) -> Self {
+    fn from(metadata: &sys_fs::Stat) -> Self {
         Self {
             device: metadata.dev(),
             inode: metadata.ino(),
@@ -396,13 +398,12 @@ impl FileIdentity {
         }
     }
 
-    fn validate(self, file: &File, path: &Path) -> Result<()> {
-        let metadata = file
-            .metadata()
-            .map_err(|error| io_error("stat admitted DSpark file", path, error))?;
+    pub(crate) fn validate(self, file: &File, path: &Path) -> Result<()> {
+        let metadata = sys_fs::fstat(&file)
+            .map_err(|error| io_error("stat admitted proposal-model file", path, error))?;
         if !metadata.is_file() || Self::from(&metadata) != self {
             return Err(DeltafinError::new(format!(
-                "admitted DSpark file changed while open: {}",
+                "admitted proposal-model file changed while open: {}",
                 path.display()
             )));
         }
@@ -410,12 +411,15 @@ impl FileIdentity {
     }
 }
 
-fn open_regular(path: &Path, expected_length: Option<u64>) -> Result<(File, FileIdentity)> {
-    let before = std::fs::symlink_metadata(path)
-        .map_err(|error| io_error("inspect DSpark file", path, error))?;
+pub(crate) fn open_regular(
+    path: &Path,
+    expected_length: Option<u64>,
+) -> Result<(File, FileIdentity)> {
+    let before = sys_fs::lstat(path)
+        .map_err(|error| io_error("inspect proposal-model file", path, error))?;
     if before.file_type().is_symlink() || !before.is_file() {
         return Err(DeltafinError::new(format!(
-            "DSpark input must be a regular non-symlink file: {}",
+            "proposal-model input must be a regular non-symlink file: {}",
             path.display()
         )));
     }
@@ -427,34 +431,25 @@ fn open_regular(path: &Path, expected_length: Option<u64>) -> Result<(File, File
             expected_length.unwrap_or_default(),
         )));
     }
-    let file = OpenOptions::new()
+    let file = Open::new()
         .read(true)
-        .custom_flags(open_cloexec_nofollow())
+        .no_follow()
         .open(path)
-        .map_err(|error| io_error("open DSpark file without following symlinks", path, error))?;
-    let opened = file
-        .metadata()
-        .map_err(|error| io_error("stat opened DSpark file", path, error))?;
+        .map_err(|error| {
+            io_error("open proposal-model file without following symlinks", path, error)
+        })?;
+    let opened = sys_fs::fstat(&file)
+        .map_err(|error| io_error("stat opened proposal-model file", path, error))?;
     if !opened.is_file()
         || (before.dev(), before.ino()) != (opened.dev(), opened.ino())
         || expected_length.is_some_and(|length| opened.len() != length)
     {
         return Err(DeltafinError::new(format!(
-            "DSpark file changed identity while opening: {}",
+            "proposal-model file changed identity while opening: {}",
             path.display()
         )));
     }
     Ok((file, FileIdentity::from(&opened)))
-}
-
-#[cfg(target_os = "macos")]
-const fn open_cloexec_nofollow() -> i32 {
-    0x0100_0100
-}
-
-#[cfg(target_os = "linux")]
-const fn open_cloexec_nofollow() -> i32 {
-    0x000a_0000
 }
 
 fn checkpoint_schema() -> BTreeMap<String, Vec<u64>> {

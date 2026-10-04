@@ -4,15 +4,14 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 #[cfg(any(feature = "runtime", test))]
 use std::io::Read;
-#[cfg(any(feature = "runtime", test))]
-use std::os::unix::ffi::OsStringExt;
-#[cfg(any(feature = "runtime", test))]
+#[cfg(all(unix, any(feature = "runtime", test)))]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "runtime")]
 use std::process::{Command, Stdio};
 
 use crate::error::{DeltafinError, Result};
+use crate::sys::path::os_string_from_bytes;
 
 const PRESERVED_ROOTS: &[&str] = &[
     ".cache",
@@ -467,7 +466,7 @@ fn decode_profile_value(encoded: &str, label: &str) -> Result<Option<OsString>> 
             "native build profile {label} contains a NUL byte"
         )));
     }
-    Ok(Some(OsString::from_vec(bytes)))
+    Ok(Some(os_string_from_bytes(bytes)))
 }
 
 const fn hex_nibble(byte: u8) -> Option<u8> {
@@ -480,9 +479,11 @@ const fn hex_nibble(byte: u8) -> Option<u8> {
 
 impl Program {
     fn executable(self) -> &'static str {
-        match self {
-            Self::Git => "git",
-            Self::Cargo => "cargo",
+        match (self, cfg!(windows)) {
+            (Self::Git, false) => "git",
+            (Self::Git, true) => "git.exe",
+            (Self::Cargo, false) => "cargo",
+            (Self::Cargo, true) => "cargo.exe",
         }
     }
 }
@@ -595,15 +596,19 @@ fn resolve_native_program_in_path(name: &str, path: &OsStr) -> Result<PathBuf> {
             rejected.push(format!("{} (not a file)", candidate.display()));
             continue;
         }
-        // SAFETY: geteuid has no arguments, pointers, or memory preconditions.
-        let effective_user = unsafe { libc::geteuid() };
-        let owner = unresolved.uid();
-        if owner != 0 && owner != effective_user {
-            rejected.push(format!(
-                "{} (symlink/file is owned by uid {owner}, not root or the current uid {effective_user})",
-                candidate.display()
-            ));
-            continue;
+        // Windows has no uid; the executable-format check below is its gate.
+        #[cfg(unix)]
+        {
+            // SAFETY: geteuid has no arguments, pointers, or memory preconditions.
+            let effective_user = unsafe { libc::geteuid() };
+            let owner = unresolved.uid();
+            if owner != 0 && owner != effective_user {
+                rejected.push(format!(
+                    "{} (symlink/file is owned by uid {owner}, not root or the current uid {effective_user})",
+                    candidate.display()
+                ));
+                continue;
+            }
         }
         match inspect_native_executable(&candidate) {
             Ok(_) => {
@@ -630,60 +635,91 @@ fn resolve_native_program_in_path(name: &str, path: &OsStr) -> Result<PathBuf> {
 
 #[cfg(any(feature = "runtime", test))]
 fn inspect_native_executable(candidate: &Path) -> Result<PathBuf> {
-    let canonical = fs::canonicalize(candidate).map_err(|error| {
+    let canonical = crate::sys::fs::canonicalize(candidate).map_err(|error| {
         DeltafinError::new(format!("cannot resolve native executable: {error}"))
     })?;
     let metadata = fs::metadata(&canonical).map_err(|error| {
         DeltafinError::new(format!("cannot inspect {}: {error}", canonical.display()))
     })?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
-        return Err(DeltafinError::new(format!(
-            "{} is not an executable file",
-            canonical.display()
-        )));
+    #[cfg(unix)]
+    {
+        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+            return Err(DeltafinError::new(format!(
+                "{} is not an executable file",
+                canonical.display()
+            )));
+        }
+        // SAFETY: geteuid has no arguments, pointers, or memory preconditions.
+        let effective_user = unsafe { libc::geteuid() };
+        let owner = metadata.uid();
+        if owner != 0 && owner != effective_user {
+            return Err(DeltafinError::new(format!(
+                "{} is owned by uid {}, not root or the current uid {effective_user}",
+                canonical.display(),
+                owner
+            )));
+        }
+        if metadata.mode() & 0o022 != 0 {
+            return Err(DeltafinError::new(format!(
+                "{} is group/world-writable and cannot be trusted as a native tool",
+                canonical.display()
+            )));
+        }
     }
-    // SAFETY: geteuid has no arguments, pointers, or memory preconditions.
-    let effective_user = unsafe { libc::geteuid() };
-    let owner = metadata.uid();
-    if owner != 0 && owner != effective_user {
-        return Err(DeltafinError::new(format!(
-            "{} is owned by uid {}, not root or the current uid {effective_user}",
-            canonical.display(),
-            owner
-        )));
-    }
-    if metadata.mode() & 0o022 != 0 {
-        return Err(DeltafinError::new(format!(
-            "{} is group/world-writable and cannot be trusted as a native tool",
-            canonical.display()
-        )));
+    #[cfg(windows)]
+    {
+        // Windows has no exec bit or uid. A program is a `.exe` file whose
+        // headers say it is one; the format check below rejects `.cmd`/`.bat`
+        // shims, scripts renamed to `.exe` and App Execution Alias stubs.
+        let is_exe = canonical
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"));
+        if !metadata.is_file() || !is_exe {
+            return Err(DeltafinError::new(format!(
+                "{} is not an executable file",
+                canonical.display()
+            )));
+        }
     }
     let mut file = fs::File::open(&canonical).map_err(|error| {
         DeltafinError::new(format!("cannot open {}: {error}", canonical.display()))
     })?;
-    let mut magic = [0u8; 4];
+    let mut magic = [0u8; NATIVE_HEADER_BYTES];
     let count = file.read(&mut magic).map_err(|error| {
         DeltafinError::new(format!("cannot read {}: {error}", canonical.display()))
     })?;
     if !native_executable_magic(&magic[..count]) {
         return Err(DeltafinError::new(format!(
-            "{} is a script or interpreter shim; only ELF/Mach-O executables are permitted",
-            canonical.display()
+            "{} is a script or interpreter shim; only {} executables are permitted",
+            canonical.display(),
+            if cfg!(windows) { "PE" } else { "ELF/Mach-O" },
         )));
     }
     Ok(canonical)
 }
 
+/// The leading bytes needed to recognize a native executable: a four-byte
+/// magic on Unix, enough of the headers to follow `e_lfanew` on Windows.
+#[cfg(any(feature = "runtime", test))]
+const NATIVE_HEADER_BYTES: usize = if cfg!(windows) { 4096 } else { 4 };
+
 #[cfg(any(feature = "runtime", test))]
 fn native_executable_magic(bytes: &[u8]) -> bool {
-    matches!(
-        bytes,
-        [0x7f, b'E', b'L', b'F']
-            | [0xcf, 0xfa, 0xed, 0xfe]
-            | [0xfe, 0xed, 0xfa, 0xcf]
-            | [0xca, 0xfe, 0xba, 0xbe]
-            | [0xbe, 0xba, 0xfe, 0xca]
-    )
+    #[cfg(windows)]
+    {
+        crate::sys::pe::is_native_executable(bytes)
+    }
+    #[cfg(not(windows))]
+    {
+        matches!(
+            bytes,
+            [0x7f, b'E', b'L', b'F']
+                | [0xcf, 0xfa, 0xed, 0xfe]
+                | [0xfe, 0xed, 0xfa, 0xcf]
+                | [0xca, 0xfe, 0xba, 0xbe]
+                | [0xbe, 0xba, 0xfe, 0xca]
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -753,7 +789,7 @@ fn locate_repository_from(executable: &Path, current_directory: &Path) -> Result
         .take(8)
         .chain(std::iter::once(current_directory))
     {
-        let Ok(candidate) = fs::canonicalize(candidate) else {
+        let Ok(candidate) = crate::sys::fs::canonicalize(candidate) else {
             continue;
         };
         if candidate.join(".git").exists()
@@ -775,7 +811,7 @@ fn run_with_profile<R: Runner>(
     profile: &BuildProfile,
     printer: &mut dyn FnMut(&str),
 ) -> Result<()> {
-    let repo_root = fs::canonicalize(repo_root).map_err(|error| {
+    let repo_root = crate::sys::fs::canonicalize(repo_root).map_err(|error| {
         DeltafinError::new(format!(
             "resolve repository root {}: {error}",
             repo_root.display()
@@ -894,7 +930,7 @@ fn preflight_cargo<R: Runner>(runner: &R, repo_root: &Path) -> Result<()> {
         .get("workspace_root")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| DeltafinError::new("Cargo metadata omitted workspace_root"))?;
-    let workspace = fs::canonicalize(workspace).map_err(|error| {
+    let workspace = crate::sys::fs::canonicalize(workspace).map_err(|error| {
         DeltafinError::new(format!("resolve Cargo workspace root {workspace}: {error}"))
     })?;
     if workspace != repo_root {
@@ -913,14 +949,14 @@ fn preflight_cargo<R: Runner>(runner: &R, repo_root: &Path) -> Result<()> {
         ("deltafin", "native/deltafin/Cargo.toml"),
         ("deltafin-bootstrap", "native/deltafin-bootstrap/Cargo.toml"),
     ] {
-        let expected_manifest = fs::canonicalize(repo_root.join(relative_manifest))
+        let expected_manifest = crate::sys::fs::canonicalize(repo_root.join(relative_manifest))
             .map_err(|error| DeltafinError::new(format!("resolve {name} manifest: {error}")))?;
         let package_matches = packages.iter().any(|package| {
             package.get("name").and_then(serde_json::Value::as_str) == Some(name)
                 && package
                     .get("manifest_path")
                     .and_then(serde_json::Value::as_str)
-                    .and_then(|path| fs::canonicalize(path).ok())
+                    .and_then(|path| crate::sys::fs::canonicalize(path).ok())
                     .as_ref()
                     == Some(&expected_manifest)
         });
@@ -981,14 +1017,12 @@ fn require_isolated_cargo_home(repo_root: &Path) -> Result<PathBuf> {
                         directory.display()
                     ))
                 })?;
-                fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).map_err(
-                    |error| {
-                        DeltafinError::new(format!(
-                            "protect isolated native-upgrade Cargo directory {}: {error}",
-                            directory.display()
-                        ))
-                    },
-                )?;
+                crate::sys::fs::restrict_to_owner(directory).map_err(|error| {
+                    DeltafinError::new(format!(
+                        "protect isolated native-upgrade Cargo directory {}: {error}",
+                        directory.display()
+                    ))
+                })?;
             }
             Err(error) => {
                 return Err(DeltafinError::new(format!(
@@ -998,13 +1032,13 @@ fn require_isolated_cargo_home(repo_root: &Path) -> Result<PathBuf> {
             }
         }
     }
-    fs::set_permissions(&cargo_home, fs::Permissions::from_mode(0o700)).map_err(|error| {
+    crate::sys::fs::restrict_to_owner(&cargo_home).map_err(|error| {
         DeltafinError::new(format!(
             "protect isolated native-upgrade Cargo home {}: {error}",
             cargo_home.display()
         ))
     })?;
-    let cargo_home = fs::canonicalize(&cargo_home).map_err(|error| {
+    let cargo_home = crate::sys::fs::canonicalize(&cargo_home).map_err(|error| {
         DeltafinError::new(format!(
             "resolve isolated native-upgrade Cargo directory {}: {error}",
             cargo_home.display()
@@ -1035,7 +1069,7 @@ fn fetch_state<R: Runner>(runner: &R, repo_root: &Path) -> Result<GitState> {
         &["rev-parse", "--show-toplevel"],
         "locating the Git checkout",
     )?;
-    let top_level = fs::canonicalize(&top_level).map_err(|error| {
+    let top_level = crate::sys::fs::canonicalize(&top_level).map_err(|error| {
         DeltafinError::new(format!("resolve Git checkout root {top_level}: {error}"))
     })?;
     if top_level != repo_root {
@@ -1247,7 +1281,8 @@ fn require_native_https_remote<R: Runner>(
             "Git reported a relative helper directory; refusing an ambiguous HTTPS transport",
         ));
     }
-    inspect_native_executable(&exec_path.join("git-remote-https")).map_err(|error| {
+    let helper = format!("git-remote-https{}", std::env::consts::EXE_SUFFIX);
+    inspect_native_executable(&exec_path.join(helper)).map_err(|error| {
         DeltafinError::new(format!(
             "Git's HTTPS transport helper is not a compiled native executable: {error}"
         ))
@@ -1439,7 +1474,7 @@ fn require_safe_target_root(repo_root: &Path, target_root: &Path) -> Result<()> 
                     target_root.display()
                 )));
             }
-            let resolved = fs::canonicalize(target_root).map_err(|error| {
+            let resolved = crate::sys::fs::canonicalize(target_root).map_err(|error| {
                 DeltafinError::new(format!(
                     "resolve Cargo target directory {}: {error}",
                     target_root.display()
@@ -1529,13 +1564,13 @@ fn verify_artifact_with_profile(
             artifact.display()
         )));
     }
-    let artifact = fs::canonicalize(artifact).map_err(|error| {
+    let artifact = crate::sys::fs::canonicalize(artifact).map_err(|error| {
         DeltafinError::new(format!(
             "Cargo's Deltafin artifact {} cannot be resolved: {error}",
             artifact.display()
         ))
     })?;
-    let target_root = fs::canonicalize(target_root).map_err(|error| {
+    let target_root = crate::sys::fs::canonicalize(target_root).map_err(|error| {
         DeltafinError::new(format!(
             "Cargo target directory {} cannot be resolved: {error}",
             target_root.display()
@@ -1585,6 +1620,7 @@ fn verify_artifact_with_profile(
 }
 
 #[cfg(test)]
+#[cfg_attr(all(windows, feature = "runtime"), allow(dead_code))]
 fn verify_no_python_environment_path(artifact: &Path) -> Result<()> {
     crate::loader_audit::audit_loader_closure(
         artifact,
@@ -1778,6 +1814,39 @@ mod tests {
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
+    /// `deltafin` and `git-remote-https` as this host names a program.
+    const EXE: &str = std::env::consts::EXE_SUFFIX;
+
+    /// A program image this host's audit accepts and that loads nothing it
+    /// could not resolve: Mach-O with a harmless loader path on Unix, a PE that
+    /// imports only `kernel32.dll` on Windows.
+    fn native_fixture() -> Vec<u8> {
+        #[cfg(windows)]
+        {
+            pe_fixture(&["kernel32.dll"])
+        }
+        #[cfg(not(windows))]
+        {
+            macho_with_loader_path(b"@loader_path/native")
+        }
+    }
+
+    fn pe_fixture(imports: &[&str]) -> Vec<u8> {
+        deltafin_sys::pe::testing::SyntheticImage::executable()
+            .importing(imports)
+            .build()
+    }
+
+    /// An absolute path on this host for a Unix-style spelling: unchanged on
+    /// Unix, on drive `C:` with backslashes on Windows.
+    fn host_path(unix_style: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{}", unix_style.replace('/', "\\"))
+        } else {
+            unix_style.to_owned()
+        }
+    }
+
     struct Fixture {
         root: PathBuf,
     }
@@ -1805,12 +1874,12 @@ mod tests {
             )
             .unwrap();
             fs::create_dir(root.join("git-exec")).unwrap();
-            let helper = root.join("git-exec/git-remote-https");
-            fs::write(&helper, macho_with_loader_path(b"@loader_path/native")).unwrap();
+            let helper = root.join(format!("git-exec/git-remote-https{EXE}"));
+            fs::write(&helper, native_fixture()).unwrap();
             #[cfg(unix)]
             fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
             Self {
-                root: fs::canonicalize(root).unwrap(),
+                root: crate::sys::fs::canonicalize(root).unwrap(),
             }
         }
     }
@@ -1881,7 +1950,7 @@ mod tests {
                 .map(|(program, args)| {
                     format!(
                         "{} {}",
-                        program.executable(),
+                        program_name(*program),
                         logical_arguments(*program, args).join(" ")
                     )
                 })
@@ -1892,7 +1961,7 @@ mod tests {
             self.commands
                 .borrow()
                 .iter()
-                .map(|(program, args)| format!("{} {}", program.executable(), args.join(" ")))
+                .map(|(program, args)| format!("{} {}", program_name(*program), args.join(" ")))
                 .collect()
         }
 
@@ -1948,9 +2017,9 @@ mod tests {
                     .to_string(),
                 ),
                 (Program::Cargo, [build, ..]) if build == "build" => {
-                    let artifact = self.root.join("target/release/deltafin");
+                    let artifact = self.root.join(format!("target/release/deltafin{EXE}"));
                     fs::create_dir_all(artifact.parent().unwrap()).unwrap();
-                    fs::write(&artifact, macho_with_loader_path(b"@loader_path/native")).unwrap();
+                    fs::write(&artifact, native_fixture()).unwrap();
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
@@ -2060,6 +2129,15 @@ mod tests {
         }
     }
 
+    /// The program as these tests spell it: `git` and `cargo` on every host,
+    /// not `git.exe` where Windows names it so.
+    fn program_name(program: Program) -> &'static str {
+        match program {
+            Program::Git => "git",
+            Program::Cargo => "cargo",
+        }
+    }
+
     fn logical_arguments<'a>(program: Program, arguments: &'a [String]) -> &'a [String] {
         let prefix = match program {
             Program::Git => 1 + GIT_CONFIGURATION.len() * 2,
@@ -2068,6 +2146,7 @@ mod tests {
         &arguments[prefix..]
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     fn macho_with_path_command(command: u32, path: &[u8]) -> Vec<u8> {
         const LC_RPATH: u32 = 0x8000_001c;
         let path_offset = if command == LC_RPATH { 12 } else { 24 };
@@ -2085,10 +2164,12 @@ mod tests {
         bytes
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     fn macho_with_loader_path(path: &[u8]) -> Vec<u8> {
         macho_with_path_command(0x8000_001c, path)
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     fn elf_with_dynamic_path(tag: i64, path: &[u8]) -> Vec<u8> {
         const HEADER_BYTES: usize = 64;
         const PROGRAM_BYTES: usize = 56;
@@ -2180,10 +2261,10 @@ mod tests {
 
     #[test]
     fn cuda_build_profile_replays_exact_native_environment_and_clears_ambient_aliases() {
-        let root = profile_hex(b"/opt/audited/libtorch");
+        let root = profile_hex(host_path("/opt/audited/libtorch").as_bytes());
         let architectures = profile_hex(b"90;100");
-        let compiler = profile_hex(b"/opt/cuda-13.0/bin/nvcc");
-        let cuda_home = profile_hex(b"/opt/cuda-13.0");
+        let compiler = profile_hex(host_path("/opt/cuda-13.0/bin/nvcc").as_bytes());
+        let cuda_home = profile_hex(host_path("/opt/cuda-13.0").as_bytes());
         let profile = BuildProfile::parse(
             Some("v2"),
             Some("explicit"),
@@ -2202,7 +2283,7 @@ mod tests {
         let set: std::collections::BTreeMap<_, _> = environment.set.into_iter().collect();
         assert_eq!(
             set.get(OsStr::new("DELTAFIN_TORCH_ROOT")),
-            Some(&OsString::from("/opt/audited/libtorch"))
+            Some(&OsString::from(host_path("/opt/audited/libtorch")))
         );
         assert_eq!(
             set.get(OsStr::new("DELTAFIN_CUDA_MOE")),
@@ -2214,7 +2295,7 @@ mod tests {
         );
         assert_eq!(
             set.get(OsStr::new("CUDA_HOME")),
-            Some(&OsString::from("/opt/cuda-13.0"))
+            Some(&OsString::from(host_path("/opt/cuda-13.0")))
         );
         assert!(!set.contains_key(OsStr::new("LIBTORCH")));
     }
@@ -2244,8 +2325,8 @@ mod tests {
 
     #[test]
     fn cuda_provider_without_nvcc_replays_only_its_toolkit_root() {
-        let root = profile_hex(b"/opt/audited/cuda-libtorch");
-        let cuda_home = profile_hex(b"/opt/cuda-13.0-runtime");
+        let root = profile_hex(host_path("/opt/audited/cuda-libtorch").as_bytes());
+        let cuda_home = profile_hex(host_path("/opt/cuda-13.0-runtime").as_bytes());
         let profile = BuildProfile::parse(
             Some("v2"),
             Some("explicit"),
@@ -2266,7 +2347,7 @@ mod tests {
         );
         assert_eq!(
             set.get(OsStr::new("CUDA_HOME")),
-            Some(&OsString::from("/opt/cuda-13.0-runtime"))
+            Some(&OsString::from(host_path("/opt/cuda-13.0-runtime")))
         );
         assert!(!set.contains_key(OsStr::new("CUDACXX")));
         assert!(!set.contains_key(OsStr::new("DELTAFIN_CUDA_ARCHITECTURES")));
@@ -2376,9 +2457,10 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn native_program_resolution_validates_target_but_preserves_multicall_symlink_name() {
-        use std::os::unix::fs::symlink;
+        use crate::sys::fs::symlink;
 
         let fixture = Fixture::new();
         let tools = fixture.root.join("proxy-tools");
@@ -2393,11 +2475,12 @@ mod tests {
 
         assert_eq!(admitted, cargo);
         assert!(admitted.is_absolute());
-        assert_ne!(admitted, fs::canonicalize(&admitted).unwrap());
-        assert_eq!(fs::canonicalize(&admitted).unwrap(), proxy);
+        assert_ne!(admitted, crate::sys::fs::canonicalize(&admitted).unwrap());
+        assert_eq!(crate::sys::fs::canonicalize(&admitted).unwrap(), proxy);
     }
 
     #[cfg(feature = "runtime")]
+    #[cfg(unix)]
     #[test]
     fn isolated_cargo_home_still_launches_the_selected_native_cargo() {
         let fixture = Fixture::new();
@@ -2460,6 +2543,8 @@ mod tests {
         assert!(runner.command_lines().is_empty());
     }
 
+    // Mach-O/ELF loader metadata: the PE spelling is tested below.
+    #[cfg(unix)]
     #[test]
     fn compiled_artifact_rejects_embedded_python_environment_rpath() {
         let fixture = Fixture::new();
@@ -2487,6 +2572,8 @@ mod tests {
         );
     }
 
+    // Mach-O/ELF loader metadata: the PE spelling is tested below.
+    #[cfg(unix)]
     #[test]
     fn compiled_artifact_rejects_macho_libpython_load_dependency() {
         let fixture = Fixture::new();
@@ -2511,6 +2598,8 @@ mod tests {
         assert!(error.to_string().contains("libPython3.14.dylib"));
     }
 
+    // Mach-O/ELF loader metadata: the PE spelling is tested below.
+    #[cfg(unix)]
     #[test]
     fn compiled_artifact_rejects_elf_libtorch_python_needed_dependency() {
         let fixture = Fixture::new();
@@ -2539,6 +2628,8 @@ mod tests {
         assert!(error.to_string().contains("libtorch_python.so.2.13"));
     }
 
+    // Mach-O/ELF loader metadata: the PE spelling is tested below.
+    #[cfg(unix)]
     #[test]
     fn python_named_search_path_is_not_mistaken_for_a_loaded_dependency() {
         let fixture = Fixture::new();
@@ -2559,6 +2650,49 @@ mod tests {
         verify_artifact(&fixture.root, &fixture.root.join("target"), &artifact).unwrap();
     }
 
+    fn write_release_artifact(fixture: &Fixture, image: Vec<u8>) -> PathBuf {
+        let target = fixture.root.join("target/release");
+        fs::create_dir_all(&target).unwrap();
+        let artifact = target.join(format!("deltafin{EXE}"));
+        fs::write(&artifact, image).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&artifact, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        artifact
+    }
+
+    #[test]
+    fn compiled_artifact_rejects_a_python_dll_import() {
+        for dll in ["python313.dll", "python3.dll", "torch_python.dll"] {
+            let fixture = Fixture::new();
+            // The interpreter's DLL is named first: the verdict must not
+            // depend on whether this host has a Windows system directory.
+            let artifact =
+                write_release_artifact(&fixture, pe_fixture(&[dll, "kernel32.dll"]));
+
+            let error = verify_artifact(&fixture.root, &fixture.root.join("target"), &artifact)
+                .unwrap_err();
+
+            assert!(error.to_string().contains("forbidden"), "{dll}: {error}");
+            assert!(error.to_string().contains(dll), "{dll}: {error}");
+        }
+    }
+
+    // Needs a real Windows system directory to resolve `kernel32.dll`.
+    #[cfg(windows)]
+    #[test]
+    fn compiled_artifact_with_only_platform_imports_is_accepted() {
+        let fixture = Fixture::new();
+        let artifact = write_release_artifact(&fixture, native_fixture());
+        verify_artifact(&fixture.root, &fixture.root.join("target"), &artifact).unwrap();
+    }
+
+    // The test executable of a runtime build imports LibTorch's DLLs, which
+    // Windows resolves from beside the executable; those are the build's
+    // concern, so only the dependency-free configuration is audited here.
+    #[cfg(not(all(windows, feature = "runtime")))]
     #[test]
     fn loader_audit_accepts_the_real_platform_test_executable() {
         let executable = std::env::current_exe().unwrap();
@@ -2787,7 +2921,7 @@ mod tests {
     #[test]
     fn interpreted_https_helper_stops_before_fetch() {
         let fixture = Fixture::new();
-        let helper = fixture.root.join("git-exec/git-remote-https");
+        let helper = fixture.root.join(format!("git-exec/git-remote-https{EXE}"));
         fs::write(&helper, b"#!/bin/sh\nexit 0\n").unwrap();
 
         let runner = FakeRunner::new(&fixture.root, FakeRelation::Behind);

@@ -22,6 +22,8 @@ Chat requests accept `reasoning_effort` (`low`, `high`, or `max`) to control K3'
 
 These OpenAI features are not implemented: non-default `stop` sequences, penalties, logit bias, logprobs, seeds, suffix/echo, tools and tool choice, structured response formats, prediction, and service tiers. Sending any of them — or any field the server does not recognize — returns an ordinary OpenAI-shaped HTTP 400 error before the model is ever entered, so a client can never believe an option worked when it didn't.
 
+A request with nothing to continue is refused the same way. `/v1/completions` needs a non-empty string `prompt` and `/v1/chat/completions` a non-empty `messages` array; an empty, missing or non-string `prompt` (streaming or not) gets an HTTP 400 `invalid_request_error` rather than a retryable 5xx, because retrying cannot help. Whitespace is text and is accepted, and a chat message with empty `content` is still a rendered chat turn. The `deltafin` command line applies the same rule to a raw `--prompt ""` before it loads the model.
+
 The server also generates one answer at a time, on purpose: a second generation request arriving mid-generation receives an OpenAI-shaped HTTP 429 ("busy"), while `/v1/models` and other non-generation requests keep responding normally.
 
 ## Text only, for now

@@ -2,22 +2,23 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::ffi::CString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Write};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
+#[cfg(not(windows))]
 use std::sync::OnceLock;
 use std::time::Duration;
 
+#[cfg(not(windows))]
 use curl::easy::{Easy, List};
 
 use crate::error::{DeltafinError, Result};
 use crate::packfile::{Digest, digest_open_file};
+use crate::sys::fs::{self as sysfs, Open};
 
 const MAX_HEADER_BYTES: u64 = 64 << 10;
 const CHUNK: usize = 8 << 20;
+#[cfg(not(windows))]
 const MINIMUM_LIBCURL_VERSION: u32 = 0x07_1c_00;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -64,25 +65,21 @@ pub(crate) struct NativeHttpsTransport;
 /// Admit and hash an exact regular file through one no-follow descriptor.
 pub(crate) fn verify_regular_digest(path: &Path, size: u64, digest: Digest) -> Result<()> {
     let before =
-        fs::symlink_metadata(path).map_err(|error| io_error("inspect pinned file", path, error))?;
+        sysfs::lstat(path).map_err(|error| io_error("inspect pinned file", path, error))?;
     if before.file_type().is_symlink() || !before.is_file() || before.len() != size {
         return Err(DeltafinError::new(format!(
             "{} is not a regular, non-symlink file of pinned size {size}",
             path.display()
         )));
     }
-    let file = OpenOptions::new()
+    let file = Open::new()
         .read(true)
-        .custom_flags(open_nofollow_cloexec())
+        .no_follow()
         .open(path)
         .map_err(|error| io_error("open pinned file without following symlinks", path, error))?;
-    let opened = file
-        .metadata()
-        .map_err(|error| io_error("stat pinned file", path, error))?;
-    if !opened.is_file()
-        || opened.len() != size
-        || (opened.dev(), opened.ino()) != (before.dev(), before.ino())
-    {
+    let opened =
+        sysfs::fstat(&file).map_err(|error| io_error("stat pinned file", path, error))?;
+    if !opened.is_file() || opened.len() != size || opened.id() != before.id() {
         return Err(DeltafinError::new(format!(
             "pinned file changed while opening: {}",
             path.display()
@@ -90,10 +87,9 @@ pub(crate) fn verify_regular_digest(path: &Path, size: u64, digest: Digest) -> R
     }
     let actual =
         digest_open_file(&file, path).map_err(|error| DeltafinError::new(error.to_string()))?;
-    let after = file
-        .metadata()
-        .map_err(|error| io_error("restat pinned file", path, error))?;
-    if (after.dev(), after.ino(), after.len()) != (opened.dev(), opened.ino(), size) {
+    let after =
+        sysfs::fstat(&file).map_err(|error| io_error("restat pinned file", path, error))?;
+    if (after.id(), after.len()) != (opened.id(), size) {
         return Err(DeltafinError::new(format!(
             "pinned file changed while hashing: {}",
             path.display()
@@ -109,71 +105,44 @@ pub(crate) fn verify_regular_digest(path: &Path, size: u64, digest: Digest) -> R
 }
 
 pub(crate) fn secure_create_new(path: &Path, mode: u32) -> Result<File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    OpenOptions::new()
+    Open::new()
         .write(true)
         .create_new(true)
         .mode(mode)
-        .custom_flags(open_nofollow_cloexec())
+        .no_follow()
         .open(path)
         .map_err(|error| io_error("create regular file safely", path, error))
 }
 
 pub(crate) fn fsync_directory(path: &Path) -> Result<()> {
     let metadata =
-        fs::symlink_metadata(path).map_err(|error| io_error("inspect directory", path, error))?;
+        sysfs::lstat(path).map_err(|error| io_error("inspect directory", path, error))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(DeltafinError::new(format!(
             "{} is not a real directory",
             path.display()
         )));
     }
-    let file = OpenOptions::new()
+    let directory = Open::new()
         .read(true)
-        .custom_flags(open_directory_flags())
+        .directory()
+        .no_follow()
         .open(path)
         .map_err(|error| io_error("open directory for fsync", path, error))?;
-    file.sync_all()
-        .map_err(|error| io_error("fsync directory", path, error))
+    sysfs::sync_directory(&directory).map_err(|error| io_error("fsync directory", path, error))
 }
 
 /// Publish a verified partial without overwrite, then durably unlink its old name.
 pub(crate) fn publish_hard_link(part: &Path, final_path: &Path, directory: &Path) -> Result<()> {
-    fs::hard_link(part, final_path)
+    sysfs::publish_without_replace(part, final_path)
         .map_err(|error| io_error("publish verified file without overwrite", final_path, error))?;
-    fs::remove_file(part)
-        .map_err(|error| io_error("remove published partial link", part, error))?;
     fsync_directory(directory)
 }
 
 /// Atomically rename without ever replacing a path that raced into place.
 pub(crate) fn rename_noreplace(source: &Path, destination: &Path) -> Result<()> {
-    let source_c = CString::new(source.as_os_str().as_bytes())
-        .map_err(|_| DeltafinError::new("rename source contains a NUL byte"))?;
-    let destination_c = CString::new(destination.as_os_str().as_bytes())
-        .map_err(|_| DeltafinError::new("rename destination contains a NUL byte"))?;
-    #[cfg(target_os = "macos")]
-    // SAFETY: both C strings are live, NUL terminated, and retained for the call.
-    let status = unsafe { renamex_np(source_c.as_ptr(), destination_c.as_ptr(), RENAME_EXCL) };
-    #[cfg(target_os = "linux")]
-    // SAFETY: both C strings are live, NUL terminated, and retained for the call.
-    let status = unsafe {
-        renameat2(
-            AT_FDCWD,
-            source_c.as_ptr(),
-            AT_FDCWD,
-            destination_c.as_ptr(),
-            RENAME_NOREPLACE,
-        )
-    };
-    if status != 0 {
-        return Err(io_error(
-            "atomically publish without replacement",
-            destination,
-            std::io::Error::last_os_error(),
-        ));
-    }
-    Ok(())
+    sysfs::rename_noreplace(source, destination)
+        .map_err(|error| io_error("atomically publish without replacement", destination, error))
 }
 
 impl Transport for NativeHttpsTransport {
@@ -218,6 +187,90 @@ struct SingleResponse {
     header_bytes: u64,
 }
 
+/// Windows speaks HTTPS through the operating system's own WinHTTP/Schannel
+/// stack (via `deltafin_sys::https`), not through a bundled or system libcurl.
+/// The header and body state machines are the ones the libcurl path uses, fed
+/// the same bytes in the same order, so every bound and every refusal is
+/// identical on both transports.
+#[cfg(windows)]
+fn perform_once(
+    request: &Request,
+    url: &str,
+    target: &mut dyn Write,
+    maximum: u64,
+    header_budget: u64,
+) -> Result<SingleResponse> {
+    use deltafin_sys::https;
+    require_absolute_https(url)?;
+    let mut request_headers = vec!["Accept-Encoding: identity".to_owned()];
+    if let Some(range) = &request.range {
+        request_headers.push(match range.end {
+            Some(end) => format!("Range: bytes={}-{end}", range.start),
+            None => format!("Range: bytes={}-", range.start),
+        });
+    }
+    let request_headers: Vec<&str> = request_headers.iter().map(String::as_str).collect();
+    let header_state = RefCell::new(HeaderState::new(header_budget));
+    let mut body_error = None;
+    let mut body_bytes = 0_u64;
+    let outcome = https::get(
+        &https::Get {
+            url,
+            user_agent: request.user_agent,
+            headers: &request_headers,
+            connect_timeout: Duration::from_secs(30),
+            stall_timeout: Duration::from_secs(120),
+            total_timeout: (request.timeout == TimeoutPolicy::Metadata)
+                .then_some(Duration::from_secs(120)),
+        },
+        &mut |head| {
+            // Hand the header block to the shared parser one line at a time,
+            // exactly as libcurl's header callback would.
+            let mut state = header_state.borrow_mut();
+            head.raw
+                .split_inclusive(|byte| *byte == b'\n')
+                .all(|line| state.receive(line))
+        },
+        &mut |data| {
+            match receive_body_chunk(
+                &header_state.borrow(),
+                target,
+                data,
+                maximum,
+                &mut body_bytes,
+            ) {
+                Ok(_) => true,
+                Err(error) => {
+                    body_error = Some(error);
+                    false
+                }
+            }
+        },
+    );
+    let state = header_state.into_inner();
+    if let Some(error) = state.error {
+        return Err(error);
+    }
+    if let Some(error) = body_error {
+        return Err(error);
+    }
+    outcome.map_err(|error| {
+        DeltafinError::new(format!(
+            "in-process HTTPS transfer failed for {url}: {error}"
+        ))
+    })?;
+    let (status, headers) = state.parsed.ok_or_else(|| {
+        DeltafinError::new("HTTPS transport returned no complete response headers")
+    })?;
+    Ok(SingleResponse {
+        status,
+        headers,
+        bytes: body_bytes,
+        header_bytes: state.raw.len() as u64,
+    })
+}
+
+#[cfg(not(windows))]
 fn perform_once(
     request: &Request,
     url: &str,
@@ -315,6 +368,7 @@ fn perform_once(
 /// build-time ELF/Mach-O checks establish library identity; these runtime
 /// capability bits establish version, TLS, and HTTPS support without launching
 /// `curl`, `curl-config`, a shell, or any other helper process.
+#[cfg(not(windows))]
 fn require_https_capable_libcurl() -> Result<()> {
     static CHECK: OnceLock<std::result::Result<(), String>> = OnceLock::new();
     let result = CHECK.get_or_init(|| {
@@ -563,6 +617,7 @@ fn has_uri_scheme(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
 }
 
+#[cfg(not(windows))]
 fn curl_option_error(operation: &str, error: curl::Error) -> DeltafinError {
     DeltafinError::new(format!("{operation}: {error}"))
 }
@@ -656,58 +711,16 @@ fn parse_final_headers(raw: &[u8]) -> Result<(u16, BTreeMap<String, String>)> {
     Ok((status, headers))
 }
 
-#[cfg(target_os = "macos")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x0100_0100
-}
-#[cfg(target_os = "linux")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x000a_0000
-}
-#[cfg(target_os = "macos")]
-const fn open_directory_flags() -> i32 {
-    0x0110_0100
-}
-#[cfg(target_os = "linux")]
-const fn open_directory_flags() -> i32 {
-    0x000b_0000
-}
-
 fn io_error(operation: &str, path: &Path, error: std::io::Error) -> DeltafinError {
     DeltafinError::new(format!("{operation} {}: {error}", path.display()))
 }
-
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    fn renamex_np(
-        old: *const std::os::raw::c_char,
-        new: *const std::os::raw::c_char,
-        flags: u32,
-    ) -> i32;
-}
-#[cfg(target_os = "macos")]
-const RENAME_EXCL: u32 = 0x0000_0004;
-
-#[cfg(target_os = "linux")]
-unsafe extern "C" {
-    fn renameat2(
-        olddirfd: i32,
-        old: *const std::os::raw::c_char,
-        newdirfd: i32,
-        new: *const std::os::raw::c_char,
-        flags: u32,
-    ) -> i32;
-}
-#[cfg(target_os = "linux")]
-const AT_FDCWD: i32 = -100;
-#[cfg(target_os = "linux")]
-const RENAME_NOREPLACE: u32 = 1;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io;
 
+    #[cfg(not(windows))]
     #[test]
     fn linked_system_curl_meets_the_https_contract() {
         require_https_capable_libcurl().unwrap();

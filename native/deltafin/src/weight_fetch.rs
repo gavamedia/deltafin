@@ -6,10 +6,8 @@
 //! after their complete coalesced source run has passed HTTP range validation.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,6 +20,7 @@ use crate::experts::{
 };
 use crate::inventory::{InventoryDocument, K3Inventory, TensorRecord, safe_tensor_path};
 use crate::k3_source;
+use crate::sys::fs::{self as sys_fs, Open};
 use crate::trusted_download::{
     ByteRange, NativeHttpsTransport, Request, ResponseMeta, TimeoutPolicy, Transport,
     fsync_directory, publish_hard_link, secure_create_new,
@@ -558,7 +557,7 @@ fn largest_sum(values: &mut [u64], maximum: usize, context: &str) -> Result<u64>
 }
 
 fn validated_partial_storage(path: &Path, maximum: u64) -> Result<PartialStorage> {
-    match fs::symlink_metadata(path) {
+    match sys_fs::lstat(path) {
         Ok(before) => {
             if before.file_type().is_symlink() || !before.is_file() || before.len() > maximum {
                 return Err(DeltafinError::new(format!(
@@ -566,13 +565,12 @@ fn validated_partial_storage(path: &Path, maximum: u64) -> Result<PartialStorage
                     path.display()
                 )));
             }
-            let file = OpenOptions::new()
+            let file = Open::new()
                 .read(true)
-                .custom_flags(open_nofollow_cloexec())
+                .no_follow()
                 .open(path)
                 .map_err(|error| io_error("open resumable partial for accounting", path, error))?;
-            let opened = file
-                .metadata()
+            let opened = sys_fs::fstat(&file)
                 .map_err(|error| io_error("stat resumable partial for accounting", path, error))?;
             if !opened.is_file()
                 || (opened.dev(), opened.ino(), opened.len())
@@ -1492,7 +1490,7 @@ fn is_expert_record(name: &str) -> bool {
 }
 
 fn exact_regular_file(path: &Path, expected: u64) -> Result<bool> {
-    match fs::symlink_metadata(path) {
+    match sys_fs::lstat(path) {
         Ok(before) => {
             if before.file_type().is_symlink() || !before.is_file() {
                 return Err(DeltafinError::new(format!(
@@ -1507,13 +1505,12 @@ fn exact_regular_file(path: &Path, expected: u64) -> Result<bool> {
                     before.len()
                 )));
             }
-            let file = OpenOptions::new()
+            let file = Open::new()
                 .read(true)
-                .custom_flags(open_nofollow_cloexec())
+                .no_follow()
                 .open(path)
                 .map_err(|error| io_error("open existing weight without symlinks", path, error))?;
-            let opened = file
-                .metadata()
+            let opened = sys_fs::fstat(&file)
                 .map_err(|error| io_error("stat opened existing weight", path, error))?;
             if !opened.is_file()
                 || (opened.dev(), opened.ino(), opened.len())
@@ -1532,7 +1529,7 @@ fn exact_regular_file(path: &Path, expected: u64) -> Result<bool> {
 }
 
 fn open_resumable(path: &Path, expected: u64) -> Result<File> {
-    match fs::symlink_metadata(path) {
+    match sys_fs::lstat(path) {
         Ok(before) => {
             if before.file_type().is_symlink() || !before.is_file() || before.len() > expected {
                 return Err(DeltafinError::new(format!(
@@ -1540,13 +1537,12 @@ fn open_resumable(path: &Path, expected: u64) -> Result<File> {
                     path.display()
                 )));
             }
-            let file = OpenOptions::new()
+            let file = Open::new()
                 .append(true)
-                .custom_flags(open_nofollow_cloexec())
+                .no_follow()
                 .open(path)
                 .map_err(|error| io_error("open resumable weight partial", path, error))?;
-            let opened = file
-                .metadata()
+            let opened = sys_fs::fstat(&file)
                 .map_err(|error| io_error("stat opened weight partial", path, error))?;
             if !opened.is_file()
                 || (opened.dev(), opened.ino(), opened.len())
@@ -1567,7 +1563,7 @@ fn open_resumable(path: &Path, expected: u64) -> Result<File> {
 }
 
 fn open_exact_regular(path: &Path, expected: u64) -> Result<File> {
-    let before = fs::symlink_metadata(path)
+    let before = sys_fs::lstat(path)
         .map_err(|error| io_error("inspect validated weight file", path, error))?;
     if before.file_type().is_symlink() || !before.is_file() || before.len() != expected {
         return Err(DeltafinError::new(format!(
@@ -1575,13 +1571,12 @@ fn open_exact_regular(path: &Path, expected: u64) -> Result<File> {
             path.display()
         )));
     }
-    let file = OpenOptions::new()
+    let file = Open::new()
         .read(true)
-        .custom_flags(open_nofollow_cloexec())
+        .no_follow()
         .open(path)
         .map_err(|error| io_error("open validated weight file", path, error))?;
-    let opened = file
-        .metadata()
+    let opened = sys_fs::fstat(&file)
         .map_err(|error| io_error("stat validated weight file", path, error))?;
     if (opened.dev(), opened.ino(), opened.len()) != (before.dev(), before.ino(), expected) {
         return Err(DeltafinError::new(format!(
@@ -1614,7 +1609,7 @@ fn publish_or_accept_race(
 }
 
 fn inspect_optional_directory(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
+    match sys_fs::lstat(path) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
         Ok(_) => Err(DeltafinError::new(format!(
             "weight destination is not a real directory: {}",
@@ -1627,7 +1622,7 @@ fn inspect_optional_directory(path: &Path) -> Result<()> {
 
 fn require_real_directory(path: &Path) -> Result<()> {
     let metadata =
-        fs::symlink_metadata(path).map_err(|error| io_error("inspect model root", path, error))?;
+        sys_fs::lstat(path).map_err(|error| io_error("inspect model root", path, error))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(DeltafinError::new(format!(
             "model root is not a real directory: {}",
@@ -1639,11 +1634,11 @@ fn require_real_directory(path: &Path) -> Result<()> {
 
 fn ensure_real_directory_tree(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent()
-        && fs::symlink_metadata(parent).is_err()
+        && sys_fs::lstat(parent).is_err()
     {
         ensure_real_directory_tree(parent)?;
     }
-    match fs::symlink_metadata(path) {
+    match sys_fs::lstat(path) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
         Ok(_) => Err(DeltafinError::new(format!(
             "refusing unsafe weight directory {}",
@@ -1665,7 +1660,7 @@ fn ensure_real_directory_tree(path: &Path) -> Result<()> {
 /// root. `f_bavail` is intentionally used instead of `f_bfree`, so quotas and
 /// blocks reserved from the current user cannot make the gate optimistic.
 fn available_disk_bytes(root: &Path) -> Result<u64> {
-    let before = fs::symlink_metadata(root)
+    let before = sys_fs::lstat(root)
         .map_err(|error| io_error("inspect model root for capacity check", root, error))?;
     if before.file_type().is_symlink() || !before.is_dir() {
         return Err(DeltafinError::new(format!(
@@ -1673,13 +1668,12 @@ fn available_disk_bytes(root: &Path) -> Result<u64> {
             root.display()
         )));
     }
-    let directory = OpenOptions::new()
+    let directory = Open::new()
         .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .directory().no_follow()
         .open(root)
         .map_err(|error| io_error("open model root for capacity check", root, error))?;
-    let opened = directory
-        .metadata()
+    let opened = sys_fs::fstat(&directory)
         .map_err(|error| io_error("stat opened capacity target", root, error))?;
     if !opened.is_dir() || (opened.dev(), opened.ino()) != (before.dev(), before.ino()) {
         return Err(DeltafinError::new(format!(
@@ -1687,28 +1681,8 @@ fn available_disk_bytes(root: &Path) -> Result<u64> {
             root.display()
         )));
     }
-    // SAFETY: `fstatvfs` initializes the entire output on success, the file
-    // descriptor remains live for the call, and the output points to writable
-    // storage of the exact libc type for this target.
-    let filesystem = unsafe {
-        let mut value = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-        if libc::fstatvfs(directory.as_raw_fd(), value.as_mut_ptr()) != 0 {
-            return Err(io_error(
-                "query model-volume capacity",
-                root,
-                std::io::Error::last_os_error(),
-            ));
-        }
-        value.assume_init()
-    };
-    let fragment_bytes = if filesystem.f_frsize == 0 {
-        filesystem.f_bsize
-    } else {
-        filesystem.f_frsize
-    };
-    u64::from(filesystem.f_bavail)
-        .checked_mul(fragment_bytes)
-        .ok_or_else(|| DeltafinError::new("filesystem available byte count overflowed"))
+    sys_fs::available_space(&directory, root)
+        .map_err(|error| io_error("query model-volume capacity", root, error))
 }
 
 /// Create or authenticate a directory-local Spotlight exclusion marker. The
@@ -1719,7 +1693,7 @@ fn ensure_spotlight_marker(directory: &Path, platform: HostPlatform) -> Result<(
         return Ok(());
     }
     let marker = directory.join(SPOTLIGHT_MARKER);
-    match fs::symlink_metadata(&marker) {
+    match sys_fs::lstat(&marker) {
         Ok(before) => {
             if before.file_type().is_symlink() || !before.is_file() {
                 return Err(DeltafinError::new(format!(
@@ -1727,9 +1701,9 @@ fn ensure_spotlight_marker(directory: &Path, platform: HostPlatform) -> Result<(
                     marker.display()
                 )));
             }
-            let file = OpenOptions::new()
+            let file = Open::new()
                 .read(true)
-                .custom_flags(open_nofollow_cloexec())
+                .no_follow()
                 .open(&marker)
                 .map_err(|error| {
                     io_error(
@@ -1738,8 +1712,7 @@ fn ensure_spotlight_marker(directory: &Path, platform: HostPlatform) -> Result<(
                         error,
                     )
                 })?;
-            let opened = file
-                .metadata()
+            let opened = sys_fs::fstat(&file)
                 .map_err(|error| io_error("stat opened Spotlight marker", &marker, error))?;
             if !opened.is_file() || (opened.dev(), opened.ino()) != (before.dev(), before.ino()) {
                 return Err(DeltafinError::new(format!(
@@ -1777,7 +1750,7 @@ fn unique_part(directory: &Path, label: &str) -> Result<PathBuf> {
     for _ in 0..128 {
         let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let path = directory.join(format!(".{label}.{}.{sequence}.part", std::process::id()));
-        if fs::symlink_metadata(&path).is_err() {
+        if sys_fs::lstat(&path).is_err() {
             return Ok(path);
         }
     }
@@ -1808,15 +1781,6 @@ fn parse_decimal(value: &str, label: &str) -> Result<u64> {
 fn checked_add(left: u64, right: u64, label: &str) -> Result<u64> {
     left.checked_add(right)
         .ok_or_else(|| DeltafinError::new(format!("{label} overflowed")))
-}
-
-#[cfg(target_os = "macos")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x0100_0100
-}
-#[cfg(target_os = "linux")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x000a_0000
 }
 
 fn io_error(operation: &str, path: &Path, error: std::io::Error) -> DeltafinError {
@@ -2014,7 +1978,7 @@ mod tests {
 
     #[test]
     fn spotlight_marker_is_macos_only_idempotent_and_rejects_symlinks() {
-        use std::os::unix::fs::symlink;
+        use crate::sys::fs::symlink;
 
         let root = TestRoot::new();
         let directory = root.0.join("weights");
@@ -2087,7 +2051,7 @@ mod tests {
 
     #[test]
     fn native_capacity_probe_uses_a_real_directory_descriptor() {
-        use std::os::unix::fs::symlink;
+        use crate::sys::fs::symlink;
 
         let root = TestRoot::new();
         let _available = available_disk_bytes(&root.0).unwrap();
@@ -2526,7 +2490,7 @@ mod tests {
 
     #[test]
     fn exact_size_regular_files_are_reused_but_symlinks_fail_closed() {
-        use std::os::unix::fs::symlink;
+        use crate::sys::fs::symlink;
         let root = TestRoot::new();
         let file = root.0.join("weight");
         fs::write(&file, [1, 2, 3]).unwrap();

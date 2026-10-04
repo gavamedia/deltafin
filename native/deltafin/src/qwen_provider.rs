@@ -1,14 +1,13 @@
 //! Lifetime-safe Rust ownership for the proposal-only Qwen provider ABI.
 
-use std::ffi::{CStr, c_char, c_void};
+use std::ffi::{CStr, c_char};
 use std::mem::size_of;
-use std::os::fd::AsRawFd;
-use std::ptr;
 use std::sync::Arc;
 
 use crate::error::{DeltafinError, Result};
 use crate::provider::{NativeProviderSession, SessionInner};
 use crate::qwen_checkpoint::{QwenCheckpoint, QwenVariant};
+use crate::sys::fs as sys_fs;
 
 const ABI_VERSION: u32 = 1;
 const BF16: u32 = 1;
@@ -137,21 +136,9 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> i32;
-    fn mmap(
-        address: *mut c_void,
-        length: usize,
-        protection: i32,
-        flags: i32,
-        file_descriptor: i32,
-        offset: i64,
-    ) -> *mut c_void;
-    fn munmap(address: *mut c_void, length: usize) -> i32;
 }
 
-struct ReadOnlyMap {
-    address: *mut c_void,
-    length: usize,
-}
+struct ReadOnlyMap(sys_fs::ReadOnlyMap);
 
 impl ReadOnlyMap {
     fn checkpoint(checkpoint: &QwenCheckpoint) -> Result<Self> {
@@ -163,21 +150,9 @@ impl ReadOnlyMap {
                 .len(),
         )
         .map_err(|_| DeltafinError::new("Qwen checkpoint length exceeds usize"))?;
-        // SAFETY: the admitted regular file is live and this is a private read-only map.
-        let address = unsafe {
-            mmap(
-                ptr::null_mut(),
-                length,
-                1,
-                2,
-                checkpoint.file().as_raw_fd(),
-                0,
-            )
-        };
-        if address as isize == -1 {
-            return Err(DeltafinError::new("mmap admitted Qwen checkpoint failed"));
-        }
-        Ok(Self { address, length })
+        sys_fs::ReadOnlyMap::map(checkpoint.file(), length)
+            .map(Self)
+            .map_err(|error| DeltafinError::new(format!("map admitted Qwen checkpoint: {error}")))
     }
 
     fn pointer(&self, offset: u64, length: u64) -> Result<*const u8> {
@@ -185,20 +160,13 @@ impl ReadOnlyMap {
             .map_err(|_| DeltafinError::new("Qwen tensor offset exceeds usize"))?;
         let length = usize::try_from(length)
             .map_err(|_| DeltafinError::new("Qwen tensor length exceeds usize"))?;
-        if offset > self.length || length > self.length - offset {
+        if offset > self.0.len() || length > self.0.len() - offset {
             return Err(DeltafinError::new(
                 "Qwen tensor range exceeds mapped checkpoint",
             ));
         }
         // SAFETY: the checked extent lies within this live mapping.
-        Ok(unsafe { self.address.cast::<u8>().add(offset) })
-    }
-}
-
-impl Drop for ReadOnlyMap {
-    fn drop(&mut self) {
-        // SAFETY: this object owns exactly this successful mapping.
-        let _ = unsafe { munmap(self.address, self.length) };
+        Ok(unsafe { self.0.address().add(offset) })
     }
 }
 

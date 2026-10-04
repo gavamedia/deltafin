@@ -65,6 +65,22 @@
 //        fused into one dispatch. Returns -6 when its optional kernel or Tier-2
 //        bindless execution is unavailable, so callers can fall back safely.
 //
+//   uint64_t k3_metal_moe_stage_begin_v1(int expert_count, const float *x)
+//   int  k3_metal_moe_stage_edges_v1(uint64_t token, const desc *experts,
+//                                    const int *edges, int count)
+//   int  k3_metal_moe_stage_finish_v1(uint64_t token, const desc *experts,
+//                                     int n, const float *w, const float *x,
+//                                     float *out)
+//   void k3_metal_moe_stage_abandon_v1(uint64_t token)
+//        Staged form of k3_metal_moe_layer for callers whose expert bytes
+//        arrive one at a time from storage: each edge's GLU/W2 runs as soon as
+//        that edge's bytes land, committed but not waited on, so the GPU works
+//        during the remaining reads. The finish call computes whatever was
+//        never staged and then performs the single weighted reduction over
+//        every edge in route order. Staging is packaging only -- it can never
+//        move a value or a reduction step -- and any inconsistency degrades to
+//        recomputing the whole layer. See tools/metal_moe_abi.h.
+//
 //   void k3_metal_drop(const uint8_t *blob)
 //        Release the cached MTLBuffer for one blob pointer.  MUST be called
 //        before the caller unmaps/frees that memory, otherwise a later call that
@@ -177,6 +193,9 @@ id<MTLComputePipelineState> g_pGluB = nil, g_pW2B = nil;
 id<MTLComputePipelineState> g_pGluPosB = nil, g_pRedPos = nil;
 id<MTLComputePipelineState> g_pW2RedPos = nil;
 id<MTLComputePipelineState> g_pGlu1 = nil, g_pW21 = nil;
+id<MTLComputePipelineState> g_pGluSlots = nil, g_pW2Slots = nil;
+id<MTLComputePipelineState> g_pGluSlotsScale4 = nil, g_pW2SlotsScale4 = nil;
+bool g_slots_ok = false;
 id<MTLComputePipelineState> g_pRed = nil;
 id<MTLComputePipelineState> g_pGluBScale4 = nil, g_pW2BScale4 = nil;
 id<MTLComputePipelineState> g_pGluPosBScale4 = nil;
@@ -185,6 +204,10 @@ id<MTLComputePipelineState> g_pGlu1Scale4 = nil, g_pW21Scale4 = nil;
 bool g_scale4_ok = false;
 
 id<MTLBuffer> g_bX = nil, g_bH = nil, g_bY = nil, g_bOut = nil, g_bW = nil, g_bArgs = nil;
+// Argument buffer and output-slice map for a staged subset of one layer's
+// edges. Separate from g_bArgs so a staged wave cannot disturb the
+// whole-layer bindless path's own argument buffer.
+id<MTLBuffer> g_bStageArgs = nil, g_bStageSlots = nil;
 // N5 uses separate pools so the default one-position allocation and execution
 // path above remain byte-for-byte untouched until explicitly requested.
 id<MTLBuffer> g_bBatchX = nil, g_bBatchH = nil, g_bBatchY = nil;
@@ -197,6 +220,9 @@ int g_cap = 0;                                                   // pool capacit
 int g_batch_edge_cap = 0, g_batch_position_cap = 0;
 int g_bindless = -1;                                             // -1 = auto
 long long g_calls = 0, g_wraps = 0, g_copies = 0;
+
+long long g_stage_begins = 0, g_stage_edges = 0;
+long long g_stage_reuses = 0, g_stage_fallbacks = 0;
 
 void seterr(const char *what, NSError *e) {
   g_err = what;
@@ -335,6 +361,45 @@ bool layout_for_id(uint32_t id, LayoutSpec *out) {
   return false;
 }
 
+// ---- staged single-position execution ("expert early drain") --------------
+// At most one staged layer is in flight. The token is monotonic, so a stale
+// token from an abandoned layer can never be mistaken for the live one, and
+// every other entry point clears the live token before it overwrites the
+// shared g_bX/g_bH/g_bY pools.
+uint64_t g_stage_token = 0;      // 0 = nothing staged
+uint64_t g_stage_next_token = 1;
+int g_stage_experts = 0;
+bool g_stage_layout_set = false;
+LayoutSpec g_stage_layout {};
+std::vector<bool> g_stage_ready;
+std::vector<float> g_stage_input;
+NSMutableArray<id<MTLCommandBuffer>> *g_stage_cbs = nil;
+// Next free entry in the staged argument/slot pools. Waves never share
+// entries, so an in-flight wave's command buffer keeps reading its own.
+int g_stage_arg_cursor = 0;
+
+// Every staged command buffer reads g_bX and writes g_bH/g_bY. Nothing may
+// rewrite those pools while one is still in flight, so abandoning a staged
+// layer drains it first. The queue is serial, so the last buffer implies all
+// of them.
+void drain_stage_locked() {
+  if (g_stage_cbs != nil && [g_stage_cbs count] != 0) {
+    [[g_stage_cbs lastObject] waitUntilCompleted];
+  }
+}
+
+void clear_stage_locked() {
+  drain_stage_locked();
+  g_stage_token = 0;
+  g_stage_experts = 0;
+  g_stage_layout_set = false;
+  g_stage_layout = LayoutSpec{};
+  g_stage_ready.clear();
+  g_stage_input.clear();
+  g_stage_arg_cursor = 0;
+  if (g_stage_cbs != nil) [g_stage_cbs removeAllObjects];
+}
+
 uint32_t read_le32(const uint8_t *p) {
   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
          ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -467,8 +532,16 @@ bool ensure_capacity(int n) {
                                         options:MTLResourceStorageModeShared];
   id<MTLBuffer> bA = [g_dev newBufferWithLength:(size_t)cap * 8
                                         options:MTLResourceStorageModeShared];
-  if (!bH || !bY || !bW || !bA) { seterr("pool alloc", nil); return false; }
-  g_bH = bH; g_bY = bY; g_bW = bW; g_bArgs = bA; g_cap = cap;
+  id<MTLBuffer> bStageA = [g_dev newBufferWithLength:(size_t)cap * 8
+                                            options:MTLResourceStorageModeShared];
+  id<MTLBuffer> bStageS = [g_dev newBufferWithLength:(size_t)cap * 4
+                                            options:MTLResourceStorageModeShared];
+  if (!bH || !bY || !bW || !bA || !bStageA || !bStageS) {
+    seterr("pool alloc", nil);
+    return false;
+  }
+  g_bH = bH; g_bY = bY; g_bW = bW; g_bArgs = bA;
+  g_bStageArgs = bStageA; g_bStageSlots = bStageS; g_cap = cap;
   return true;
 }
 
@@ -551,6 +624,10 @@ bool init_locked(const char *source_selector) {
         mkpipe_optional(lib, @"moe_w2_reduce_positions_scale4");
     g_pGlu1Scale4 = mkpipe_optional(lib, @"moe_glu_one_scale4");
     g_pW21Scale4 = mkpipe_optional(lib, @"moe_w2_one_scale4");
+    g_pGluSlots = mkpipe_optional(lib, @"moe_glu_slots");
+    g_pW2Slots = mkpipe_optional(lib, @"moe_w2_slots");
+    g_pGluSlotsScale4 = mkpipe_optional(lib, @"moe_glu_slots_scale4");
+    g_pW2SlotsScale4 = mkpipe_optional(lib, @"moe_w2_slots_scale4");
     if (!g_pGluB || !g_pW2B || !g_pGlu1 || !g_pW21 || !g_pRed) return false;
     if ([g_pGluB threadExecutionWidth] != 32) { seterr("simd width != 32", nil); return false; }
     g_scale4_ok =
@@ -573,6 +650,12 @@ bool init_locked(const char *source_selector) {
       const char *env = getenv("K3_METAL_BINDLESS");
       g_bindless = env ? (atoi(env) != 0 && tier2) : (tier2 ? 1 : 0);
     }
+    // A staged subset can use one dispatch per stage only where the argument
+    // buffer works; otherwise it falls back to a dispatch per expert, which is
+    // correct but pays far more submission overhead per staged expert.
+    g_slots_ok = g_bindless == 1 && g_pGluSlots != nil && g_pW2Slots != nil &&
+                 (!g_scale4_ok ||
+                  (g_pGluSlotsScale4 != nil && g_pW2SlotsScale4 != nil));
     g_ok = true;
   }
   return g_ok;
@@ -613,6 +696,124 @@ id<MTLBuffer> wrap_blob(const uint8_t *p, int slot,
   memcpy([b contents], p, layout.span);
   g_copies++;
   return b;
+}
+
+// Encode GLU + W2 for an arbitrary subset of a layer's edges into one command
+// buffer, writing the same per-edge h/y slices the whole-layer path writes.
+// Prefers one dispatch per stage over the whole subset via the slot-mapped
+// argument-buffer kernels, and falls back to a dispatch per expert where those
+// are unavailable; both forms run the identical glu_rows/w2_rows over the
+// identical bytes into the identical slice. Every edge is an independent
+// writer of its own slice, so which edges share a dispatch or a command
+// buffer -- and in what order those buffers are submitted -- cannot change any
+// value produced here. The weighted reduction is deliberately not encoded: it
+// belongs to the finish call, where it runs once over all edges in canonical
+// route order.
+//
+// Only staged execution calls this, so the argument/slot cursor it advances is
+// always inside one begin/finish pair.
+bool encode_expert_edges_locked(id<MTLCommandBuffer> cb,
+                                const uint8_t *const *blobs, const int *edges,
+                                int count, const LayoutSpec &layout,
+                                int n_experts) {
+  id<MTLComputePipelineState> pGlu = layout.scale4 ? g_pGlu1Scale4 : g_pGlu1;
+  id<MTLComputePipelineState> pW2 = layout.scale4 ? g_pW21Scale4 : g_pW21;
+  if (!pGlu || !pW2) {
+    g_err = "per-expert Metal pipelines are unavailable";
+    return false;
+  }
+  std::vector<id<MTLBuffer>> bufs((size_t)count);
+  for (int i = 0; i < count; ++i) {
+    if (edges[i] < 0 || edges[i] >= n_experts || !blobs[i]) {
+      g_err = "staged Metal expert edge is outside its layer";
+      return false;
+    }
+    bufs[(size_t)i] = wrap_blob(blobs[i], edges[i], layout);
+    if (!bufs[(size_t)i]) return false;
+  }
+  MoeDims D = dims_for(layout, (uint32_t)n_experts);
+
+  id<MTLComputePipelineState> pGluSet =
+      layout.scale4 ? g_pGluSlotsScale4 : g_pGluSlots;
+  id<MTLComputePipelineState> pW2Set =
+      layout.scale4 ? g_pW2SlotsScale4 : g_pW2Slots;
+  if (g_slots_ok && pGluSet && pW2Set &&
+      g_stage_arg_cursor + count <= g_cap) {
+    // One dispatch per stage over the whole wave. Each row still resolves to
+    // the same (expert bytes, output slice) pair the per-expert form would
+    // give it; grouping them only stops paying a submission per expert.
+    //
+    // Each wave takes a fresh span of the argument/slot buffers rather than
+    // rewriting the front: an earlier wave's command buffer is deliberately
+    // still in flight and is still reading its own entries. A layer has at
+    // most one entry per edge, so the cursor cannot outrun the pools.
+    const int base = g_stage_arg_cursor;
+    uint64_t *addr = (uint64_t *)[g_bStageArgs contents];
+    uint32_t *slots = (uint32_t *)[g_bStageSlots contents];
+    for (int i = 0; i < count; ++i) {
+      addr[base + i] = [bufs[(size_t)i] gpuAddress];
+      slots[base + i] = (uint32_t)edges[i];
+    }
+    g_stage_arg_cursor = base + count;
+    const NSUInteger arg_offset = (NSUInteger)base * 8;
+    const NSUInteger slot_offset = (NSUInteger)base * 4;
+    // Serial encoder: W2 reads the h slices GLU just wrote, and the implicit
+    // barrier between dispatches in a serial encoder is exactly that ordering.
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    for (int i = 0; i < count; ++i) {
+      [enc useResource:bufs[(size_t)i] usage:MTLResourceUsageRead];
+    }
+    D.nt = (uint32_t)count * K3_I;
+    [enc setComputePipelineState:pGluSet];
+    [enc setBuffer:g_bStageArgs offset:arg_offset atIndex:0];
+    [enc setBuffer:g_bX offset:0 atIndex:1];
+    [enc setBuffer:g_bH offset:0 atIndex:2];
+    [enc setBytes:&D length:sizeof D atIndex:3];
+    [enc setBuffer:g_bStageSlots offset:slot_offset atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake((D.nt + ROWS_PER_TG - 1) / ROWS_PER_TG, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(TG_THREADS, 1, 1)];
+
+    D.nt = (uint32_t)count * K3_H;
+    [enc setComputePipelineState:pW2Set];
+    [enc setBuffer:g_bStageArgs offset:arg_offset atIndex:0];
+    [enc setBuffer:g_bH offset:0 atIndex:1];
+    [enc setBuffer:g_bY offset:0 atIndex:2];
+    [enc setBytes:&D length:sizeof D atIndex:3];
+    [enc setBuffer:g_bStageSlots offset:slot_offset atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake((D.nt + ROWS_PER_TG - 1) / ROWS_PER_TG, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(TG_THREADS, 1, 1)];
+    [enc endEncoding];
+    return true;
+  }
+
+  id<MTLComputeCommandEncoder> e1 =
+      [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+  [e1 setComputePipelineState:pGlu];
+  [e1 setBuffer:g_bX offset:0 atIndex:1];
+  [e1 setBuffer:g_bH offset:0 atIndex:2];
+  for (int i = 0; i < count; ++i) {
+    D.expert = (uint32_t)edges[i]; D.nt = K3_I;
+    [e1 setBuffer:bufs[(size_t)i] offset:0 atIndex:0];
+    [e1 setBytes:&D length:sizeof D atIndex:3];
+    [e1 dispatchThreadgroups:MTLSizeMake((K3_I + ROWS_PER_TG - 1) / ROWS_PER_TG, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(TG_THREADS, 1, 1)];
+  }
+  [e1 endEncoding];                       // encoder boundary == full barrier
+
+  id<MTLComputeCommandEncoder> e2 =
+      [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+  [e2 setComputePipelineState:pW2];
+  [e2 setBuffer:g_bH offset:0 atIndex:1];
+  [e2 setBuffer:g_bY offset:0 atIndex:2];
+  for (int i = 0; i < count; ++i) {
+    D.expert = (uint32_t)edges[i]; D.nt = K3_H;
+    [e2 setBuffer:bufs[(size_t)i] offset:0 atIndex:0];
+    [e2 setBytes:&D length:sizeof D atIndex:3];
+    [e2 dispatchThreadgroups:MTLSizeMake((K3_H + ROWS_PER_TG - 1) / ROWS_PER_TG, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(TG_THREADS, 1, 1)];
+  }
+  [e2 endEncoding];
+  return true;
 }
 
 }  // namespace
@@ -694,6 +895,9 @@ int k3_metal_set_mode(int bindless) {
 
 void k3_metal_drop(const uint8_t *blob) {
   std::lock_guard<std::mutex> lk(g_mu);
+  // Dropping a wrap is the caller's signal that it may unmap those bytes, so
+  // no staged command buffer may still be reading them.
+  clear_stage_locked();
   NSNumber *key = @((unsigned long long)(uintptr_t)blob);
   if (g_cache) [g_cache removeObjectForKey:key];
   if (g_cache_meta) [g_cache_meta removeObjectForKey:key];
@@ -701,6 +905,7 @@ void k3_metal_drop(const uint8_t *blob) {
 
 void k3_metal_flush(void) {
   std::lock_guard<std::mutex> lk(g_mu);
+  clear_stage_locked();
   if (g_cache) [g_cache removeAllObjects];
   if (g_cache_meta) [g_cache_meta removeAllObjects];
   if (g_scratch) [g_scratch removeAllObjects];
@@ -710,6 +915,9 @@ static int k3_metal_moe_layer_locked(
                        const uint8_t *const *expert_blobs, int n_experts,
                        const float *weights, const float *x, float *out,
                        const LayoutSpec &layout) {
+  // This call owns g_bX/g_bH/g_bY outright. Retire any staged layer -- and
+  // wait out its in-flight command buffers -- before overwriting them.
+  clear_stage_locked();
   if (!out || !x) return -2;
   if (n_experts < 0) return -2;
   if (n_experts == 0) { memset(out, 0, K3_H * 4); return 0; }
@@ -847,6 +1055,194 @@ int k3_metal_moe_layer_desc_v1(
   return k3_metal_moe_layer_locked(
       blobs.empty() ? nullptr : blobs.data(), n_experts,
       weights, x, out, layout);
+}
+
+uint64_t k3_metal_moe_stage_begin_v1(int expert_count, const float *x) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  if (!init_locked(nullptr)) return 0;
+  if (expert_count <= 0 || !x) return 0;
+  // Growing the pools would move the very storage a staged layer accumulates
+  // into, so the whole layer's capacity is proven here, before it starts.
+  if (!ensure_capacity(expert_count)) return 0;
+  clear_stage_locked();
+  @autoreleasepool {
+    memcpy([g_bX contents], x, K3_H * 4);
+  }
+  g_stage_token = g_stage_next_token++;
+  g_stage_experts = expert_count;
+  g_stage_layout_set = false;
+  g_stage_ready.assign((size_t)expert_count, false);
+  g_stage_input.assign(x, x + K3_H);
+  g_stage_arg_cursor = 0;
+  if (g_stage_cbs == nil) g_stage_cbs = [NSMutableArray array];
+  [g_stage_cbs removeAllObjects];
+  g_stage_begins++;
+  return g_stage_token;
+}
+
+int k3_metal_moe_stage_edges_v1(uint64_t token,
+                                const K3MetalExpertDescriptorV1 *experts,
+                                const int *edges, int count) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  if (!init_locked(nullptr)) return -1;
+  if (token == 0 || token != g_stage_token) return -8;
+  if (count <= 0 || !experts || !edges) return -2;
+  std::vector<const uint8_t *> blobs;
+  LayoutSpec layout {};
+  if (!descriptors_locked(experts, count, &blobs, &layout)) return -7;
+  if (!g_stage_layout_set) {
+    g_stage_layout = layout;
+    g_stage_layout_set = true;
+  } else if (g_stage_layout.id != layout.id) {
+    g_err = "staged Metal expert layouts changed inside one layer";
+    return -7;
+  }
+  for (int i = 0; i < count; ++i) {
+    const int edge = edges[i];
+    if (edge < 0 || edge >= g_stage_experts ||
+        g_stage_ready[(size_t)edge]) {
+      g_err = "staged Metal expert edge is out of range or already staged";
+      return -2;
+    }
+    for (int j = 0; j < i; ++j) {
+      if (edges[j] == edge) {
+        g_err = "staged Metal expert edge repeats inside one call";
+        return -2;
+      }
+    }
+  }
+  @autoreleasepool {
+    id<MTLCommandBuffer> cb = [g_q commandBuffer];
+    if (!cb) { g_err = "staged Metal command buffer allocation failed"; return -3; }
+    if (!encode_expert_edges_locked(cb, blobs.data(), edges, count,
+                                    layout, g_stage_experts)) {
+      return -4;
+    }
+    // Commit without waiting: the GPU runs these experts while the caller
+    // goes back to reading the ones that have not landed yet.
+    [cb commit];
+    [g_stage_cbs addObject:cb];
+  }
+  for (int i = 0; i < count; ++i) g_stage_ready[(size_t)edges[i]] = true;
+  g_stage_edges += count;
+  return 0;
+}
+
+int k3_metal_moe_stage_finish_v1(uint64_t token,
+                                 const K3MetalExpertDescriptorV1 *experts,
+                                 int n_experts, const float *weights,
+                                 const float *x, float *out) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  if (!init_locked(nullptr)) return -1;
+  if (!out || !x || !weights || n_experts <= 0) { clear_stage_locked(); return -2; }
+  std::vector<const uint8_t *> blobs;
+  LayoutSpec layout {};
+  if (!descriptors_locked(experts, n_experts, &blobs, &layout)) {
+    clear_stage_locked();
+    return -7;
+  }
+  if (!ensure_capacity(n_experts)) { clear_stage_locked(); return -3; }
+
+  // Decide whether the staged slots may be trusted. A stale token, a changed
+  // layer shape or layout, a different activation row, or a command buffer
+  // that failed all degrade to recomputing every edge -- so this call's output
+  // is the same whether or not anything was ever staged.
+  bool reuse = token != 0 && token == g_stage_token &&
+               n_experts == g_stage_experts && g_stage_layout_set &&
+               g_stage_layout.id == layout.id &&
+               g_stage_input.size() == (size_t)K3_H &&
+               memcmp(g_stage_input.data(), x, K3_H * 4) == 0;
+  if (reuse && g_stage_cbs != nil) {
+    for (id<MTLCommandBuffer> staged in g_stage_cbs) {
+      [staged waitUntilCompleted];
+      if ([staged status] == MTLCommandBufferStatusError) {
+        seterr("staged command buffer", [staged error]);
+        reuse = false;
+        break;
+      }
+    }
+  }
+  if (!reuse) {
+    // Nothing staged survives. Hand the whole layer to the established call,
+    // which drains any in-flight staging and encodes every expert through the
+    // batched/bindless form -- markedly better GPU occupancy than replaying
+    // per-edge dispatches for a layer that gained nothing from staging.
+    g_stage_fallbacks++;
+    return k3_metal_moe_layer_locked(blobs.empty() ? nullptr : blobs.data(),
+                                     n_experts, weights, x, out, layout);
+  }
+
+  int status = 0;
+  @autoreleasepool {
+    memcpy([g_bX contents], x, K3_H * 4);
+    memcpy([g_bW contents], weights, (size_t)n_experts * 4);
+    std::vector<int> pending;
+    std::vector<const uint8_t *> pending_blobs;
+    pending.reserve((size_t)n_experts);
+    pending_blobs.reserve((size_t)n_experts);
+    for (int edge = 0; edge < n_experts; ++edge) {
+      if (reuse && g_stage_ready[(size_t)edge]) continue;
+      pending.push_back(edge);
+      pending_blobs.push_back(blobs[(size_t)edge]);
+    }
+    id<MTLCommandBuffer> cb = [g_q commandBuffer];
+    if (!cb) { clear_stage_locked(); return -3; }
+    if (!pending.empty() &&
+        !encode_expert_edges_locked(cb, pending_blobs.data(), pending.data(),
+                                    (int)pending.size(), layout, n_experts)) {
+      clear_stage_locked();
+      return -4;
+    }
+    // out[i] = sum_e weights[e] * y[e*H + i], summed in route-edge order by
+    // the same kernel the unstaged path uses. This is the only place a
+    // per-expert contribution ever enters the layer's running sum.
+    MoeDims D = dims_for(layout, (uint32_t)n_experts);
+    id<MTLComputeCommandEncoder> e3 = [cb computeCommandEncoder];
+    [e3 setComputePipelineState:g_pRed];
+    [e3 setBuffer:g_bY offset:0 atIndex:0];
+    [e3 setBuffer:g_bW offset:0 atIndex:1];
+    [e3 setBuffer:g_bOut offset:0 atIndex:2];
+    [e3 setBytes:&D length:sizeof D atIndex:3];
+    [e3 dispatchThreadgroups:MTLSizeMake((K3_H + 255) / 256, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [e3 endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    if ([cb status] == MTLCommandBufferStatusError) {
+      seterr("command buffer", [cb error]);
+      status = -5;
+    } else {
+      memcpy(out, [g_bOut contents], K3_H * 4);
+      g_calls++;
+      g_stage_reuses++;
+    }
+  }
+  // The staged command buffers were already waited on above when they were
+  // reused, and drained before recomputation when they were not.
+  g_stage_token = 0;
+  g_stage_experts = 0;
+  g_stage_layout_set = false;
+  g_stage_layout = LayoutSpec{};
+  g_stage_ready.clear();
+  g_stage_input.clear();
+  g_stage_arg_cursor = 0;
+  if (g_stage_cbs != nil) [g_stage_cbs removeAllObjects];
+  return status;
+}
+
+void k3_metal_moe_stage_abandon_v1(uint64_t token) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  if (!g_ok || token == 0 || token != g_stage_token) return;
+  clear_stage_locked();
+}
+
+void k3_metal_moe_stage_stats_v1(long long *four) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  if (!four) return;
+  four[0] = g_stage_begins;
+  four[1] = g_stage_edges;
+  four[2] = g_stage_reuses;
+  four[3] = g_stage_fallbacks;
 }
 
 static int k3_metal_moe_positions_locked(

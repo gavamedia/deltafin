@@ -16,11 +16,11 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::sys::fs::{FileExt, Open};
 
 pub const MAGIC: [u8; 8] = *b"DFSPINE\0";
 pub const VERSION_MAJOR: u16 = 1;
@@ -2224,15 +2224,13 @@ fn write_zeroes(
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        File::open(path)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| PackError::io("fsync directory", path, error))?;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
+    let directory = Open::new()
+        .read(true)
+        .directory()
+        .open(path)
+        .map_err(|error| PackError::io("open directory for fsync", path, error))?;
+    crate::sys::fs::sync_directory(&directory)
+        .map_err(|error| PackError::io("fsync directory", path, error))
 }
 
 fn destination_parent(path: &Path) -> &Path {
@@ -2430,7 +2428,6 @@ pub fn digest_file(path: impl AsRef<Path>) -> Result<Digest> {
 /// path or disturbing its shared file cursor. Native checkpoint loaders use
 /// this after `O_NOFOLLOW`/inode/length validation so integrity never races a
 /// second pathname lookup.
-#[cfg(unix)]
 pub(crate) fn digest_open_file(file: &File, path: &Path) -> Result<Digest> {
     let length = file
         .metadata()

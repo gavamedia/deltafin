@@ -11,17 +11,18 @@
 #![cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 
 use std::collections::BTreeSet;
-use std::ffi::{CString, OsStr};
+use std::ffi::OsStr;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+#[cfg(not(windows))]
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(not(windows))]
 use curl::easy::{Easy, List};
+use deltafin_sys::fs::{self as sysfs, Open};
 use sha2::{Digest, Sha256};
 use zip::{CompressionMethod, ZipArchive};
 
@@ -32,8 +33,10 @@ const FILES_MANIFEST_FORMAT: &str = "deltafin-native-files-v1";
 const FILES_MANIFEST_NAME: &str = ".deltafin-files";
 const TORCH_CPP_API_HEADER: &str = "torch/include/torch/csrc/api/include/torch/torch.h";
 const MAX_FILES_MANIFEST_BYTES: u64 = 8 << 20;
+#[cfg_attr(windows, allow(dead_code))]
 const MAX_DOWNLOAD_HEADERS: u64 = 64 << 10;
 const COPY_BUFFER: usize = 1 << 20;
+#[cfg(not(windows))]
 const MINIMUM_LIBCURL_VERSION: u32 = 0x07_1c_00;
 
 /// Bounds are deliberately above the official CPU wheels but far below an
@@ -86,6 +89,7 @@ pub enum PlatformTarget {
     MacosArm64,
     LinuxX86_64,
     LinuxAarch64,
+    WindowsX86_64,
 }
 
 impl PlatformTarget {
@@ -94,16 +98,36 @@ impl PlatformTarget {
             ("macos", "aarch64") => Ok(Self::MacosArm64),
             ("linux", "x86_64") => Ok(Self::LinuxX86_64),
             ("linux", "aarch64") => Ok(Self::LinuxAarch64),
+            ("windows", "x86_64") => Ok(Self::WindowsX86_64),
             (os, arch) => Err(BootstrapError::new(format!(
                 "PyTorch {PYTORCH_VERSION} native bootstrap does not have a pinned CPU artifact for {os}/{arch}"
             ))),
         }
     }
 
-    fn library_suffix(self) -> &'static str {
+    /// The files, under `torch/lib`, without which the runtime cannot be
+    /// linked or loaded: the shared libraries on Unix, and on Windows each
+    /// DLL together with the import library a linker needs to name it.
+    fn required_libraries(self) -> Vec<String> {
+        let components = ["torch", "torch_cpu", "c10"];
         match self {
-            Self::MacosArm64 => "dylib",
-            Self::LinuxX86_64 | Self::LinuxAarch64 => "so",
+            Self::MacosArm64 => components
+                .iter()
+                .map(|name| format!("torch/lib/lib{name}.dylib"))
+                .collect(),
+            Self::LinuxX86_64 | Self::LinuxAarch64 => components
+                .iter()
+                .map(|name| format!("torch/lib/lib{name}.so"))
+                .collect(),
+            Self::WindowsX86_64 => components
+                .iter()
+                .flat_map(|name| {
+                    [
+                        format!("torch/lib/{name}.dll"),
+                        format!("torch/lib/{name}.lib"),
+                    ]
+                })
+                .collect(),
         }
     }
 
@@ -112,6 +136,7 @@ impl PlatformTarget {
             Self::MacosArm64 => "macos-arm64",
             Self::LinuxX86_64 => "linux-x86_64",
             Self::LinuxAarch64 => "linux-aarch64",
+            Self::WindowsX86_64 => "windows-x86_64",
         }
     }
 }
@@ -156,11 +181,25 @@ const LINUX_AARCH64: Artifact = Artifact {
     files_manifest_sha256: "bf0e29d0ea3dba35bc8e259d82f4d4b0e3b76e97501a5d467636f1685b510a1a",
 };
 
+// Windows x86-64's pin is the same kind of value from the same index. Its
+// files manifest was recorded from the first authenticated extraction of this
+// exact (size- and SHA-256-pinned) wheel on a Windows runner: the manifest is a
+// pure function of the wheel's bytes and this crate's selection rules, so it
+// pins both, and any later extraction that disagrees is refused.
+const WINDOWS_X86_64: Artifact = Artifact {
+    target: PlatformTarget::WindowsX86_64,
+    url: "https://download-r2.pytorch.org/whl/cpu/torch-2.13.0%2Bcpu-cp314-cp314-win_amd64.whl",
+    sha256: "e2e5134decf00e218da62318f3dc5df156231d367871918e91eba95ab0ad43ab",
+    size: 123_860_488,
+    files_manifest_sha256: "bb99d3477922be46f64154bfff21f53051c4c0b9d033fa5f91fc20393ec87432",
+};
+
 fn artifact_for(target: PlatformTarget) -> &'static Artifact {
     match target {
         PlatformTarget::MacosArm64 => &MACOS_ARM64,
         PlatformTarget::LinuxX86_64 => &LINUX_X86_64,
         PlatformTarget::LinuxAarch64 => &LINUX_AARCH64,
+        PlatformTarget::WindowsX86_64 => &WINDOWS_X86_64,
     }
 }
 
@@ -299,13 +338,14 @@ fn prepare_toolchain_directory(repository: &Path) -> Result<PathBuf> {
 }
 
 fn ensure_child_directory(parent: &Path, name: &OsStr, mode: u32) -> Result<PathBuf> {
-    if name.as_bytes().is_empty() || name.as_bytes().contains(&b'/') {
+    let bytes = name.as_encoded_bytes();
+    if bytes.is_empty() || bytes.iter().any(|byte| matches!(byte, b'/' | b'\\')) {
         return Err(BootstrapError::new("unsafe toolchain directory component"));
     }
     let path = parent.join(name);
     match fs::create_dir(&path) {
         Ok(()) => {
-            fs::set_permissions(&path, fs::Permissions::from_mode(mode))
+            sysfs::set_mode(&path, mode)
                 .map_err(|error| io_error("set toolchain directory permissions", &path, error))?;
             fsync_directory(parent)?;
         }
@@ -313,11 +353,10 @@ fn ensure_child_directory(parent: &Path, name: &OsStr, mode: u32) -> Result<Path
         Err(error) => return Err(io_error("create toolchain directory", &path, error)),
     }
     require_real_directory(&path)?;
-    let permissions = fs::symlink_metadata(&path)
+    let shared_writable = sysfs::lstat(&path)
         .map_err(|error| io_error("inspect toolchain directory permissions", &path, error))?
-        .permissions()
-        .mode();
-    if permissions & 0o022 != 0 {
+        .is_shared_writable();
+    if shared_writable {
         return Err(BootstrapError::new(format!(
             "toolchain directory {} is group/world writable; refusing a raceable install root",
             path.display()
@@ -353,6 +392,90 @@ fn validate_artifact(artifact: &Artifact) -> Result<()> {
     Ok(())
 }
 
+/// Windows downloads through the operating system's own WinHTTP/Schannel
+/// stack, with the same bounds the libcurl path applies: no redirects, an
+/// exact size, an exact SHA-256, bounded headers and a bounded body.
+#[cfg(windows)]
+fn download_exact(artifact: &Artifact, target: &Path, mut file: File) -> Result<()> {
+    use deltafin_sys::https;
+    let mut digest = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut status = 0_u16;
+    let mut header_error: Option<BootstrapError> = None;
+    let mut body_error: Option<BootstrapError> = None;
+    let outcome = https::get(
+        &https::Get {
+            url: artifact.url,
+            user_agent: "deltafin-bootstrap/0.1",
+            headers: &["Accept-Encoding: identity"],
+            connect_timeout: Duration::from_secs(30),
+            stall_timeout: Duration::from_secs(120),
+            total_timeout: None,
+        },
+        &mut |head| {
+            status = head.status;
+            if head.raw.len() as u64 > MAX_DOWNLOAD_HEADERS {
+                header_error = Some(BootstrapError::new(
+                    "PyTorch download headers exceeded 64 KiB",
+                ));
+                return false;
+            }
+            // Anything but 200 carries no wheel; stop before reading it.
+            status == 200
+        },
+        &mut |data| {
+            let next = match bytes.checked_add(data.len() as u64) {
+                Some(next) if next <= artifact.size => next,
+                _ => {
+                    body_error = Some(BootstrapError::new(format!(
+                        "PyTorch response exceeded its exact {}-byte pin",
+                        artifact.size
+                    )));
+                    return false;
+                }
+            };
+            if let Err(error) = file.write_all(data) {
+                body_error = Some(io_error("write pinned PyTorch wheel", target, error));
+                return false;
+            }
+            digest.update(data);
+            bytes = next;
+            true
+        },
+    );
+    if let Some(error) = header_error {
+        return Err(error);
+    }
+    if let Some(error) = body_error {
+        return Err(error);
+    }
+    outcome.map_err(|error| {
+        BootstrapError::new(format!("download pinned PyTorch wheel: {error}"))
+    })?;
+    if status != 200 {
+        return Err(BootstrapError::new(format!(
+            "pinned PyTorch server returned HTTP {status}; redirects are intentionally not followed"
+        )));
+    }
+    if bytes != artifact.size {
+        return Err(BootstrapError::new(format!(
+            "pinned PyTorch wheel was {bytes} bytes; expected exactly {}",
+            artifact.size
+        )));
+    }
+    let actual = format_digest(digest.finalize().as_slice());
+    if actual != artifact.sha256 {
+        return Err(BootstrapError::new(format!(
+            "pinned PyTorch wheel SHA-256 mismatch: got {actual}, expected {}",
+            artifact.sha256
+        )));
+    }
+    file.sync_all()
+        .map_err(|error| io_error("fsync pinned PyTorch wheel", target, error))?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
 fn download_exact(artifact: &Artifact, target: &Path, mut file: File) -> Result<()> {
     require_https_capable_libcurl()?;
     let mut easy = Easy::new();
@@ -463,6 +586,7 @@ fn download_exact(artifact: &Artifact, target: &Path, mut file: File) -> Result<
 /// direct native build verifies the DSO/Mach-O selection; only libcurl can
 /// authoritatively report whether that selected library supplies TLS and the
 /// HTTPS protocol at runtime.
+#[cfg(not(windows))]
 fn require_https_capable_libcurl() -> Result<()> {
     static CHECK: OnceLock<std::result::Result<(), String>> = OnceLock::new();
     let result = CHECK.get_or_init(|| {
@@ -675,10 +799,7 @@ fn extract_native_layout(
         output
             .sync_all()
             .map_err(|error| io_error("fsync extracted native runtime file", &target, error))?;
-        fs::set_permissions(
-            &target,
-            fs::Permissions::from_mode(if plan.executable { 0o755 } else { 0o644 }),
-        )
+        sysfs::set_mode(&target, if plan.executable { 0o755 } else { 0o644 })
         .map_err(|error| io_error("set extracted native runtime permissions", &target, error))?;
         manifest_entries.push(ManifestEntry {
             relative: plan.relative,
@@ -694,8 +815,7 @@ fn extract_native_layout(
 fn preflight_zip_metadata(file: &mut File, path: &Path, limits: ArchiveLimits) -> Result<()> {
     const EOCD_SIZE: usize = 22;
     const MAX_COMMENT: usize = u16::MAX as usize;
-    let metadata = file
-        .metadata()
+    let metadata = sysfs::fstat(&file)
         .map_err(|error| io_error("stat wheel before ZIP preflight", path, error))?;
     if !metadata.is_file()
         || metadata.len() < EOCD_SIZE as u64
@@ -836,8 +956,14 @@ fn validate_archive_path(
     Ok(path)
 }
 
+/// A path spelled one way on every host: components joined by `/`, folded to
+/// lower case. Manifest entries are written with `/` while a directory walk
+/// yields the platform's separator, and both must land on the same key.
 fn portable_path_key(path: &Path) -> String {
-    path.as_os_str().to_string_lossy().to_ascii_lowercase()
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn select_native_file(path: &Path) -> bool {
@@ -854,7 +980,7 @@ fn select_native_file(path: &Path) -> bool {
         }
         if components[1] == "lib" {
             let filename = components.last().copied().unwrap_or_default();
-            return !filename.to_ascii_lowercase().starts_with("libtorch_python");
+            return !is_python_binding_library(filename);
         }
     }
     if components.len() >= 2
@@ -866,6 +992,13 @@ fn select_native_file(path: &Path) -> bool {
                 && matches!(components[1], "LICENSE" | "METADATA" | "WHEEL"));
     }
     false
+}
+
+/// The Python bindings' library, which this runtime never takes: `libtorch_python.*`
+/// on Unix and `torch_python.dll`/`.lib` on Windows.
+fn is_python_binding_library(filename: &str) -> bool {
+    let lower = filename.to_ascii_lowercase();
+    lower.starts_with("libtorch_python") || lower.starts_with("torch_python")
 }
 
 fn is_executable_native_file(path: &Path, unix_mode: Option<u32>) -> bool {
@@ -886,51 +1019,38 @@ fn is_executable_native_file(path: &Path, unix_mode: Option<u32>) -> bool {
 struct RequiredLayout {
     header: bool,
     config: bool,
-    torch: bool,
-    torch_cpu: bool,
-    c10: bool,
+    libraries: BTreeSet<String>,
 }
 
 impl RequiredLayout {
     fn observe(&mut self, path: &Path, target: PlatformTarget) {
-        let value = path.to_string_lossy();
+        // Archive paths are '/'-separated whatever the host; compare them
+        // exactly, so a wheel that spells a required path in another case
+        // does not count as having it.
+        let value = path
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
         self.header |= value == TORCH_CPP_API_HEADER;
         self.config |= value == "torch/share/cmake/Torch/TorchConfig.cmake";
-        let suffix = target.library_suffix();
-        self.torch |= value == format!("torch/lib/libtorch.{suffix}");
-        self.torch_cpu |= value == format!("torch/lib/libtorch_cpu.{suffix}");
-        self.c10 |= value == format!("torch/lib/libc10.{suffix}");
+        if target.required_libraries().contains(&value) {
+            self.libraries.insert(value);
+        }
     }
 
     fn finish(&self, target: PlatformTarget) -> Result<()> {
         let mut missing = Vec::new();
         if !self.header {
-            missing.push(TORCH_CPP_API_HEADER);
+            missing.push(TORCH_CPP_API_HEADER.to_owned());
         }
         if !self.config {
-            missing.push("torch/share/cmake/Torch/TorchConfig.cmake");
+            missing.push("torch/share/cmake/Torch/TorchConfig.cmake".to_owned());
         }
-        let suffix = target.library_suffix();
-        if !self.torch {
-            missing.push(if suffix == "dylib" {
-                "torch/lib/libtorch.dylib"
-            } else {
-                "torch/lib/libtorch.so"
-            });
-        }
-        if !self.torch_cpu {
-            missing.push(if suffix == "dylib" {
-                "torch/lib/libtorch_cpu.dylib"
-            } else {
-                "torch/lib/libtorch_cpu.so"
-            });
-        }
-        if !self.c10 {
-            missing.push(if suffix == "dylib" {
-                "torch/lib/libc10.dylib"
-            } else {
-                "torch/lib/libc10.so"
-            });
+        for required in target.required_libraries() {
+            if !self.libraries.contains(&required) {
+                missing.push(required);
+            }
         }
         if !missing.is_empty() {
             return Err(BootstrapError::new(format!(
@@ -957,7 +1077,7 @@ fn create_secure_directories(root: &Path, parent: &Path) -> Result<()> {
         };
         current.push(component);
         match fs::create_dir(&current) {
-            Ok(()) => fs::set_permissions(&current, fs::Permissions::from_mode(0o700))
+            Ok(()) => sysfs::set_mode(&current, 0o700)
                 .map_err(|error| io_error("set staging directory permissions", &current, error))?,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 require_real_directory(&current)?;
@@ -1039,12 +1159,7 @@ fn ensure_no_python_library(root: &Path) -> Result<()> {
             }
             if file_type.is_dir() {
                 pending.push(entry.path());
-            } else if entry
-                .file_name()
-                .to_string_lossy()
-                .to_ascii_lowercase()
-                .starts_with("libtorch_python")
-            {
+            } else if is_python_binding_library(&entry.file_name().to_string_lossy()) {
                 return Err(BootstrapError::new(
                     "libtorch_python was selected despite the native-only policy",
                 ));
@@ -1121,7 +1236,7 @@ fn write_files_manifest(root: &Path, entries: &[ManifestEntry]) -> Result<String
         .map_err(|error| io_error("write native files manifest", &path, error))?;
     file.sync_all()
         .map_err(|error| io_error("fsync native files manifest", &path, error))?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+    sysfs::set_mode(&path, 0o644)
         .map_err(|error| io_error("set native files manifest permissions", &path, error))?;
     Ok(digest)
 }
@@ -1156,7 +1271,7 @@ fn write_marker(root: &Path, artifact: &Artifact, files_manifest_sha256: &str) -
         .map_err(|error| io_error("write native toolchain marker", &path, error))?;
     file.sync_all()
         .map_err(|error| io_error("fsync native toolchain marker", &path, error))?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+    sysfs::set_mode(&path, 0o644)
         .map_err(|error| io_error("set native toolchain marker permissions", &path, error))?;
     Ok(())
 }
@@ -1186,7 +1301,7 @@ fn finish_tree(root: &Path) -> Result<()> {
     }
     directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     for directory in &directories {
-        fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).map_err(|error| {
+        sysfs::set_mode(&directory, 0o755).map_err(|error| {
             io_error(
                 "set native toolchain directory permissions",
                 directory,
@@ -1425,7 +1540,7 @@ fn validate_complete_tree(root: &Path, entries: &[ManifestEntry]) -> Result<()> 
                 BootstrapError::new("installed native toolchain path escaped its root")
             })?;
             let key = portable_path_key(relative);
-            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            let metadata = sysfs::lstat(&path).map_err(|error| {
                 io_error("inspect installed native toolchain entry", &path, error)
             })?;
             if metadata.file_type().is_symlink() {
@@ -1470,7 +1585,7 @@ fn validate_complete_tree(root: &Path, entries: &[ManifestEntry]) -> Result<()> 
 
 fn verify_manifest_entry(root: &Path, entry: &ManifestEntry) -> Result<()> {
     let path = root.join(&entry.relative);
-    let before = fs::symlink_metadata(&path)
+    let before = sysfs::lstat(&path)
         .map_err(|error| io_error("inspect manifested native runtime file", &path, error))?;
     if before.file_type().is_symlink() || !before.is_file() || before.len() != entry.size {
         return Err(BootstrapError::new(format!(
@@ -1480,8 +1595,7 @@ fn verify_manifest_entry(root: &Path, entry: &ManifestEntry) -> Result<()> {
     }
     require_owned_nonwritable(&path, false)?;
     let mut file = secure_open_read(&path)?;
-    let opened = file
-        .metadata()
+    let opened = sysfs::fstat(&file)
         .map_err(|error| io_error("stat opened native runtime file", &path, error))?;
     if (opened.dev(), opened.ino(), opened.len()) != (before.dev(), before.ino(), entry.size) {
         return Err(BootstrapError::new(format!(
@@ -1510,8 +1624,7 @@ fn verify_manifest_entry(root: &Path, entry: &ManifestEntry) -> Result<()> {
         }
         digest.update(&buffer[..read]);
     }
-    let after = file
-        .metadata()
+    let after = sysfs::fstat(&file)
         .map_err(|error| io_error("restat native runtime file", &path, error))?;
     if total != entry.size
         || (after.dev(), after.ino(), after.len()) != (opened.dev(), opened.ino(), entry.size)
@@ -1526,7 +1639,7 @@ fn verify_manifest_entry(root: &Path, entry: &ManifestEntry) -> Result<()> {
 }
 
 fn read_regular_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>> {
-    let before = fs::symlink_metadata(path)
+    let before = sysfs::lstat(path)
         .map_err(|error| io_error("inspect bounded native toolchain file", path, error))?;
     if before.file_type().is_symlink() || !before.is_file() || before.len() > maximum {
         return Err(BootstrapError::new(format!(
@@ -1536,8 +1649,7 @@ fn read_regular_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>> {
     }
     require_owned_nonwritable(path, false)?;
     let file = secure_open_read(path)?;
-    let opened = file
-        .metadata()
+    let opened = sysfs::fstat(&file)
         .map_err(|error| io_error("stat bounded native toolchain file", path, error))?;
     if (opened.dev(), opened.ino(), opened.len()) != (before.dev(), before.ino(), before.len()) {
         return Err(BootstrapError::new(format!(
@@ -1561,13 +1673,12 @@ fn read_regular_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>> {
 }
 
 fn require_owned_nonwritable(path: &Path, directory: bool) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
+    let metadata = sysfs::lstat(path)
         .map_err(|error| io_error("inspect native toolchain ownership", path, error))?;
     if metadata.file_type().is_symlink()
         || (directory && !metadata.is_dir())
         || (!directory && !metadata.is_file())
-        || metadata.uid() != effective_uid()
-        || metadata.permissions().mode() & 0o022 != 0
+        || !metadata.is_owner_controlled()
     {
         return Err(BootstrapError::new(format!(
             "{} is not an owner-controlled, non-group/world-writable {}",
@@ -1584,7 +1695,7 @@ fn require_owned_nonwritable(path: &Path, directory: bool) -> Result<()> {
 
 fn require_real_directory(path: &Path) -> Result<()> {
     let metadata =
-        fs::symlink_metadata(path).map_err(|error| io_error("inspect directory", path, error))?;
+        sysfs::lstat(path).map_err(|error| io_error("inspect directory", path, error))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(BootstrapError::new(format!(
             "{} is not a real directory",
@@ -1595,32 +1706,32 @@ fn require_real_directory(path: &Path) -> Result<()> {
 }
 
 fn secure_create_new(path: &Path, mode: u32) -> Result<File> {
-    OpenOptions::new()
+    Open::new()
         .write(true)
         .create_new(true)
         .mode(mode)
-        .custom_flags(open_nofollow_cloexec())
+        .no_follow()
         .open(path)
         .map_err(|error| io_error("create file without following links", path, error))
 }
 
 fn secure_open_read(path: &Path) -> Result<File> {
-    OpenOptions::new()
+    Open::new()
         .read(true)
-        .custom_flags(open_nofollow_cloexec())
+        .no_follow()
         .open(path)
         .map_err(|error| io_error("open file without following links", path, error))
 }
 
 fn fsync_directory(path: &Path) -> Result<()> {
     require_real_directory(path)?;
-    let file = OpenOptions::new()
+    let directory = Open::new()
         .read(true)
-        .custom_flags(open_directory_flags())
+        .directory()
+        .no_follow()
         .open(path)
         .map_err(|error| io_error("open directory for fsync", path, error))?;
-    file.sync_all()
-        .map_err(|error| io_error("fsync directory", path, error))
+    sysfs::sync_directory(&directory).map_err(|error| io_error("fsync directory", path, error))
 }
 
 fn unique_file(parent: &Path, label: &str, extension: &str) -> Result<(PathBuf, File)> {
@@ -1644,7 +1755,7 @@ fn unique_directory(parent: &Path, label: &str) -> Result<PathBuf> {
         let path = parent.join(format!(".{stem}-{attempt}"));
         match fs::create_dir(&path) {
             Ok(()) => {
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                sysfs::set_mode(&path, 0o700)
                     .map_err(|error| io_error("set staging permissions", &path, error))?;
                 return Ok(path);
             }
@@ -1694,32 +1805,13 @@ impl Drop for Cleanup {
 }
 
 fn rename_noreplace(source: &Path, destination: &Path) -> Result<()> {
-    let source = CString::new(source.as_os_str().as_bytes())
-        .map_err(|_| BootstrapError::new("staging path contains a NUL byte"))?;
-    let destination_c = CString::new(destination.as_os_str().as_bytes())
-        .map_err(|_| BootstrapError::new("toolchain destination contains a NUL byte"))?;
-    #[cfg(target_os = "macos")]
-    // SAFETY: both retained CString values are NUL-terminated for the call.
-    let status = unsafe { renamex_np(source.as_ptr(), destination_c.as_ptr(), RENAME_EXCL) };
-    #[cfg(target_os = "linux")]
-    // SAFETY: both retained CString values are NUL-terminated for the call.
-    let status = unsafe {
-        renameat2(
-            AT_FDCWD,
-            source.as_ptr(),
-            AT_FDCWD,
-            destination_c.as_ptr(),
-            RENAME_NOREPLACE,
-        )
-    };
-    if status != 0 {
-        return Err(io_error(
+    sysfs::rename_noreplace(source, destination).map_err(|error| {
+        io_error(
             "publish native toolchain without replacement",
             destination,
-            std::io::Error::last_os_error(),
-        ));
-    }
-    Ok(())
+            error,
+        )
+    })
 }
 
 fn parse_sha256(value: &str) -> Result<[u8; 32]> {
@@ -1752,6 +1844,7 @@ fn format_digest(bytes: &[u8]) -> String {
     output
 }
 
+#[cfg(not(windows))]
 fn curl_error(operation: &str, error: curl::Error) -> BootstrapError {
     BootstrapError::new(format!("{operation}: {error}"))
 }
@@ -1759,55 +1852,6 @@ fn curl_error(operation: &str, error: curl::Error) -> BootstrapError {
 fn io_error(operation: &str, path: &Path, error: std::io::Error) -> BootstrapError {
     BootstrapError::new(format!("{operation} {}: {error}", path.display()))
 }
-
-fn effective_uid() -> u32 {
-    // SAFETY: geteuid has no arguments, memory effects, or failure return.
-    unsafe { geteuid() }
-}
-
-unsafe extern "C" {
-    fn geteuid() -> u32;
-}
-
-// Open flags must come from the active target ABI, never from literals. The
-// numeric values of O_NOFOLLOW and O_DIRECTORY differ between x86_64 and
-// aarch64 Linux: an x86-derived literal silently decodes to O_LARGEFILE and
-// O_DIRECT on aarch64, dropping the very symlink guard these callers exist
-// to apply. Darwin shares one ABI across its architectures, so only Linux
-// ever diverged.
-const fn open_nofollow_cloexec() -> i32 {
-    libc::O_NOFOLLOW | libc::O_CLOEXEC
-}
-
-const fn open_directory_flags() -> i32 {
-    libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
-}
-
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    fn renamex_np(
-        old: *const std::os::raw::c_char,
-        new: *const std::os::raw::c_char,
-        flags: u32,
-    ) -> i32;
-}
-#[cfg(target_os = "macos")]
-const RENAME_EXCL: u32 = 0x0000_0004;
-
-#[cfg(target_os = "linux")]
-unsafe extern "C" {
-    fn renameat2(
-        olddirfd: i32,
-        old: *const std::os::raw::c_char,
-        newdirfd: i32,
-        new: *const std::os::raw::c_char,
-        flags: u32,
-    ) -> i32;
-}
-#[cfg(target_os = "linux")]
-const AT_FDCWD: i32 = -100;
-#[cfg(target_os = "linux")]
-const RENAME_NOREPLACE: u32 = 1;
 
 #[cfg(test)]
 mod tests {
@@ -1818,20 +1862,20 @@ mod tests {
     use zip::write::SimpleFileOptions;
 
     #[test]
-    fn secure_open_flags_carry_the_guards_their_names_promise() {
-        // A hard-coded x86 literal silently loses O_NOFOLLOW on aarch64
-        // Linux, so assert the bits rather than any numeric value.
-        let nofollow = open_nofollow_cloexec();
-        assert_ne!(nofollow & libc::O_NOFOLLOW, 0, "symlink guard dropped");
-        assert_ne!(nofollow & libc::O_CLOEXEC, 0, "close-on-exec dropped");
-
-        let directory = open_directory_flags();
-        for (bit, name) in [
-            (libc::O_DIRECTORY, "O_DIRECTORY"),
-            (libc::O_NOFOLLOW, "O_NOFOLLOW"),
-            (libc::O_CLOEXEC, "O_CLOEXEC"),
-        ] {
-            assert_ne!(directory & bit, 0, "{name} dropped from directory flags");
+    fn secure_open_refuses_a_final_symlink_but_not_a_regular_file() {
+        // The guard is tested by behavior, not by flag bits: a literal that is
+        // right on one ABI can silently be the wrong flag on another.
+        let directory = TestDirectory::new("nofollow");
+        let target = directory.0.join("target");
+        fs::write(&target, b"x").unwrap();
+        assert!(secure_open_read(&target).is_ok());
+        let link = directory.0.join("link");
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&target, &link).is_ok();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&target, &link).is_ok();
+        if linked {
+            assert!(secure_open_read(&link).is_err(), "symlink guard dropped");
         }
     }
 
@@ -1893,6 +1937,34 @@ mod tests {
         ]
     }
 
+    fn windows_required_entries() -> Vec<(&'static str, &'static [u8])> {
+        vec![
+            (TORCH_CPP_API_HEADER, b"header"),
+            ("torch/share/cmake/Torch/TorchConfig.cmake", b"cmake config"),
+            ("torch/lib/torch.dll", b"torch"),
+            ("torch/lib/torch.lib", b"torch import library"),
+            ("torch/lib/torch_cpu.dll", b"torch cpu"),
+            ("torch/lib/torch_cpu.lib", b"torch cpu import library"),
+            ("torch/lib/c10.dll", b"c10"),
+            ("torch/lib/c10.lib", b"c10 import library"),
+            ("torch/lib/libiomp5md.dll", b"OpenMP runtime the wheel ships"),
+            ("torch/lib/torch_python.dll", b"must not extract"),
+            ("torch/lib/torch_python.lib", b"must not extract"),
+            ("torch/__init__.py", b"must not extract"),
+            (
+                "torch-2.13.0.dist-info/licenses/LICENSE",
+                b"upstream license",
+            ),
+        ]
+    }
+
+    fn windows_artifact() -> Artifact {
+        Artifact {
+            target: PlatformTarget::WindowsX86_64,
+            ..fake_artifact()
+        }
+    }
+
     fn duplicate_name_fixture() -> Vec<u8> {
         let mut bytes = fixture(&[("torch/lib/a", b"one"), ("torch/lib/A", b"two")], None);
         let needle = b"torch/lib/A";
@@ -1930,7 +2002,7 @@ mod tests {
 
     #[test]
     fn official_cpu_artifacts_have_exact_safe_pins() {
-        for artifact in [&MACOS_ARM64, &LINUX_X86_64, &LINUX_AARCH64] {
+        for artifact in [&MACOS_ARM64, &LINUX_X86_64, &LINUX_AARCH64, &WINDOWS_X86_64] {
             validate_artifact(artifact).unwrap();
             assert_eq!(parse_sha256(artifact.sha256).unwrap().len(), 32);
             assert_eq!(
@@ -1946,8 +2018,20 @@ mod tests {
         assert_eq!(MACOS_ARM64.size, 111_227_066);
         assert_eq!(LINUX_X86_64.size, 191_822_516);
         assert_eq!(LINUX_AARCH64.size, 155_020_718);
+        assert_eq!(WINDOWS_X86_64.size, 123_860_488);
+        // A pin is a recorded value, never a stand-in for one.
+        for artifact in [&MACOS_ARM64, &LINUX_X86_64, &LINUX_AARCH64, &WINDOWS_X86_64] {
+            assert_ne!(artifact.sha256, "0".repeat(64), "{}", artifact.target);
+            assert_ne!(
+                artifact.files_manifest_sha256,
+                "0".repeat(64),
+                "{}",
+                artifact.target
+            );
+        }
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn linked_system_curl_meets_the_https_contract() {
         require_https_capable_libcurl().unwrap();
@@ -1971,6 +2055,114 @@ mod tests {
             output
                 .join("torch-2.13.0.dist-info/licenses/LICENSE")
                 .is_file()
+        );
+    }
+
+    #[test]
+    fn the_windows_layout_takes_dlls_and_import_libraries_but_never_the_python_bindings() {
+        let temporary = TestDirectory::new("windows-layout");
+        let archive = temporary.0.join("fixture.whl");
+        fs::write(&archive, fixture(&windows_required_entries(), None)).unwrap();
+        let output = temporary.0.join("output");
+        fs::create_dir(&output).unwrap();
+
+        let entries =
+            extract_native_layout(&archive, &output, &windows_artifact(), PRODUCTION_LIMITS)
+                .unwrap();
+
+        for taken in [
+            "torch/lib/torch.dll",
+            "torch/lib/torch.lib",
+            "torch/lib/torch_cpu.dll",
+            "torch/lib/torch_cpu.lib",
+            "torch/lib/c10.dll",
+            "torch/lib/c10.lib",
+            "torch/lib/libiomp5md.dll",
+        ] {
+            assert!(output.join(taken).is_file(), "{taken} was not extracted");
+        }
+        for refused in [
+            "torch/lib/torch_python.dll",
+            "torch/lib/torch_python.lib",
+            "torch/__init__.py",
+        ] {
+            assert!(!output.join(refused).exists(), "{refused} was extracted");
+        }
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !is_python_binding_library(&entry.relative.to_string_lossy()
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .to_owned()))
+        );
+        ensure_no_python_library(&output).unwrap();
+    }
+
+    #[test]
+    fn a_windows_wheel_without_an_import_library_is_refused_by_name() {
+        for missing in ["torch/lib/torch.lib", "torch/lib/c10.dll", "torch/lib/torch_cpu.lib"] {
+            let temporary = TestDirectory::new("windows-missing");
+            let mut entries = windows_required_entries();
+            entries.retain(|(path, _)| *path != missing);
+            let archive = temporary.0.join("fixture.whl");
+            fs::write(&archive, fixture(&entries, None)).unwrap();
+            let output = temporary.0.join("output");
+            fs::create_dir(&output).unwrap();
+
+            let error =
+                extract_native_layout(&archive, &output, &windows_artifact(), PRODUCTION_LIMITS)
+                    .unwrap_err();
+
+            assert!(error.to_string().contains(missing), "{missing}: {error}");
+        }
+    }
+
+    #[test]
+    fn the_python_binding_library_is_recognized_in_both_spellings_only() {
+        for python in [
+            "libtorch_python.so",
+            "libtorch_python.dylib",
+            "LIBTORCH_PYTHON.so.2.13",
+            "torch_python.dll",
+            "Torch_Python.LIB",
+        ] {
+            assert!(is_python_binding_library(python), "{python}");
+        }
+        for fine in ["libtorch.so", "torch.dll", "torch_cpu.lib", "c10.dll", "libiomp5md.dll", "python_helper.dll"] {
+            assert!(!is_python_binding_library(fine), "{fine}");
+        }
+    }
+
+    #[test]
+    fn the_required_libraries_name_the_files_each_target_links_and_loads() {
+        assert_eq!(
+            PlatformTarget::WindowsX86_64.required_libraries(),
+            [
+                "torch/lib/torch.dll",
+                "torch/lib/torch.lib",
+                "torch/lib/torch_cpu.dll",
+                "torch/lib/torch_cpu.lib",
+                "torch/lib/c10.dll",
+                "torch/lib/c10.lib"
+            ]
+        );
+        assert_eq!(
+            PlatformTarget::MacosArm64.required_libraries(),
+            [
+                "torch/lib/libtorch.dylib",
+                "torch/lib/libtorch_cpu.dylib",
+                "torch/lib/libc10.dylib"
+            ]
+        );
+        assert_eq!(
+            PlatformTarget::LinuxAarch64.required_libraries(),
+            [
+                "torch/lib/libtorch.so",
+                "torch/lib/libtorch_cpu.so",
+                "torch/lib/libc10.so"
+            ]
         );
     }
 

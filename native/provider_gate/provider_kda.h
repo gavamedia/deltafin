@@ -114,6 +114,28 @@ struct KdaPositionsRecurrentResult {
 };
 
 /*
+ * What a T-row recurrence retains so a verify commit can rebuild the state
+ * after any accepted prefix: the starting recurrent state, the per-row
+ * decay/key/value/beta rows the loop consumed, and the convolution sources.
+ * Replaying k rows runs the loop's own per-row update on the same row
+ * tensors, so it reproduces boundary k bit for bit while keeping about 1/22
+ * of the memory of one recurrent state per row (19 MiB a row on K3 against
+ * 453 MiB).
+ */
+struct KdaRecurrenceRecord {
+  at::Tensor initial_recurrent;
+  at::Tensor gated_decay;  // [T, heads, width]
+  at::Tensor key;          // [T, heads, width], normalized
+  at::Tensor value;        // [T, heads, width]
+  at::Tensor beta;         // [T, heads], after the sigmoid
+  at::Tensor query_source;  // [1, projection, convolution - 1 + T]
+  at::Tensor key_source;
+  at::Tensor value_source;
+  std::int64_t positions = 0;
+  std::int64_t convolution_width = 0;
+};
+
+/*
  * Execute one decode position.  exact_k3=true rejects every dimension,
  * scalar type, and storage form that is not the released K3 contract.
  */
@@ -145,7 +167,18 @@ KdaPositionsRecurrentResult kda_recur_convolved_positions(
     const at::Tensor& hidden_rows, const KdaWeights& weights,
     const KdaState& state, const KdaConvolvedPositions& convolved,
     const KdaDependentPositions& dependent,
-    bool retain_boundaries, bool exact_k3);
+    bool retain_boundaries, bool exact_k3,
+    KdaRecurrenceRecord* record = nullptr);
+
+/*
+ * The state after the first `positions` rows (1..T) of a recorded
+ * recurrence, in the same form `retain_boundaries` returns for that row.
+ */
+KdaState kda_replay_recorded_state(const KdaRecurrenceRecord& record,
+                                   std::int64_t positions);
+
+/* Bytes a record keeps alive beyond the final state. */
+std::uint64_t kda_recurrence_record_bytes(const KdaRecurrenceRecord& record);
 
 /* Development-gate entry points: same equations, with the dispatch policy
  * forced so an isolated parity/timing executable can compare both arms. */

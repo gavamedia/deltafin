@@ -1,0 +1,143 @@
+name: Windows native
+
+# Windows x86-64 is a third native target. These legs run on a real Windows
+# runner (MSVC toolchain) and establish, in order of cost, that:
+#   1. the shared OS layer (deltafin-sys) behaves on Windows exactly as it does
+#      on Unix: no-follow opens, identity, overlapped positional reads, locks,
+#      no-replace publication, free space, canonical paths, WinHTTP, PE import
+#      parsing;
+#   2. the compiled-only publication and interpreter-boundary gates hold, and
+#      the loader audit, updater and bootstrap behave with PE images and
+#      Windows paths;
+#   3. the build-time installer and the whole runtime crate (with its tests)
+#      compile for Windows;
+#   4. the native build graph (MSVC cl.exe/lib.exe/link.exe, the pinned
+#      LibTorch for Windows, the exact C kernels, the provider) builds and its
+#      isolated native tests pass, and the complete product links and runs.
+# Legs 1-3 are cheap and always run. Leg 4 compiles LibTorch-heavy C++ with
+# MSVC on a two-core runner and bills Windows minutes at twice the rate, so it
+# is chosen at dispatch. No job needs a GPU or the model, so none can say
+# anything about throughput or tokens: that still requires physical hardware
+# and the token oracle.
+#
+# Not a per-push job: a Windows runner bills at twice the Linux rate and the
+# Linux gate already runs on every push. It is dispatched when Windows code or
+# the native build graph changes, and runs weekly (cheap legs plus the two
+# kernel gates) as a heartbeat that catches drift nobody dispatched for.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      native_tests:
+        description: >-
+          Native provider tests to build and run (xtask names, space
+          separated; "all" for every spec; empty for none)
+        default: "provider-schedule-oracle cpu-isa"
+        type: string
+      product_build:
+        description: Build the complete product and run its whole test suite
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-native-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  windows:
+    name: Windows x86-64 (MSVC)
+    runs-on: windows-2025
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report the toolchain
+        run: |
+          set -eux
+          rustc --version --verbose
+          cargo --version
+          "/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" \
+            -latest -products '*' -property installationVersion || true
+          ls "/c/Program Files/LLVM/bin" 2>/dev/null | head -3 || true
+          echo "processors: ${NUMBER_OF_PROCESSORS}"
+
+      - name: Test the shared OS layer
+        if: success() || failure()
+        run: cargo test --locked --no-fail-fast -p deltafin-sys
+
+      - name: Audit the compiled-only publication policy
+        if: success() || failure()
+        run: >-
+          cargo test --locked --no-fail-fast -p deltafin --no-default-features
+          --test publication_policy
+          --test interpreter_boundary_policy
+          --test release_policy
+          --test curl_build_policy
+
+      - name: Test the build-time installer and build graph
+        if: success() || failure()
+        run: cargo test --locked --no-fail-fast -p deltafin-bootstrap -p deltafin-native-build
+
+      # A type-check of the complete runtime crate and its tests on a real
+      # Windows host. DELTAFIN_NATIVE_BUILD_CHECK_ONLY skips configuring
+      # LibTorch and compiling the provider, which this step does not need.
+      - name: Type-check the runtime crate and its tests
+        if: success() || failure()
+        env:
+          DELTAFIN_NATIVE_BUILD_CHECK_ONLY: "1"
+        run: cargo check --locked -p deltafin --tests
+
+      - name: Test the tokenizer and protocol layer without the runtime
+        if: success() || failure()
+        run: cargo test --locked --no-fail-fast -p deltafin --no-default-features --lib
+
+      # The build graph's own output is the evidence here: it names every
+      # translation unit that failed to compile, not only the first.
+      - name: Build and run the native provider tests
+        if: (success() || failure()) && (github.event_name == 'schedule' || inputs.native_tests != '')
+        env:
+          NATIVE_TESTS: ${{ github.event_name == 'schedule' && 'provider-schedule-oracle cpu-isa' || inputs.native_tests }}
+        run: |
+          set -u
+          cargo build --locked --release -p deltafin-xtask
+          status=0
+          for name in ${NATIVE_TESTS}; do
+            echo "::group::native-test ${name}"
+            cargo run --locked --release -p deltafin-xtask -- native-test "${name}" || status=1
+            echo "::endgroup::"
+          done
+          exit ${status}
+
+      # The same four checks the Linux leg makes of the shipped profile: the
+      # product builds and starts, its linked closure audits clean, the whole
+      # runtime suite passes, and every CLI help surface answers.
+      - name: Build the complete product
+        if: (success() || failure()) && inputs.product_build
+        run: cargo build --locked --release
+
+      - name: Execute the compiled CLI and audit its linked closure
+        if: (success() || failure()) && inputs.product_build
+        run: |
+          set -eux
+          ./target/release/deltafin.exe --version
+          ./target/release/deltafin.exe doctor --runtime-only
+
+      - name: Run the complete native Rust runtime suite
+        if: (success() || failure()) && inputs.product_build
+        run: cargo test --locked --release --no-fail-fast -p deltafin --lib
+
+      - name: Exercise every compiled CLI help surface
+        if: (success() || failure()) && inputs.product_build
+        run: cargo test --locked --release -p deltafin --test cli_command_matrix

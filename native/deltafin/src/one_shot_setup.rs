@@ -5,9 +5,6 @@
 //! fail-closed capacity boundary in front of them. Planning is read-only and
 //! never contacts the network.
 
-use std::ffi::CString;
-use std::fs;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use crate::dspark_setup;
@@ -15,6 +12,7 @@ use crate::error::{DeltafinError, Result};
 use crate::experts::{K3_EXPERT_RAW_FILES, K3_EXPERT_SOURCE_BYTES};
 use crate::setup_k3;
 use crate::setup_qwen;
+use crate::sys::fs as sys_fs;
 use crate::weight_fetch::{
     self, FetchLimits, MAX_PARALLEL_TRANSFERS, ProgressSink, WeightFetchDryRun,
     WeightFetchProgress, WeightFetchStorage, WeightSelection,
@@ -364,7 +362,7 @@ fn plan_for_resolved_mode(options: &SetupOptions, mode: SetupMode) -> Result<Set
 fn inspect_common_requirements(options: &SetupOptions) -> Result<CommonRequirements> {
     let metadata_total = setup_k3::exact_payload_bytes();
     let metadata_path = options.root.join("k3-meta");
-    let metadata_bytes_missing = match fs::symlink_metadata(&metadata_path) {
+    let metadata_bytes_missing = match sys_fs::lstat(&metadata_path) {
         Ok(_) => {
             setup_k3::load_installed_inventory(&options.root)?;
             0
@@ -404,7 +402,7 @@ fn inspect_weight_requirements(
 ) -> Result<WeightRequirements> {
     let expected = mode.weight_bytes();
     let metadata_path = options.root.join("k3-meta");
-    match fs::symlink_metadata(&metadata_path) {
+    match sys_fs::lstat(&metadata_path) {
         Ok(_) => {
             let inventory = setup_k3::load_installed_inventory(&options.root)?;
             let weight_plan = weight_fetch::plan(
@@ -557,37 +555,20 @@ fn validate_weight_total(mode: SetupMode, work: WeightFetchDryRun) -> Result<()>
     Ok(())
 }
 
-fn available_disk_bytes(root: &Path) -> Result<u64> {
-    let canonical = fs::canonicalize(root)
+pub(crate) fn available_disk_bytes(root: &Path) -> Result<u64> {
+    let canonical = crate::sys::fs::canonicalize(root)
         .map_err(|error| io_error("resolve model root for capacity check", root, error))?;
-    let path = CString::new(canonical.as_os_str().as_bytes())
-        .map_err(|_| DeltafinError::new("model root contains a NUL byte"))?;
-    // SAFETY: `statvfs` initializes the whole output structure on success. The
-    // canonical path is a live NUL-terminated string for the duration of the
-    // call, and the output pointer refers to valid writable storage.
-    let filesystem = unsafe {
-        let mut value = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-        if libc::statvfs(path.as_ptr(), value.as_mut_ptr()) != 0 {
-            return Err(io_error(
-                "query model-volume capacity",
-                &canonical,
-                std::io::Error::last_os_error(),
-            ));
-        }
-        value.assume_init()
-    };
-    let fragment_bytes = if filesystem.f_frsize == 0 {
-        filesystem.f_bsize
-    } else {
-        filesystem.f_frsize
-    };
-    u64::from(filesystem.f_bavail)
-        .checked_mul(fragment_bytes)
-        .ok_or_else(|| DeltafinError::new("filesystem available byte count overflowed"))
+    let directory = crate::sys::fs::Open::new()
+        .read(true)
+        .directory()
+        .open(&canonical)
+        .map_err(|error| io_error("open model root for capacity check", &canonical, error))?;
+    crate::sys::fs::available_space(&directory, &canonical)
+        .map_err(|error| io_error("query model-volume capacity", &canonical, error))
 }
 
 fn validate_root(root: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(root)
+    let metadata = sys_fs::lstat(root)
         .map_err(|error| io_error("inspect one-shot model root", root, error))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(DeltafinError::new(format!(
@@ -619,6 +600,7 @@ fn io_error(context: &str, path: &Path, error: std::io::Error) -> DeltafinError 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);

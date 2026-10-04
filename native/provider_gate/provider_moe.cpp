@@ -123,6 +123,13 @@ struct MetalApi {
   using Flush = void (*)();
   using Stats = void (*)(long long*);
   using LastError = const char* (*)();
+  using StageBegin = std::uint64_t (*)(int, const float*);
+  using StageEdges = int (*)(std::uint64_t, const K3MetalExpertDescriptorV1*,
+                             const int*, int);
+  using StageFinish = int (*)(std::uint64_t, const K3MetalExpertDescriptorV1*,
+                              int, const float*, const float*, float*);
+  using StageAbandon = void (*)(std::uint64_t);
+  using StageStats = void (*)(long long*);
   Init init = nullptr;
   Layer layer = nullptr;
   Positions positions = nullptr;
@@ -136,6 +143,11 @@ struct MetalApi {
   Flush flush = nullptr;
   Stats stats = nullptr;
   LastError last_error = nullptr;
+  StageBegin stage_begin = nullptr;
+  StageEdges stage_edges = nullptr;
+  StageFinish stage_finish = nullptr;
+  StageAbandon stage_abandon = nullptr;
+  StageStats stage_stats = nullptr;
 };
 
 const MetalApi& metal_api() {
@@ -155,7 +167,12 @@ const MetalApi& metal_api() {
       &k3_metal_drop,
       &k3_metal_flush,
       &k3_metal_stats,
-      &k3_metal_last_error};
+      &k3_metal_last_error,
+      &k3_metal_moe_stage_begin_v1,
+      &k3_metal_moe_stage_edges_v1,
+      &k3_metal_moe_stage_finish_v1,
+      &k3_metal_moe_stage_abandon_v1,
+      &k3_metal_moe_stage_stats_v1};
 #else
   // Resolving from the process image avoids a required symbol on Linux and in
   // CPU-only macOS builds. A production Apple link that includes the reviewed
@@ -182,7 +199,17 @@ const MetalApi& metal_api() {
       reinterpret_cast<MetalApi::Flush>(dlsym(RTLD_DEFAULT, "k3_metal_flush")),
       reinterpret_cast<MetalApi::Stats>(dlsym(RTLD_DEFAULT, "k3_metal_stats")),
       reinterpret_cast<MetalApi::LastError>(
-          dlsym(RTLD_DEFAULT, "k3_metal_last_error"))};
+          dlsym(RTLD_DEFAULT, "k3_metal_last_error")),
+      reinterpret_cast<MetalApi::StageBegin>(
+          dlsym(RTLD_DEFAULT, "k3_metal_moe_stage_begin_v1")),
+      reinterpret_cast<MetalApi::StageEdges>(
+          dlsym(RTLD_DEFAULT, "k3_metal_moe_stage_edges_v1")),
+      reinterpret_cast<MetalApi::StageFinish>(
+          dlsym(RTLD_DEFAULT, "k3_metal_moe_stage_finish_v1")),
+      reinterpret_cast<MetalApi::StageAbandon>(
+          dlsym(RTLD_DEFAULT, "k3_metal_moe_stage_abandon_v1")),
+      reinterpret_cast<MetalApi::StageStats>(
+          dlsym(RTLD_DEFAULT, "k3_metal_moe_stage_stats_v1"))};
 #endif
   return api;
 }
@@ -856,6 +883,42 @@ void validate_backend_layout(const MoeExpertBackend backend,
   throw std::invalid_argument("expert storage layout is unknown");
 }
 
+#if defined(__APPLE__)
+std::uint32_t metal_layout_id(const MoeExpertLayout layout) {
+  switch (layout) {
+    case MoeExpertLayout::RawV1:
+      return K3_LAYOUT_RAW_V1;
+    case MoeExpertLayout::Scale4V2:
+      return K3_LAYOUT_SCALE4_V2;
+  }
+  throw std::invalid_argument("Metal expert storage layout is unknown");
+}
+
+K3MetalExpertDescriptorV1 metal_descriptor(const MoeExpertLayout layout,
+                                           const std::uint64_t span_bytes,
+                                           const std::uint8_t* blob) {
+  return K3MetalExpertDescriptorV1{
+      .abi_version = K3_DESCRIPTOR_ABI_V1,
+      .struct_bytes = sizeof(K3MetalExpertDescriptorV1),
+      .layout_id = metal_layout_id(layout),
+      .reserved = 0,
+      .blob_bytes = span_bytes,
+      .blob = blob};
+}
+
+bool metal_descriptor_suite_ready(const MetalApi& api,
+                                  const MoeExpertLayout layout) {
+  if (api.descriptor_abi == nullptr || api.layout_capabilities == nullptr ||
+      api.descriptor_abi() != K3_DESCRIPTOR_ABI_V1) {
+    return false;
+  }
+  const std::uint64_t capability = layout == MoeExpertLayout::Scale4V2
+                                       ? K3_CAP_SCALE4_V2
+                                       : K3_CAP_RAW_V1;
+  return (api.layout_capabilities() & capability) != 0;
+}
+#endif
+
 std::array<float, kMoeRouteTopK> route_weights(const MoeRouteT1& route) {
   std::array<float, kMoeRouteTopK> weights = {};
   for (std::size_t edge = 0; edge < weights.size(); ++edge) {
@@ -1025,7 +1088,33 @@ at::Tensor execute_metal(const PreparedMoeT1& prepared,
   record_trace(options.execution_trace,
                MoeExecutionStage::MetalExpertRowDispatch);
   int status = 0;
-  if (layout == MoeExpertLayout::RawV1) {
+  bool executed = false;
+  if (options.metal_staged_token != 0) {
+    // Complete a layer whose experts were partly computed as their bytes
+    // landed. The bridge recomputes anything that never got staged and then
+    // performs the single route-ordered reduction, so consuming the token is
+    // equivalent to the established call in every observable way.
+    if (api.stage_finish == nullptr ||
+        !metal_descriptor_suite_ready(api, layout)) {
+      if (api.stage_abandon != nullptr) {
+        api.stage_abandon(options.metal_staged_token);
+      }
+    } else {
+      std::array<K3MetalExpertDescriptorV1, kMoeRouteTopK> descriptors{};
+      for (std::size_t edge = 0; edge < descriptors.size(); ++edge) {
+        descriptors[edge] =
+            metal_descriptor(layout, expert_span_bytes, blobs[edge]);
+      }
+      status = api.stage_finish(
+          options.metal_staged_token, descriptors.data(),
+          static_cast<int>(descriptors.size()), weights.data(),
+          input.const_data_ptr<float>(), routed_output.data_ptr<float>());
+      executed = true;
+    }
+  }
+  if (executed) {
+    // The staged finish already produced the layer's routed output.
+  } else if (layout == MoeExpertLayout::RawV1) {
     status = api.layer(blobs.data(), static_cast<int>(blobs.size()),
                        weights.data(), input.const_data_ptr<float>(),
                        routed_output.data_ptr<float>());
@@ -1298,7 +1387,33 @@ at::Tensor execute_metal_pointer_positions(
             prepared.route, expert_ids, expert_span_pointers, geometry);
         const auto weights = route_weights(prepared.route);
         int status = 0;
-        if (expert_layout == MoeExpertLayout::RawV1) {
+        bool executed = false;
+        // A staged token belongs to exactly one row; a tile that turned out to
+        // hold more rows than the staging assumed cannot consume it.
+        if (options.metal_staged_token != 0 && prepared_rows.size() == 1) {
+          if (api.stage_finish == nullptr ||
+              !metal_descriptor_suite_ready(api, expert_layout)) {
+            if (api.stage_abandon != nullptr) {
+              api.stage_abandon(options.metal_staged_token);
+            }
+          } else {
+            std::array<K3MetalExpertDescriptorV1, kMoeRouteTopK> descriptors{};
+            for (std::size_t edge = 0; edge < descriptors.size(); ++edge) {
+              descriptors[edge] = metal_descriptor(
+                  expert_layout, expert_span_bytes, blobs[edge]);
+            }
+            status = api.stage_finish(
+                options.metal_staged_token, descriptors.data(),
+                static_cast<int>(descriptors.size()), weights.data(),
+                inputs[static_cast<std::int64_t>(row)]
+                    .const_data_ptr<float>(),
+                outputs[static_cast<std::int64_t>(row)].data_ptr<float>());
+            executed = true;
+          }
+        }
+        if (executed) {
+          // The staged finish already produced this row's routed output.
+        } else if (expert_layout == MoeExpertLayout::RawV1) {
           status = api.layer(
               blobs.data(), static_cast<int>(blobs.size()), weights.data(),
               inputs[static_cast<std::int64_t>(row)].const_data_ptr<float>(),
@@ -1641,6 +1756,145 @@ bool moe_positions_select_metal(const at::Device& device,
                                 const MoeRunOptions& options) {
   return select_backend(device, options.expert_backend, options.cuda_cache) ==
       MoeExpertBackend::MetalMxfp4;
+}
+
+std::uint64_t begin_staged_routed_moe_t1(const PreparedMoeT1& prepared,
+                                         const at::Tensor& routed_input_cpu,
+                                         const MoeRunOptions& options) {
+#if !defined(__APPLE__)
+  static_cast<void>(prepared);
+  static_cast<void>(routed_input_cpu);
+  static_cast<void>(options);
+  return 0;
+#else
+  const MoeGeometry& geometry = prepared.geometry;
+  if (geometry.hidden != k3_moe_geometry().hidden ||
+      geometry.routed_hidden != k3_moe_geometry().routed_hidden ||
+      geometry.intermediate != k3_moe_geometry().intermediate) {
+    return 0;
+  }
+  if (select_backend(prepared.routed_input.device(), options.expert_backend,
+                     options.cuda_cache) != MoeExpertBackend::MetalMxfp4) {
+    return 0;
+  }
+  if (!routed_input_cpu.defined() ||
+      routed_input_cpu.scalar_type() != at::kFloat ||
+      !routed_input_cpu.device().is_cpu() ||
+      !routed_input_cpu.is_contiguous() ||
+      routed_input_cpu.sizes() != at::IntArrayRef(
+          {1, static_cast<std::int64_t>(geometry.routed_hidden)})) {
+    return 0;
+  }
+  const MetalApi& api = metal_api();
+  if (api.init == nullptr || api.stage_begin == nullptr ||
+      api.stage_edges == nullptr || api.stage_finish == nullptr ||
+      api.stage_abandon == nullptr) {
+    return 0;
+  }
+  const char* shader =
+      options.metal_shader_path.empty() ? nullptr
+                                        : options.metal_shader_path.c_str();
+  if (api.init(shader) != 0) {
+    return 0;
+  }
+  return api.stage_begin(static_cast<int>(kMoeRouteTopK),
+                         routed_input_cpu.const_data_ptr<float>());
+#endif
+}
+
+bool stage_routed_moe_edges_t1(
+    const std::uint64_t token, const PreparedMoeT1& prepared,
+    const std::span<const std::uint16_t> arrived_expert_ids,
+    const std::span<const std::uint8_t* const> arrived_span_pointers,
+    const MoeExpertLayout layout, const std::uint64_t expert_span_bytes,
+    const MoeRunOptions& options) {
+#if !defined(__APPLE__)
+  static_cast<void>(token);
+  static_cast<void>(prepared);
+  static_cast<void>(arrived_expert_ids);
+  static_cast<void>(arrived_span_pointers);
+  static_cast<void>(layout);
+  static_cast<void>(expert_span_bytes);
+  static_cast<void>(options);
+  return false;
+#else
+  if (token == 0 || arrived_expert_ids.empty() ||
+      arrived_expert_ids.size() != arrived_span_pointers.size() ||
+      arrived_expert_ids.size() > kMoeRouteTopK ||
+      expert_span_bytes != required_expert_span(layout, prepared.geometry)) {
+    return false;
+  }
+  const MetalApi& api = metal_api();
+  if (api.stage_edges == nullptr || !metal_descriptor_suite_ready(api, layout)) {
+    return false;
+  }
+  // Map each arrived expert onto the route edge that owns it. The edge index
+  // is the router's own position for that expert, which is what fixes the
+  // reduction order later -- arrival order only decides when the edge's
+  // independent matmul runs, never where its result lands.
+  std::array<K3MetalExpertDescriptorV1, kMoeRouteTopK> descriptors{};
+  std::array<int, kMoeRouteTopK> edges{};
+  std::size_t count = 0;
+  for (std::size_t index = 0; index < arrived_expert_ids.size(); ++index) {
+    const std::uint16_t expert = arrived_expert_ids[index];
+    if (index != 0 && arrived_expert_ids[index - 1] >= expert) {
+      return false;
+    }
+    const std::uint8_t* blob = arrived_span_pointers[index];
+    if (blob == nullptr) {
+      return false;
+    }
+    for (std::size_t edge = 0; edge < kMoeRouteTopK; ++edge) {
+      if (prepared.route.expert_ids[edge] != expert) {
+        continue;
+      }
+      if (count >= edges.size()) {
+        return false;
+      }
+      descriptors[count] = metal_descriptor(layout, expert_span_bytes, blob);
+      edges[count] = static_cast<int>(edge);
+      ++count;
+    }
+  }
+  if (count == 0) {
+    return false;
+  }
+  static_cast<void>(options);
+  return api.stage_edges(token, descriptors.data(), edges.data(),
+                         static_cast<int>(count)) == 0;
+#endif
+}
+
+void abandon_staged_routed_moe_t1(const std::uint64_t token) {
+#if defined(__APPLE__)
+  if (token == 0) {
+    return;
+  }
+  const MetalApi& api = metal_api();
+  if (api.stage_abandon != nullptr) {
+    api.stage_abandon(token);
+  }
+#else
+  static_cast<void>(token);
+#endif
+}
+
+StagedMoeStats staged_moe_stats() {
+  StagedMoeStats stats;
+#if defined(__APPLE__)
+  const MetalApi& api = metal_api();
+  if (api.stage_stats != nullptr) {
+    long long counters[4] = {0, 0, 0, 0};
+    api.stage_stats(counters);
+    stats.begins = static_cast<std::uint64_t>(std::max<long long>(counters[0], 0));
+    stats.edges = static_cast<std::uint64_t>(std::max<long long>(counters[1], 0));
+    stats.reused_finishes =
+        static_cast<std::uint64_t>(std::max<long long>(counters[2], 0));
+    stats.recomputed_finishes =
+        static_cast<std::uint64_t>(std::max<long long>(counters[3], 0));
+  }
+#endif
+  return stats;
 }
 
 bool qualify_moe_shared_gate_up(MoeSpineT1& spine) {

@@ -6,13 +6,13 @@
 //! mirrors the already-deployed format instead of introducing a Rust-specific
 //! variant, so existing sidecars and compiled kernels remain interoperable.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Read};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::error::{DeltafinError, Result};
 use crate::packfile::{Digest, DigestState, digest_bytes};
+use crate::sys::fs::{self as sys_fs, Open};
 
 pub const MAGIC: [u8; 8] = *b"K3SC4V2\0";
 pub const VERSION: u32 = 2;
@@ -344,8 +344,7 @@ pub fn encode_raw_expert(path: impl AsRef<Path>) -> Result<EncodedExpert> {
             path.display()
         )));
     }
-    let after = source
-        .metadata()
+    let after = sys_fs::fstat(&source)
         .map_err(|error| io_error("restat raw expert", path, error))?;
     let after = source_identity(&after);
     if after != before {
@@ -377,7 +376,7 @@ pub fn encode_raw_expert(path: impl AsRef<Path>) -> Result<EncodedExpert> {
 }
 
 pub fn source_still_matches(encoded: &EncodedExpert) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(&encoded.source)
+    let metadata = sys_fs::lstat(&encoded.source)
         .map_err(|error| io_error("reinspect raw expert", &encoded.source, error))?;
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
@@ -392,7 +391,7 @@ pub fn source_still_matches(encoded: &EncodedExpert) -> Result<()> {
 }
 
 fn open_exact_source(path: &Path) -> Result<(File, SourceIdentity)> {
-    let observed = std::fs::symlink_metadata(path)
+    let observed = sys_fs::lstat(path)
         .map_err(|error| io_error("inspect raw expert", path, error))?;
     if observed.file_type().is_symlink()
         || !observed.is_file()
@@ -403,13 +402,12 @@ fn open_exact_source(path: &Path) -> Result<(File, SourceIdentity)> {
             path.display()
         )));
     }
-    let file = OpenOptions::new()
+    let file = Open::new()
         .read(true)
-        .custom_flags(open_nofollow_cloexec())
+        .no_follow()
         .open(path)
         .map_err(|error| io_error("open raw expert without following symlinks", path, error))?;
-    let opened = file
-        .metadata()
+    let opened = sys_fs::fstat(&file)
         .map_err(|error| io_error("stat opened raw expert", path, error))?;
     let observed = source_identity(&observed);
     let opened = source_identity(&opened);
@@ -422,7 +420,7 @@ fn open_exact_source(path: &Path) -> Result<(File, SourceIdentity)> {
     Ok((file, opened))
 }
 
-fn source_identity(metadata: &std::fs::Metadata) -> SourceIdentity {
+fn source_identity(metadata: &sys_fs::Stat) -> SourceIdentity {
     SourceIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
@@ -475,16 +473,6 @@ fn drop_completed_cache(file: &File, bytes: usize) {
 #[cfg(not(target_os = "linux"))]
 fn drop_completed_cache(_file: &File, _bytes: usize) {}
 
-#[cfg(target_os = "macos")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x0100_0000 | 0x0000_0100
-}
-
-#[cfg(target_os = "linux")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x0008_0000 | 0x0002_0000
-}
-
 fn io_error(operation: &str, path: &Path, error: io::Error) -> DeltafinError {
     DeltafinError::new(format!("{operation} {}: {error}", path.display()))
 }
@@ -527,6 +515,7 @@ fn invalid(message: impl Into<String>) -> DeltafinError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
     use std::io::Write as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};

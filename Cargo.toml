@@ -4,6 +4,7 @@ members = [
     "native/deltafin-bootstrap",
     "native/deltafin-curl-sys-direct",
     "native/deltafin-native-build",
+    "native/deltafin-sys",
     "native/deltafin-xtask",
 ]
 default-members = ["native/deltafin"]

@@ -7,10 +7,8 @@
 //! and ignores that inert material instead of deleting user data.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -19,6 +17,7 @@ use crate::cli::SetupQwenArgs;
 use crate::dspark_checkpoint::strict_json;
 use crate::error::{DeltafinError, Result};
 use crate::packfile::Digest;
+use crate::sys::fs::{self as sys_fs, Open};
 use crate::trusted_download::{
     ByteRange, NativeHttpsTransport, Request, ResponseMeta, TimeoutPolicy, Transport,
     fsync_directory, publish_hard_link, rename_noreplace, secure_create_new, verify_regular_digest,
@@ -205,7 +204,7 @@ pub(crate) fn exact_install_bytes() -> Result<u64> {
 pub(crate) fn audited_installed_bytes(root: &Path) -> Result<u64> {
     [WIDE, PROBE].into_iter().try_fold(0_u64, |total, model| {
         let destination = root.join(model.destination);
-        match fs::symlink_metadata(&destination) {
+        match sys_fs::lstat(&destination) {
             Ok(_) => {
                 audit_model(&destination, &model)?;
                 let actual_manifest =
@@ -234,7 +233,7 @@ fn install_model(root: &Path, model: &ModelPin<'_>, transport: &mut dyn Transpor
     require_real_directory(root)?;
     let destination = root.join(model.destination);
     let _lock = InstallationLock::acquire(&destination)?;
-    match fs::symlink_metadata(&destination) {
+    match sys_fs::lstat(&destination) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
             ensure_spotlight_marker(&destination)?;
             // Installations created by the former Python setup path contain
@@ -258,17 +257,14 @@ fn install_model(root: &Path, model: &ModelPin<'_>, transport: &mut dyn Transpor
         Err(error) => return Err(io_error("inspect Qwen destination", &destination, error)),
     }
     let staging = suffix_path(&destination, ".installing")?;
-    match fs::symlink_metadata(&staging) {
+    match sys_fs::lstat(&staging) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
         Ok(_) => return Err(DeltafinError::new("Qwen staging path is unsafe")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             fs::create_dir(&staging)
                 .map_err(|error| io_error("create Qwen staging directory", &staging, error))?;
-            fs::set_permissions(
-                &staging,
-                std::os::unix::fs::PermissionsExt::from_mode(0o700),
-            )
-            .map_err(|error| io_error("secure Qwen staging directory", &staging, error))?;
+            sys_fs::restrict_to_owner(&staging)
+                .map_err(|error| io_error("secure Qwen staging directory", &staging, error))?;
             fsync_directory(root)?;
         }
         Err(error) => return Err(io_error("inspect Qwen staging directory", &staging, error)),
@@ -451,7 +447,7 @@ fn download_file(
     transport: &mut dyn Transport,
 ) -> Result<()> {
     let destination = directory.join(pin.name);
-    match fs::symlink_metadata(&destination) {
+    match sys_fs::lstat(&destination) {
         Ok(_) => return verify_regular_digest(&destination, pin.size, pin.sha256),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(io_error("inspect Qwen file", &destination, error)),
@@ -536,7 +532,7 @@ fn validate_download_response(response: &ResponseMeta, start: u64, size: u64) ->
 fn write_or_validate_manifest(directory: &Path, model: &ModelPin<'_>) -> Result<()> {
     let path = directory.join(MANIFEST_NAME);
     let expected = manifest_bytes(model)?;
-    match fs::symlink_metadata(&path) {
+    match sys_fs::lstat(&path) {
         Ok(_) => {
             let actual = read_regular_limited(&path, 64 << 10)?;
             if actual != expected {
@@ -637,7 +633,7 @@ struct OpenIdentity {
 }
 
 fn existing_part_size(path: &Path, maximum: u64) -> Result<u64> {
-    match fs::symlink_metadata(path) {
+    match sys_fs::lstat(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(
             DeltafinError::new(format!("refusing unsafe Qwen partial {}", path.display())),
         ),
@@ -652,15 +648,14 @@ fn existing_part_size(path: &Path, maximum: u64) -> Result<u64> {
 }
 
 fn open_part_append(path: &Path, expected_size: u64) -> Result<(File, OpenIdentity)> {
-    let file = OpenOptions::new()
+    let file = Open::new()
         .create(true)
         .append(true)
         .mode(0o600)
-        .custom_flags(open_nofollow_cloexec())
+        .no_follow()
         .open(path)
         .map_err(|error| io_error("open Qwen partial safely", path, error))?;
-    let metadata = file
-        .metadata()
+    let metadata = sys_fs::fstat(&file)
         .map_err(|error| io_error("stat Qwen partial", path, error))?;
     if !metadata.is_file() || metadata.len() != expected_size {
         return Err(DeltafinError::new("Qwen partial changed while opening"));
@@ -680,8 +675,7 @@ fn validate_open_identity(
     size: u64,
     path: &Path,
 ) -> Result<()> {
-    let metadata = file
-        .metadata()
+    let metadata = sys_fs::fstat(&file)
         .map_err(|error| io_error("restat Qwen partial", path, error))?;
     if !metadata.is_file()
         || metadata.dev() != identity.device
@@ -701,7 +695,7 @@ fn rollback_partial(file: &File, path: &Path, length: u64) -> Result<()> {
 }
 
 fn read_regular_limited(path: &Path, maximum: u64) -> Result<Vec<u8>> {
-    let before = fs::symlink_metadata(path)
+    let before = sys_fs::lstat(path)
         .map_err(|error| io_error("inspect Qwen regular file", path, error))?;
     if before.file_type().is_symlink() || !before.is_file() || before.len() > maximum {
         return Err(DeltafinError::new(format!(
@@ -709,13 +703,12 @@ fn read_regular_limited(path: &Path, maximum: u64) -> Result<Vec<u8>> {
             path.display()
         )));
     }
-    let mut file = OpenOptions::new()
+    let mut file = Open::new()
         .read(true)
-        .custom_flags(open_nofollow_cloexec())
+        .no_follow()
         .open(path)
         .map_err(|error| io_error("open Qwen regular file safely", path, error))?;
-    let opened = file
-        .metadata()
+    let opened = sys_fs::fstat(&file)
         .map_err(|error| io_error("stat Qwen regular file", path, error))?;
     if (opened.dev(), opened.ino(), opened.len()) != (before.dev(), before.ino(), before.len()) {
         return Err(DeltafinError::new(
@@ -725,8 +718,7 @@ fn read_regular_limited(path: &Path, maximum: u64) -> Result<Vec<u8>> {
     let mut raw = Vec::with_capacity(opened.len() as usize);
     file.read_to_end(&mut raw)
         .map_err(|error| io_error("read Qwen regular file", path, error))?;
-    let after = file
-        .metadata()
+    let after = sys_fs::fstat(&file)
         .map_err(|error| io_error("restat Qwen regular file", path, error))?;
     if (after.dev(), after.ino(), after.len()) != (opened.dev(), opened.ino(), raw.len() as u64) {
         return Err(DeltafinError::new(
@@ -741,7 +733,7 @@ fn ensure_spotlight_marker(directory: &Path) -> Result<()> {
         return Ok(());
     }
     let marker = directory.join(SPOTLIGHT_MARKER);
-    match fs::symlink_metadata(&marker) {
+    match sys_fs::lstat(&marker) {
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(()),
         Ok(_) => Err(DeltafinError::new("unsafe Qwen Spotlight marker")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -759,7 +751,7 @@ fn validate_spotlight_marker(directory: &Path) -> Result<()> {
         return Ok(());
     }
     let marker = directory.join(SPOTLIGHT_MARKER);
-    let metadata = fs::symlink_metadata(&marker)
+    let metadata = sys_fs::lstat(&marker)
         .map_err(|error| io_error("inspect Qwen Spotlight marker", &marker, error))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(DeltafinError::new("Qwen Spotlight marker is unsafe"));
@@ -768,7 +760,7 @@ fn validate_spotlight_marker(directory: &Path) -> Result<()> {
 }
 
 fn require_real_directory(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
+    let metadata = sys_fs::lstat(path)
         .map_err(|error| io_error("inspect Qwen directory", path, error))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(DeltafinError::new(format!(
@@ -793,23 +785,23 @@ struct InstallationLock(File);
 impl InstallationLock {
     fn acquire(destination: &Path) -> Result<Self> {
         let path = suffix_path(destination, ".install.lock")?;
-        let file = OpenOptions::new()
+        let file = Open::new()
             .read(true)
             .write(true)
             .create(true)
             .mode(0o600)
-            .custom_flags(open_nofollow_cloexec())
+            .no_follow()
             .open(&path)
             .map_err(|error| io_error("open Qwen installation lock", &path, error))?;
-        if !file
-            .metadata()
+        if !sys_fs::fstat(&file)
             .map_err(|error| io_error("stat Qwen installation lock", &path, error))?
             .is_file()
         {
             return Err(DeltafinError::new("Qwen installation lock is not regular"));
         }
-        // SAFETY: the descriptor stays live for the lock lifetime.
-        if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+        if !sys_fs::try_lock_exclusive(&file)
+            .map_err(|error| io_error("acquire Qwen installation lock", &path, error))?
+        {
             return Err(DeltafinError::new(
                 "another Qwen installer is active for this destination",
             ));
@@ -820,25 +812,8 @@ impl InstallationLock {
 
 impl Drop for InstallationLock {
     fn drop(&mut self) {
-        // SAFETY: the descriptor is live through this call.
-        let _ = unsafe { flock(self.0.as_raw_fd(), LOCK_UN) };
+        sys_fs::unlock(&self.0);
     }
-}
-
-unsafe extern "C" {
-    fn flock(fd: i32, operation: i32) -> i32;
-}
-const LOCK_EX: i32 = 2;
-const LOCK_NB: i32 = 4;
-const LOCK_UN: i32 = 8;
-
-#[cfg(target_os = "macos")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x0100_0100
-}
-#[cfg(target_os = "linux")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x000a_0000
 }
 
 const fn pin(name: &'static str, size: u64, hex: &'static str) -> FilePin {

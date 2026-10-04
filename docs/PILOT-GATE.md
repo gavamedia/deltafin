@@ -188,10 +188,13 @@ compute-only windows; that budget is worth ~4% of steady decode here, and
 speculation → aggressively gated → gated → full), everything except "none"
 is indistinguishable, so the default configuration sits at the measured
 maximum within this experiment's power; no gate setting can add measurable
-speed on this machine. Defaults stay `on` / threshold 0.10 / warmup 16:
-same speed as every alternative measured, plus the redirects at the
-collapsed layers, the per-layer diagnostic surface, and self-correction if
-a future quantization or model revision shifts the map. Recall-improving
+speed on this machine. The gate therefore shipped as `on` / threshold 0.10
+/ warmup 16: same speed as every alternative measured, plus the redirects at
+the collapsed layers, the per-layer diagnostic surface, and self-correction
+if a future quantization or model revision shifts the map. A later clean,
+freeze-free France-oracle A/B measured full speculation (`off`) at 0.2901
+tok/s against the gate's 0.2847 with byte-identical output (+1.9%), so since
+2026-08-06 the default is `off`; `on` and `measure` remain available. Recall-improving
 extensions (delayed snapshots, learned correctors) inherit the same ~4%
 ceiling; larger decode wins on this machine live outside prefetch
 scheduling entirely (fewer bytes per miss, bigger caches, spine-stream
@@ -250,6 +253,22 @@ be Spotlight's baseline resident cost rather than active work on this repo
 specifically. `deltafin setup` now excludes the whole model root from
 Spotlight automatically regardless (see below); it costs nothing and can
 only help if this ever recurs.
+
+The engine now also prevents rather than survives these refusals, two ways.
+First: every admission failure ever recorded — across four campaigns — was
+the full-speculation arm, never the suppressed arm, and the mechanism is the
+speculative-prefetch arena, which lazily materializes up to ~1.1 GiB of
+slabs it retains for the whole run while measured admission margins were
+0–340 MiB; a failed growth proof now sheds those advisory slabs (they
+re-grow lazily on the next speculative read) and re-proves immediately
+before waiting on anyone else's memory. Second: a bounded request
+(`--max-new`, envelope ≤ 512 tokens) proves its whole context ceiling at its
+first chunk, so every later growth boundary takes the committed-capacity
+fast path with no live mid-run proof — pressure arriving mid-run (opening
+another application) can no longer fail a generation that was admissible
+when it began; a declined envelope just falls back to incremental growth.
+Verified live: the envelope pre-admits at request start and the output is
+byte-identical to the pre-fix binary (same preflight sha).
 
 **Open finding, not yet resolved**: tracing individual outlier chunks (not
 tied to cache growth) turned up several, scattered through one campaign, where

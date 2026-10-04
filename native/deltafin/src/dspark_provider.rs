@@ -6,9 +6,9 @@
 //! seven already-read BF16 embedding rows per proposal. The K3 LM head is
 //! borrowed from the owning provider session.
 
-use std::ffi::{CStr, c_char, c_void};
+use std::ffi::{CStr, c_char};
+use std::fs::File;
 use std::mem::size_of;
-use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::ptr;
 use std::sync::{Arc, Mutex};
@@ -23,26 +23,29 @@ use crate::error::{DeltafinError, Result};
 use crate::inventory::PINNED_INVENTORY_SHA256;
 use crate::platform::Device;
 use crate::provider::{NativeProviderSession, ProviderTensor, SessionInner};
+use crate::sys::fs as sys_fs;
 
 const ABI_VERSION: u32 = 1;
-const BF16: u32 = 1;
+pub(crate) const BF16: u32 = 1;
 const TENSOR_COUNT: usize = 67;
 const QUERY_ROWS: usize = 7;
 const HIDDEN: usize = 7_168;
 const TARGET_CONTEXT: usize = 5 * HIDDEN;
 const ERROR_CAPACITY: usize = 2_048;
 
+/// One borrowed BF16 weight for a proposal-model create call; shared by the
+/// DSpark and EAGLE-3 rosters (`DeltafinProviderDSparkTensorV1`).
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct TensorV1 {
-    slot: u32,
-    scalar_type: u32,
-    rank: u32,
-    flags: u32,
-    shape: [u64; 2],
-    data: *const u8,
-    data_length: u64,
-    reserved: [u64; 2],
+pub(crate) struct TensorV1 {
+    pub(crate) slot: u32,
+    pub(crate) scalar_type: u32,
+    pub(crate) rank: u32,
+    pub(crate) flags: u32,
+    pub(crate) shape: [u64; 2],
+    pub(crate) data: *const u8,
+    pub(crate) data_length: u64,
+    pub(crate) reserved: [u64; 2],
 }
 
 #[repr(C)]
@@ -86,7 +89,7 @@ impl ReportV1 {
 }
 
 #[repr(C)]
-struct ResourceV1 {
+pub(crate) struct ResourceV1 {
     struct_size: u32,
     abi_version: u32,
     session: u64,
@@ -96,7 +99,7 @@ struct ResourceV1 {
     reserved: [u64; 4],
 }
 
-fn resource(session: u64, handle: u64) -> ResourceV1 {
+pub(crate) fn resource(session: u64, handle: u64) -> ResourceV1 {
     ResourceV1 {
         struct_size: size_of::<ResourceV1>() as u32,
         abi_version: ABI_VERSION,
@@ -266,69 +269,43 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> i32;
-    fn mmap(
-        address: *mut c_void,
-        length: usize,
-        protection: i32,
-        flags: i32,
-        file_descriptor: i32,
-        offset: i64,
-    ) -> *mut c_void;
-    fn munmap(address: *mut c_void, length: usize) -> i32;
 }
 
-struct ReadOnlyMap {
-    address: *mut c_void,
-    length: usize,
-}
+pub(crate) struct ReadOnlyMap(sys_fs::ReadOnlyMap);
 
 impl ReadOnlyMap {
     fn checkpoint(checkpoint: &DSparkCheckpoint) -> Result<Self> {
-        let length = usize::try_from(
-            checkpoint
-                .file()
-                .metadata()
-                .map_err(|error| DeltafinError::new(format!("stat DSpark checkpoint: {error}")))?
-                .len(),
-        )
-        .map_err(|_| DeltafinError::new("DSpark checkpoint length exceeds usize"))?;
-        // SAFETY: admitted regular file remains open for this map's lifetime;
-        // mapping is read-only/private and offset zero is page aligned.
-        let address = unsafe {
-            mmap(
-                ptr::null_mut(),
-                length,
-                1, // PROT_READ
-                2, // MAP_PRIVATE on supported Unix targets
-                checkpoint.file().as_raw_fd(),
-                0,
-            )
-        };
-        if address as isize == -1 {
-            return Err(DeltafinError::new("mmap admitted DSpark checkpoint failed"));
-        }
-        Ok(Self { address, length })
+        Self::file(checkpoint.file())
     }
 
-    fn pointer(&self, offset: u64, length: u64) -> Result<*const u8> {
+    /// Map an admitted proposal checkpoint read-only for one synchronous
+    /// native bind.
+    pub(crate) fn file(file: &File) -> Result<Self> {
+        let length = usize::try_from(
+            file.metadata()
+                .map_err(|error| DeltafinError::new(format!("stat proposal checkpoint: {error}")))?
+                .len(),
+        )
+        .map_err(|_| DeltafinError::new("proposal checkpoint length exceeds usize"))?;
+        sys_fs::ReadOnlyMap::map(file, length)
+            .map(Self)
+            .map_err(|error| {
+                DeltafinError::new(format!("map admitted proposal checkpoint: {error}"))
+            })
+    }
+
+    pub(crate) fn pointer(&self, offset: u64, length: u64) -> Result<*const u8> {
         let offset = usize::try_from(offset)
             .map_err(|_| DeltafinError::new("DSpark tensor offset exceeds usize"))?;
         let length = usize::try_from(length)
             .map_err(|_| DeltafinError::new("DSpark tensor length exceeds usize"))?;
-        if offset > self.length || length > self.length - offset {
+        if offset > self.0.len() || length > self.0.len() - offset {
             return Err(DeltafinError::new(
                 "DSpark tensor range exceeds mapped checkpoint",
             ));
         }
-        // SAFETY: bounds were checked against the live map.
-        Ok(unsafe { self.address.cast::<u8>().add(offset) })
-    }
-}
-
-impl Drop for ReadOnlyMap {
-    fn drop(&mut self) {
-        // SAFETY: this object owns exactly this successful mapping.
-        let _ = unsafe { munmap(self.address, self.length) };
+        // SAFETY: the checked extent lies within this live mapping.
+        Ok(unsafe { self.0.address().add(offset) })
     }
 }
 
@@ -995,19 +972,20 @@ impl DraftBackend for NativeDSparkBackend {
     fn advance_target_state(
         &mut self,
         target_context: &Self::TargetContext,
-        committed_rows: usize,
+        committed_input_ids: &[u32],
     ) -> std::result::Result<(), BackendFailure> {
+        // DSpark consumes the rows alone; the IDs are already in its ledger.
         self.model
-            .append_target_context_tensor_prefix(target_context, committed_rows)
+            .append_target_context_tensor_prefix(target_context, committed_input_ids.len())
             .map_err(releasable_backend_failure)
     }
 }
 
-fn releasable_backend_failure(error: DeltafinError) -> BackendFailure {
+pub(crate) fn releasable_backend_failure(error: DeltafinError) -> BackendFailure {
     BackendFailure::releasable(error.to_string())
 }
 
-fn hex_digest(digest: &[u8; 32]) -> String {
+pub(crate) fn hex_digest(digest: &[u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(64);
     for &byte in digest {
@@ -1017,16 +995,16 @@ fn hex_digest(digest: &[u8; 32]) -> String {
     output
 }
 
-type ReleaseFn = unsafe extern "C" fn(*const ResourceV1, *mut c_char, usize) -> i32;
+pub(crate) type ReleaseFn = unsafe extern "C" fn(*const ResourceV1, *mut c_char, usize) -> i32;
 
-fn release(session: u64, handle: u64, function: ReleaseFn) {
+pub(crate) fn release(session: u64, handle: u64, function: ReleaseFn) {
     let request = resource(session, handle);
     let mut error = [0 as c_char; ERROR_CAPACITY];
     // SAFETY: caller's Arc ordering keeps the owning session live.
     let _ = unsafe { function(&request, error.as_mut_ptr(), error.len()) };
 }
 
-fn ffi_status(status: i32, operation: &str, error: &[c_char]) -> Result<()> {
+pub(crate) fn ffi_status(status: i32, operation: &str, error: &[c_char]) -> Result<()> {
     if status == 0 {
         return Ok(());
     }

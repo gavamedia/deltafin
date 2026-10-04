@@ -85,21 +85,24 @@ fn parse_spine_resident_gb(raw: &str) -> Result<u64> {
     Ok(bytes as u64)
 }
 
-fn parse_expert_pin_gb(raw: &str) -> Result<u64> {
+fn parse_expert_pin_gb(raw: &str) -> Result<Option<u64>> {
+    if raw.trim().eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
     let gigabytes = if raw.trim().is_empty() {
         0.0
     } else {
         raw.trim().parse::<f64>().map_err(|_| {
-            DeltafinError::new("K3_EXPERT_PIN_GB must be a finite non-negative number")
+            DeltafinError::new("K3_EXPERT_PIN_GB must be auto or a finite non-negative number")
         })?
     };
     let bytes = gigabytes * 1_000_000_000.0;
     if !gigabytes.is_finite() || gigabytes < 0.0 || bytes > u64::MAX as f64 {
         return Err(DeltafinError::new(
-            "K3_EXPERT_PIN_GB must be a finite non-negative number",
+            "K3_EXPERT_PIN_GB must be auto or a finite non-negative number",
         ));
     }
-    Ok(bytes as u64)
+    Ok(Some(bytes as u64))
 }
 
 fn parse_expert_heat(raw: &str) -> Result<bool> {
@@ -108,6 +111,16 @@ fn parse_expert_heat(raw: &str) -> Result<bool> {
         "0" | "false" | "off" | "no" | "disabled" => Ok(false),
         _ => Err(DeltafinError::new(
             "K3_EXPERT_HEAT must be 0/1, false/true, or off/on",
+        )),
+    }
+}
+
+fn parse_expert_early_drain(raw: &str) -> Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" | "enabled" => Ok(true),
+        "0" | "false" | "off" | "no" | "disabled" => Ok(false),
+        _ => Err(DeltafinError::new(
+            "K3_EXPERT_EARLY_DRAIN must be 0/1, false/true, or off/on",
         )),
     }
 }
@@ -220,6 +233,27 @@ pub enum DSparkRequest {
     Off,
     Auto,
     On,
+}
+
+/// EAGLE-3.1 hidden-state chain drafter (`k3-draft-eagle3/`). When it loads it
+/// takes the proposal slot DSpark would otherwise hold, under the same
+/// `K3_DSPARK` mode; `off` leaves the slot to DSpark.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Eagle3Request {
+    Off,
+    Auto,
+    On,
+}
+
+impl Eagle3Request {
+    pub fn parse(value: Option<&str>) -> Result<Self> {
+        match value.unwrap_or("auto").trim().to_ascii_lowercase().as_str() {
+            "off" | "0" => Ok(Self::Off),
+            "" | "auto" => Ok(Self::Auto),
+            "on" | "1" => Ok(Self::On),
+            _ => Err(DeltafinError::new("K3_EAGLE3 must be off, auto, or on")),
+        }
+    }
 }
 
 /// Admission policy for PILOT speculative expert reads. `On` scores every
@@ -347,15 +381,30 @@ pub struct RuntimeConfig {
     /// to the same host/device safety envelope.
     pub provider_resident_layers: Option<usize>,
     pub expert_read_threads: Option<usize>,
+    /// Extra drives holding byte-identical copies of model files
+    /// (`K3_STORAGE_HOMES`). Empty keeps every read on the model root's drive.
+    pub storage_homes: Vec<crate::storage_homes::StorageHomeSpec>,
     pub expert_backend: ExpertBackendRequest,
     pub expert_scale4: ExpertScale4Request,
-    /// Byte budget for the permanent learned-expert RAM tier. Zero keeps the
-    /// tier off; a budget only marks histogram candidates, which are still
-    /// promoted lazily on their first authoritative read.
-    pub expert_pin_bytes: u64,
+    /// Byte budget for the permanent learned-expert RAM tier. `None` is the
+    /// automatic default: sized at startup to exactly the qualifying
+    /// histogram roster, capped by live free memory minus a reserved
+    /// headroom, and zero (off) while history is thin or memory is tight.
+    /// `Some(0)` forces the tier off; `Some(n)` is an explicit budget. Any
+    /// budget only marks histogram candidates, which are still promoted
+    /// lazily on their first authoritative read.
+    pub expert_pin_bytes: Option<u64>,
     /// Whether ordinary runs accumulate the persistent expert-heat histogram.
     /// Recording is advisory and default-on; it never affects routing.
     pub expert_heat: bool,
+    /// Whether a decode layer starts each missing expert's own matmul as soon
+    /// as that expert's bytes land, instead of waiting for the layer's whole
+    /// miss set. Scheduling only: the router still fixes which experts run,
+    /// their fp32 weights, and the order they are reduced in, so this cannot
+    /// change output. Default off: it measured as a clean null on the
+    /// reference host (docs/OPTIMIZATIONS.md), so it stays an explicit option
+    /// rather than an unmeasured default in the hot path.
+    pub expert_early_drain: bool,
     /// Adaptive admission for PILOT speculative expert reads. Threshold and
     /// warmup are resolved even when the gate is off so a bad value never
     /// silently rides along with a disabled feature.
@@ -366,6 +415,7 @@ pub struct RuntimeConfig {
     pub dspark: DSparkRequest,
     pub dspark_max_context: Option<usize>,
     pub dspark_min_auto_speedup: f64,
+    pub eagle3: Eagle3Request,
     pub qwen: QwenRequest,
     /// Chat thinking depth (`low`, `high`, or `max`), normalized. `None`
     /// defers to the chat template's own default of `max`; the server's
@@ -414,16 +464,26 @@ impl RuntimeConfig {
             .as_deref()
             .map(parse_expert_read_threads)
             .transpose()?;
+        let storage_homes = environment("K3_STORAGE_HOMES")
+            .as_deref()
+            .map(crate::storage_homes::parse_storage_homes)
+            .transpose()?
+            .unwrap_or_default();
         let expert_pin_bytes = environment("K3_EXPERT_PIN_GB")
             .as_deref()
             .map(parse_expert_pin_gb)
             .transpose()?
-            .unwrap_or(0);
+            .flatten();
         let expert_heat = environment("K3_EXPERT_HEAT")
             .as_deref()
             .map(parse_expert_heat)
             .transpose()?
             .unwrap_or(true);
+        let expert_early_drain = environment("K3_EXPERT_EARLY_DRAIN")
+            .as_deref()
+            .map(parse_expert_early_drain)
+            .transpose()?
+            .unwrap_or(false);
         let backend_value = arguments.expert_backend.or_else(|| environment("K3_MOE"));
         let router_trace_path = arguments
             .router_trace
@@ -458,6 +518,7 @@ impl RuntimeConfig {
         )?
         .with_resident_weights(resident_weights);
         let dspark = DSparkRequest::parse(environment("K3_DSPARK").as_deref())?;
+        let eagle3 = Eagle3Request::parse(environment("K3_EAGLE3").as_deref())?;
         let qwen = QwenRequest::parse(environment("K3_UAG_DRAFT").as_deref())?;
         let reasoning_effort = arguments
             .reasoning_effort
@@ -515,10 +576,12 @@ impl RuntimeConfig {
             spine_resident_bytes,
             provider_resident_layers,
             expert_read_threads,
+            storage_homes,
             expert_backend: ExpertBackendRequest::parse(backend_value.as_deref())?,
             expert_scale4,
             expert_pin_bytes,
             expert_heat,
+            expert_early_drain,
             pilot_gate,
             pilot_gate_threshold,
             pilot_gate_warmup,
@@ -526,6 +589,7 @@ impl RuntimeConfig {
             dspark,
             dspark_max_context,
             dspark_min_auto_speedup,
+            eagle3,
             qwen,
             reasoning_effort,
         })
@@ -571,10 +635,10 @@ impl std::fmt::Display for RuntimeConfig {
             "surface={:?} device={:?} spine={:?} spine_read_threads={} spine_fd_cache={} \
              spine_stream_nocache={} expert_stream_nocache={} spine_resident_bytes={} \
              provider_resident_layers={} \
-             expert_read_threads={} expert_backend={:?} expert_scale4={:?} \
-             expert_pin_bytes={} expert_heat={} pilot_gate={:?} \
+             expert_read_threads={} storage_homes={} expert_backend={:?} expert_scale4={:?} \
+             expert_pin_bytes={} expert_heat={} expert_early_drain={} pilot_gate={:?} \
              pilot_gate_threshold={} pilot_gate_warmup={} quality={:?} \
-             dspark={:?} dspark_max_context={} dspark_min_auto_speedup={} qwen={:?} \
+             dspark={:?} dspark_max_context={} dspark_min_auto_speedup={} eagle3={:?} qwen={:?} \
              reasoning_effort={} router_trace_mode={:?} router_trace_path={} chat={} \
              stats={} layer_profile={} max_new={}",
             self.surface,
@@ -587,10 +651,12 @@ impl std::fmt::Display for RuntimeConfig {
             describe_u64(self.spine_resident_bytes),
             describe_usize(self.provider_resident_layers),
             describe_usize(self.expert_read_threads),
+            describe_storage_homes(&self.storage_homes),
             self.expert_backend,
             self.expert_scale4,
-            self.expert_pin_bytes,
+            describe_u64(self.expert_pin_bytes),
             self.expert_heat,
+            self.expert_early_drain,
             self.pilot_gate,
             self.pilot_gate_threshold,
             self.pilot_gate_warmup,
@@ -598,6 +664,7 @@ impl std::fmt::Display for RuntimeConfig {
             self.dspark,
             describe_usize(self.dspark_max_context),
             self.dspark_min_auto_speedup,
+            self.eagle3,
             self.qwen,
             self.reasoning_effort.as_deref().unwrap_or("default"),
             self.router_trace_mode,
@@ -608,6 +675,26 @@ impl std::fmt::Display for RuntimeConfig {
             describe_u64(self.max_new),
         )
     }
+}
+
+fn describe_storage_homes(homes: &[crate::storage_homes::StorageHomeSpec]) -> String {
+    if homes.iter().all(|home| home.path.is_none()) {
+        return "none".to_string();
+    }
+    homes
+        .iter()
+        .map(|home| {
+            let path = home
+                .path
+                .as_ref()
+                .map_or_else(|| "primary".to_string(), |path| path.display().to_string());
+            match home.gbps {
+                Some(gbps) => format!("{path}@{gbps}"),
+                None => path,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn describe_usize(value: Option<usize>) -> String {
@@ -695,8 +782,14 @@ mod tests {
     #[test]
     fn expert_pin_and_heat_knobs_parse_strictly_and_default_safely() {
         let defaults = RuntimeConfig::resolve(arguments(), |_| None).unwrap();
-        assert_eq!(defaults.expert_pin_bytes, 0);
+        assert_eq!(defaults.expert_pin_bytes, None, "unset means automatic sizing");
         assert!(defaults.expert_heat);
+
+        let explicit_auto = RuntimeConfig::resolve(arguments(), |name| {
+            (name == "K3_EXPERT_PIN_GB").then(|| " AUTO ".into())
+        })
+        .unwrap();
+        assert_eq!(explicit_auto.expert_pin_bytes, None);
 
         let enabled = RuntimeConfig::resolve(arguments(), |name| match name {
             "K3_EXPERT_PIN_GB" => Some("2.5".into()),
@@ -704,14 +797,14 @@ mod tests {
             _ => None,
         })
         .unwrap();
-        assert_eq!(enabled.expert_pin_bytes, 2_500_000_000);
+        assert_eq!(enabled.expert_pin_bytes, Some(2_500_000_000));
         assert!(!enabled.expert_heat);
 
         let zero = RuntimeConfig::resolve(arguments(), |name| {
             (name == "K3_EXPERT_PIN_GB").then(|| "0".into())
         })
         .unwrap();
-        assert_eq!(zero.expert_pin_bytes, 0);
+        assert_eq!(zero.expert_pin_bytes, Some(0), "explicit zero forces the tier off");
 
         // A bad value fails closed even though it would disable the feature.
         for bad in ["-1", "nan", "gigabytes", "inf"] {
@@ -748,10 +841,12 @@ mod tests {
             "spine_resident_bytes=",
             "provider_resident_layers=",
             "expert_read_threads=",
+            "storage_homes=",
             "expert_backend=",
             "expert_scale4=",
             "expert_pin_bytes=",
             "expert_heat=",
+            "expert_early_drain=",
             "pilot_gate=",
             "pilot_gate_threshold=",
             "pilot_gate_warmup=",
@@ -759,6 +854,7 @@ mod tests {
             "dspark=",
             "dspark_max_context=",
             "dspark_min_auto_speedup=",
+            "eagle3=",
             "qwen=",
             "reasoning_effort=",
             "router_trace_mode=",
@@ -812,6 +908,7 @@ mod tests {
         assert_eq!(auto.dspark, DSparkRequest::Auto);
         assert_eq!(auto.dspark_max_context, Some(8_192));
         assert_eq!(auto.dspark_min_auto_speedup, 0.03);
+        assert_eq!(auto.eagle3, Eagle3Request::Auto);
         assert_eq!(auto.router_trace_mode, RouterTraceMode::Off);
         assert!(auto.router_trace_path.is_none());
     }
@@ -1018,6 +1115,32 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("[0,1)")
+        );
+    }
+
+    #[test]
+    fn eagle3_environment_is_tristate_and_fail_closed() {
+        for (raw, expected) in [
+            ("off", Eagle3Request::Off),
+            ("0", Eagle3Request::Off),
+            ("auto", Eagle3Request::Auto),
+            ("", Eagle3Request::Auto),
+            ("ON", Eagle3Request::On),
+            ("1", Eagle3Request::On),
+        ] {
+            let resolved = RuntimeConfig::resolve(arguments(), |name| {
+                (name == "K3_EAGLE3").then(|| raw.into())
+            })
+            .unwrap();
+            assert_eq!(resolved.eagle3, expected, "{raw:?}");
+        }
+        assert!(
+            RuntimeConfig::resolve(arguments(), |name| {
+                (name == "K3_EAGLE3").then(|| "maybe".into())
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("K3_EAGLE3")
         );
     }
 

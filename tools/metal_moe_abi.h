@@ -63,6 +63,62 @@ int k3_metal_moe_positions_desc_v1(
     const int* position_offsets, int position_count, const float* weights,
     const float* input, float* output);
 
+/*
+ * Staged single-position execution ("expert early drain").
+ *
+ * The ordinary layer call needs every expert's bytes before it can encode
+ * anything. These entry points let a caller whose experts arrive from storage
+ * one at a time run each expert's independent GLU/W2 work the moment that
+ * expert's own bytes have landed, while the rest of the layer is still being
+ * read.
+ *
+ * Exactness contract: staging changes command-buffer packaging only. A staged
+ * edge runs the same per-expert kernels, over the same bytes, into the same
+ * per-edge output slot as the unstaged path, and the weighted reduction still
+ * runs exactly once, inside the finish call, over every edge in the caller's
+ * canonical route order. Arrival order can never reach the fp32 accumulation.
+ *
+ *   k3_metal_moe_stage_begin_v1(expert_count, input)
+ *       Latch one layer's edge count and activation row. Returns a nonzero
+ *       staging token, or 0 when staging is unavailable (the caller then just
+ *       uses the ordinary layer call). Any other bridge entry point
+ *       invalidates an outstanding token rather than corrupting it.
+ *
+ *   k3_metal_moe_stage_edges_v1(token, experts, edges, count)
+ *       Compute GLU+W2 for `count` edges whose bytes are now readable.
+ *       experts[i] describes the blob for edge edges[i]. Commits without
+ *       waiting: the GPU works while the caller returns to its reads. A
+ *       nonzero result means nothing was staged for this call.
+ *
+ *   k3_metal_moe_stage_finish_v1(token, experts, expert_count, weights,
+ *                                input, output)
+ *       Complete the layer. Computes whatever was never staged, then reduces.
+ *       `experts` covers every edge in route order, exactly as the ordinary
+ *       call. A stale, mismatched, or failed staging state is not an error:
+ *       the call silently recomputes every edge, so its output never depends
+ *       on whether staging happened.
+ *
+ *   k3_metal_moe_stage_abandon_v1(token)
+ *       Drop an unfinished staging token. Harmless for an already-consumed or
+ *       already-superseded token.
+ */
+uint64_t k3_metal_moe_stage_begin_v1(int expert_count, const float* input);
+
+int k3_metal_moe_stage_edges_v1(uint64_t token,
+                                const K3MetalExpertDescriptorV1* experts,
+                                const int* edges, int count);
+
+int k3_metal_moe_stage_finish_v1(uint64_t token,
+                                 const K3MetalExpertDescriptorV1* experts,
+                                 int expert_count, const float* weights,
+                                 const float* input, float* output);
+
+void k3_metal_moe_stage_abandon_v1(uint64_t token);
+
+/* [begins, edges staged, finishes that reused staging, finishes that fell
+ * back to full recomputation]. Diagnostic only. */
+void k3_metal_moe_stage_stats_v1(long long* four);
+
 #ifdef __cplusplus
 }
 #endif

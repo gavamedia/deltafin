@@ -264,10 +264,14 @@ pub trait DraftBackend {
         pending_token_id: u32,
         max_drafts: u8,
     ) -> std::result::Result<BackendProposal, BackendFailure>;
+    /// Append the committed target rows in `target_context`. Row `i` is the
+    /// position that consumed `committed_input_ids[i]`; a backend that pairs
+    /// each row with its successor token (EAGLE-3) reads the IDs, while one
+    /// that consumes rows alone (DSpark) needs only their count.
     fn advance_target_state(
         &mut self,
         target_context: &Self::TargetContext,
-        expected_token_count: usize,
+        committed_input_ids: &[u32],
     ) -> std::result::Result<(), BackendFailure>;
 }
 
@@ -278,6 +282,17 @@ pub struct RuntimeConfig {
     pub max_drafts: u8,
     pub max_context_tokens: Option<usize>,
     pub min_auto_speedup: f64,
+    /// Whether one verified proposal with no accepted draft ends proposals
+    /// for the request. Right for a drafter whose first guess is rarely
+    /// right (DSpark); a chain drafter that agrees with K3 ~90% of the time
+    /// (EAGLE-3) instead narrows to the probe width and keeps going.
+    pub disable_on_miss: bool,
+    /// Automatic-mode verified steps observed before a negative cumulative
+    /// credit, a losing probe or a loss streak may disable proposals. One
+    /// early miss is noise for a drafter that usually wins.
+    pub economic_grace_steps: u32,
+    /// Consecutive clearly-losing automatic steps that disable proposals.
+    pub loss_streak_limit: u8,
 }
 
 impl Default for RuntimeConfig {
@@ -288,6 +303,9 @@ impl Default for RuntimeConfig {
             max_drafts: MAX_DRAFTS,
             max_context_tokens: Some(8_192),
             min_auto_speedup: 0.03,
+            disable_on_miss: true,
+            economic_grace_steps: 0,
+            loss_streak_limit: 2,
         }
     }
 }
@@ -315,6 +333,11 @@ impl RuntimeConfig {
         if !self.min_auto_speedup.is_finite() || !(0.0..1.0).contains(&self.min_auto_speedup) {
             return Err(RuntimeError::configuration(
                 "DSpark minimum automatic speedup must be finite in [0, 1)",
+            ));
+        }
+        if self.loss_streak_limit == 0 {
+            return Err(RuntimeError::configuration(
+                "DSpark loss-streak limit must be positive",
             ));
         }
         Ok(self)
@@ -569,6 +592,7 @@ struct ActiveRequest<S: Clone> {
     last_verifier_seconds: Option<f64>,
     economic_credit_seconds: f64,
     economic_loss_streak: u8,
+    economic_steps: u32,
     last_resolved: Option<(u64, usize, usize)>,
 }
 
@@ -919,6 +943,7 @@ impl<B: DraftBackend> DSparkRuntime<B> {
             last_verifier_seconds: None,
             economic_credit_seconds: 0.0,
             economic_loss_streak: 0,
+            economic_steps: 0,
             last_resolved: None,
         });
         if enabled {
@@ -990,7 +1015,8 @@ impl<B: DraftBackend> DSparkRuntime<B> {
         }
         self.metrics.verified_step_seconds += seconds;
         let auto_mode = self.mode == Mode::Auto;
-        let (baseline, expected, credit, should_evaluate) = {
+        let grace_steps = self.config.economic_grace_steps;
+        let (baseline, expected, credit, should_evaluate, in_grace) = {
             let active = self.active_for_mut(lease)?;
             active.last_resolved = None;
             let baseline = active.baseline_seconds_per_token;
@@ -998,12 +1024,14 @@ impl<B: DraftBackend> DSparkRuntime<B> {
             let credit = expected.map(|value| value - seconds);
             if let Some(value) = credit {
                 active.economic_credit_seconds += value;
+                active.economic_steps = active.economic_steps.saturating_add(1);
             }
             (
                 baseline,
                 expected,
                 credit,
                 auto_mode && active.proposals_enabled,
+                active.economic_steps <= grace_steps,
             )
         };
         if let (Some(expected), Some(credit)) = (expected, credit) {
@@ -1038,6 +1066,8 @@ impl<B: DraftBackend> DSparkRuntime<B> {
                 active.qualified = true;
                 active.width = max_width;
                 self.metrics.probe_qualifications += 1;
+            } else if in_grace {
+                // Stay at the probe width and probe again.
             } else {
                 self.metrics.economic_disables += 1;
                 let retain = self.active_for(lease)?.retain_state_after_disable;
@@ -1049,6 +1079,7 @@ impl<B: DraftBackend> DSparkRuntime<B> {
             }
             return self.decision(lease);
         }
+        let loss_streak_limit = self.config.loss_streak_limit;
         let disable = {
             let active = self.active_for_mut(lease)?;
             if credit < -baseline {
@@ -1056,7 +1087,9 @@ impl<B: DraftBackend> DSparkRuntime<B> {
             } else if credit >= 0.0 {
                 active.economic_loss_streak = 0;
             }
-            active.economic_credit_seconds < 0.0 || active.economic_loss_streak >= 2
+            !in_grace
+                && (active.economic_credit_seconds < 0.0
+                    || active.economic_loss_streak >= loss_streak_limit)
         };
         if disable {
             self.metrics.economic_disables += 1;
@@ -1129,7 +1162,7 @@ impl<B: DraftBackend> DSparkRuntime<B> {
             .backend
             .as_mut()
             .expect("aligned request always has a backend")
-            .advance_target_state(target_context, committed.len());
+            .advance_target_state(target_context, &committed);
         let after = if advanced.is_ok() {
             self.current_signature()
         } else {
@@ -1482,12 +1515,17 @@ impl<B: DraftBackend> DSparkRuntime<B> {
             self.active_for_mut(lease)?.width = width;
         } else if accepted_drafts == 0 {
             self.metrics.misses += 1;
-            let retain = self.active_for(lease)?.retain_state_after_disable;
-            self.disable_active(
-                "DSpark target-verification miss",
-                Some(retain),
-                Some(DisableCategory::AcceptanceEconomics),
-            );
+            if self.config.disable_on_miss {
+                let retain = self.active_for(lease)?.retain_state_after_disable;
+                self.disable_active(
+                    "DSpark target-verification miss",
+                    Some(retain),
+                    Some(DisableCategory::AcceptanceEconomics),
+                );
+            } else {
+                let probe = self.config.probe_drafts;
+                self.active_for_mut(lease)?.width = probe;
+            }
         } else {
             self.metrics.partial_matches += 1;
             let doubled = accepted_drafts.saturating_mul(2);
@@ -1794,6 +1832,7 @@ mod tests {
         query_epoch: u64,
         proposal: Vec<u32>,
         advances: Vec<usize>,
+        advanced_ids: Vec<u32>,
         reset_calls: usize,
         snapshot_mutates: bool,
         restore_wrong_count: bool,
@@ -1810,6 +1849,7 @@ mod tests {
                 query_epoch: 0,
                 proposal: vec![10, 11, 12, 13, 14, 15, 16],
                 advances: Vec::new(),
+                advanced_ids: Vec::new(),
                 reset_calls: 0,
                 snapshot_mutates: false,
                 restore_wrong_count: false,
@@ -1877,13 +1917,14 @@ mod tests {
         fn advance_target_state(
             &mut self,
             target_context: &Self::TargetContext,
-            expected_token_count: usize,
+            committed_input_ids: &[u32],
         ) -> std::result::Result<(), BackendFailure> {
-            if target_context.len() != expected_token_count {
+            if target_context.len() != committed_input_ids.len() {
                 return Err(BackendFailure::new("target context row mismatch"));
             }
-            self.advances.push(expected_token_count);
-            self.count += expected_token_count + usize::from(self.advance_wrong_count);
+            self.advances.push(committed_input_ids.len());
+            self.advanced_ids.extend_from_slice(committed_input_ids);
+            self.count += committed_input_ids.len() + usize::from(self.advance_wrong_count);
             Ok(())
         }
     }
@@ -2140,6 +2181,98 @@ mod tests {
             .record_verified_step(&lease, &wide, 7, 8, Duration::from_secs(100))
             .unwrap();
         assert!(!decision.proposals_enabled());
+        assert_eq!(runtime.metrics().economic_disables, 1);
+    }
+
+    fn chain_runtime(mode: Mode) -> DSparkRuntime<MockBackend> {
+        DSparkRuntime::new(
+            mode,
+            Some(MockBackend::new()),
+            RuntimeConfig {
+                probe_drafts: 3,
+                disable_on_miss: false,
+                economic_grace_steps: 4,
+                loss_streak_limit: 4,
+                ..RuntimeConfig::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn chain_drafter_miss_narrows_to_probe_and_advances_committed_ids() {
+        let mut runtime = chain_runtime(Mode::On);
+        let lease = begin_and_prefill(&mut runtime, &[1, 2]);
+        let probe = runtime.propose(&lease, 3, None).unwrap().unwrap();
+        assert_eq!(probe.token_ids(), &[10, 11, 12]);
+        runtime
+            .resolve(&lease, &probe, 3, &[10, 11, 12, 13], &[0; 4], Duration::ZERO)
+            .unwrap();
+        // The old pending token and the accepted drafts are the inputs the
+        // committed rows consumed; the bonus token stays pending.
+        assert_eq!(
+            runtime.backend().unwrap().advanced_ids,
+            vec![1, 2, 3, 10, 11, 12]
+        );
+        let wide = runtime.propose(&lease, 13, None).unwrap().unwrap();
+        assert_eq!(wide.token_ids().len(), 7);
+        let decision = runtime
+            .resolve(&lease, &wide, 0, &[77], &[0], Duration::ZERO)
+            .unwrap();
+        assert!(decision.proposals_enabled());
+        assert!(decision.state_aligned());
+        assert_eq!(decision.next_width(), 3);
+        assert_eq!(runtime.metrics().misses, 1);
+        assert_eq!(
+            runtime.backend().unwrap().advanced_ids,
+            vec![1, 2, 3, 10, 11, 12, 13]
+        );
+        let next = runtime.propose(&lease, 77, None).unwrap().unwrap();
+        assert_eq!(next.token_ids().len(), 3);
+    }
+
+    #[test]
+    fn auto_grace_rides_out_early_losses_then_judges_cumulative_credit() {
+        let mut runtime = chain_runtime(Mode::Auto);
+        let lease = begin_and_prefill(&mut runtime, &[1]);
+        runtime
+            .record_target_baseline(&lease, Duration::from_secs(10), 1)
+            .unwrap();
+        // Step 1: the probe misses outright, a clear loss inside the grace.
+        let probe = runtime.propose(&lease, 2, None).unwrap().unwrap();
+        runtime
+            .resolve(&lease, &probe, 0, &[50], &[0], Duration::ZERO)
+            .unwrap();
+        let decision = runtime
+            .record_verified_step(&lease, &probe, 0, 1, Duration::from_secs(25))
+            .unwrap();
+        assert!(decision.proposals_enabled());
+        assert!(!decision.qualified());
+        // Step 2: a full probe that beats the baseline qualifies (+20 s).
+        let probe = runtime.propose(&lease, 50, None).unwrap().unwrap();
+        assert_eq!(probe.token_ids().len(), 3);
+        runtime
+            .resolve(&lease, &probe, 3, &[10, 11, 12, 60], &[0; 4], Duration::ZERO)
+            .unwrap();
+        let decision = runtime
+            .record_verified_step(&lease, &probe, 3, 4, Duration::from_secs(20))
+            .unwrap();
+        assert!(decision.qualified());
+        assert_eq!(decision.next_width(), 7);
+        // Steps 3-5 miss at a 20 s loss each. Cumulative credit goes negative
+        // at step 3, but only step 5, past the four-step grace, may act on it.
+        let mut pending = 60;
+        for step in 3..=5_u32 {
+            let proposal = runtime.propose(&lease, pending, None).unwrap().unwrap();
+            pending = 70 + step;
+            runtime
+                .resolve(&lease, &proposal, 0, &[pending], &[0], Duration::ZERO)
+                .unwrap();
+            let decision = runtime
+                .record_verified_step(&lease, &proposal, 0, 1, Duration::from_secs(30))
+                .unwrap();
+            assert_eq!(decision.proposals_enabled(), step < 5, "step {step}");
+        }
         assert_eq!(runtime.metrics().economic_disables, 1);
     }
 

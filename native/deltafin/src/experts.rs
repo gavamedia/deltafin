@@ -772,7 +772,7 @@ fn raw_cache_missing_files(model_root: &Path) -> Result<usize> {
     Ok(present.into_iter().filter(|value| !*value).count())
 }
 
-fn parse_raw_expert_filename(name: &std::ffi::OsStr) -> Option<(u32, u16)> {
+pub(crate) fn parse_raw_expert_filename(name: &std::ffi::OsStr) -> Option<(u32, u16)> {
     let text = name.to_str()?;
     let body = text.strip_prefix('L')?.strip_suffix(".bin")?;
     let (layer_text, expert_text) = body.split_once("-E")?;
@@ -908,6 +908,52 @@ impl ExpertUnionReadTicket {
 
     pub fn is_ready(&self) -> bool {
         self.ticket.is_ready()
+    }
+
+    /// Bitmask over `expert_ids()` of the experts whose complete span has
+    /// already landed, while the rest of this union is still being read.
+    ///
+    /// Scale4 reads three raw planes plus one authenticated sidecar record per
+    /// expert; a bit is set only when every one of that expert's reads
+    /// finished, so a set bit always means one whole authenticated span.
+    /// Zero means "no partial view", which is always a legal answer.
+    pub fn arrived_experts(&self) -> u64 {
+        if self.expert_ids.len() > u64::BITS as usize {
+            return 0;
+        }
+        self.ticket.completed_destination_slots(
+            K3_EXPERT_BUFFER_KIND,
+            self.layout.expert_span_bytes(),
+            self.expert_ids.len(),
+        )
+    }
+
+    /// Borrow one arrived expert's span.
+    ///
+    /// # Safety
+    /// `slot` must be set in a bitmask this ticket just returned from
+    /// [`Self::arrived_experts`], and the slice must be dropped before the
+    /// ticket is waited on or cancelled.
+    pub unsafe fn arrived_span(&self, slot: usize) -> Option<&[u8]> {
+        // SAFETY: forwarded contract -- the caller proved this slot complete
+        // and keeps the borrow inside the ticket's lifetime.
+        unsafe {
+            self.ticket.destination_slot(
+                K3_EXPERT_BUFFER_KIND,
+                self.layout.expert_span_bytes(),
+                slot,
+            )
+        }
+    }
+
+    /// Block until another of this union's reads finishes, or the whole union
+    /// settles. `seen` is the value a previous call returned (zero to start).
+    pub fn wait_for_read_progress(&self, seen: u64) -> u64 {
+        self.ticket.wait_for_job_progress(seen)
+    }
+
+    pub fn completed_reads(&self) -> u64 {
+        self.ticket.completed_jobs()
     }
 
     pub fn cancel_unclaimed(&self) {
@@ -1687,6 +1733,7 @@ fn expert_path(cache: &Path, layer: u32, expert: u16) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage_homes::StorageHomes;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2018,7 +2065,7 @@ mod tests {
 
     #[test]
     fn one_expert_union_preserves_raw_bytes_and_reports_exact_lease() {
-        use std::os::unix::fs::FileExt;
+        use crate::sys::fs::FileExt;
 
         let root = TestModelRoot::with_experts(17, [7]);
         let source_path = expert_path(&root.0.join("k3-experts"), 17, 7);
@@ -2114,10 +2161,75 @@ mod tests {
         );
     }
 
+    /// Real-corpus exactness gate for `K3_STORAGE_HOMES`: every MoE layer,
+    /// both storage layouts, decode and wide-union paths, read once from the
+    /// model root alone and once spread over a storage home, compared whole.
+    #[test]
+    #[ignore = "reads ~60 GB of the installed corpus; set DELTAFIN_TEST_STORAGE_HOME"]
+    fn installed_corpus_reads_identical_bytes_through_storage_homes() {
+        let Some(home) = std::env::var_os("DELTAFIN_TEST_STORAGE_HOME").map(PathBuf::from) else {
+            return;
+        };
+        let root = crate::sys::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+        let homes = StorageHomes::open(&root, &home_specs(&home)).unwrap().unwrap();
+        let reader = Reader::with_arena_capacity(8, 2).unwrap();
+        let mut homed_reader = Reader::with_arena_capacity(8, 2).unwrap();
+        homed_reader.set_storage_homes(Some(Arc::clone(&homes)));
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut route = |count: usize| -> Vec<u16> {
+            let mut ids = std::collections::BTreeSet::new();
+            while ids.len() < count {
+                ids.insert((next() % K3_EXPERTS_PER_LAYER as u64) as u16);
+            }
+            ids.into_iter().collect()
+        };
+        let mut compared = 0_u64;
+        for layout in [ExpertStorageLayout::Scale4V2, ExpertStorageLayout::RawV1] {
+            let corpus = RawExpertCorpus::open(&root, layout).unwrap();
+            for layer in K3_MOE_LAYER_FIRST..=K3_MOE_LAYER_LAST {
+                let decode = route(K3_EXPERT_TOP_K);
+                let expected = corpus.read_decode(&reader, layer, &decode).unwrap();
+                let actual = corpus.read_decode(&homed_reader, layer, &decode).unwrap();
+                assert!(
+                    expected.buffers().other() == actual.buffers().other(),
+                    "{layout:?} decode layer {layer} differs through storage homes"
+                );
+                compared += actual.buffers().other().len() as u64;
+                drop((expected, actual));
+                if layer % 23 == 1 {
+                    let union = route(40);
+                    let expected = corpus.read_union(&reader, layer, &union).unwrap();
+                    let actual = corpus.read_union(&homed_reader, layer, &union).unwrap();
+                    assert!(
+                        expected.buffers().other() == actual.buffers().other(),
+                        "{layout:?} union layer {layer} differs through storage homes"
+                    );
+                    compared += actual.buffers().other().len() as u64;
+                }
+            }
+        }
+        let stats = homes.stats();
+        eprintln!(
+            "served GB per drive {:?}",
+            stats
+                .iter()
+                .map(|device| device.served_bytes as f64 / 1e9)
+                .collect::<Vec<_>>()
+        );
+        assert!(stats.iter().all(|device| device.served_bytes > 0));
+        eprintln!("compared {:.1} GB byte-for-byte", compared as f64 / 1e9);
+    }
+
     #[test]
     #[ignore = "reads one installed 281 MiB raw-v1 expert batch"]
     fn installed_decode_fast_path_is_byte_exact_and_storage_ordered() {
-        use std::os::unix::fs::FileExt;
+        use crate::sys::fs::FileExt;
 
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let experts: Vec<u16> = (0..K3_EXPERT_TOP_K as u16).collect();
@@ -2461,6 +2573,197 @@ mod tests {
         );
     }
 
+    fn home_specs(home: &Path) -> Vec<crate::storage_homes::StorageHomeSpec> {
+        crate::storage_homes::parse_storage_homes(&home.display().to_string()).unwrap()
+    }
+
+    /// A storage home beside the model root holding copies of its experts.
+    fn mirror_home(root: &Path) -> PathBuf {
+        let home = root.join("mirror-home");
+        let experts = home.join("k3-experts");
+        fs::create_dir_all(&experts).unwrap();
+        for entry in fs::read_dir(root.join("k3-experts")).unwrap() {
+            let entry = entry.unwrap();
+            fs::copy(entry.path(), experts.join(entry.file_name())).unwrap();
+        }
+        home
+    }
+
+    fn homed_reader(root: &Path, home: &Path, workers: usize, slots: usize) -> (Reader, Arc<StorageHomes>) {
+        let homes = StorageHomes::open(root, &home_specs(home)).unwrap().unwrap();
+        let mut reader = Reader::with_arena_capacity(workers, slots).unwrap();
+        reader.set_storage_homes(Some(Arc::clone(&homes)));
+        (reader, homes)
+    }
+
+    fn write_distinct_raw_experts(root: &Path, layer: u32, experts: std::ops::Range<u16>) {
+        use crate::sys::fs::FileExt;
+        let cache = root.join("k3-experts");
+        for expert in experts {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(expert_path(&cache, layer, expert))
+                .unwrap();
+            let marker = [expert as u8 ^ 0x5a, 0x11, expert as u8, 0xee];
+            file.write_at(&marker, 0).unwrap();
+            file.write_at(&marker, (K3_EXPERT_SOURCE_BYTES - marker.len()) as u64)
+                .unwrap();
+        }
+    }
+
+    fn raw_slots(buffers: &LayerBuffers, experts: usize) -> Vec<Vec<u8>> {
+        (0..experts)
+            .map(|slot| {
+                let span = &buffers.other()[slot * K3_EXPERT_SOURCE_BYTES..][..K3_EXPERT_SOURCE_BYTES];
+                [&span[..4], &span[K3_EXPERT_SOURCE_BYTES - 4..]].concat()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn raw_reads_spread_over_storage_homes_return_identical_bytes() {
+        let root = TestModelRoot::with_experts(5, 0..40);
+        write_distinct_raw_experts(&root.0, 5, 0..40);
+        let home = mirror_home(&root.0);
+        let corpus = RawExpertCorpus::open_raw_v1(&root.0).unwrap();
+        let reader = Reader::with_arena_capacity(4, 2).unwrap();
+        let decode_ids: Vec<u16> = (0..16).collect();
+        let union_ids: Vec<u16> = (0..40).collect();
+        let (expected_decode, expected_union) = {
+            let decode = corpus.read_decode(&reader, 5, &decode_ids).unwrap();
+            let decode = raw_slots(decode.buffers(), 16);
+            let union = corpus.read_union(&reader, 5, &union_ids).unwrap();
+            (decode, raw_slots(union.buffers(), 40))
+        };
+
+        let (homed, homes) = homed_reader(&root.0, &home, 4, 2);
+        // Which drive serves a read depends on both drives' load at that
+        // instant, which is thread timing. Pin it instead: with one drive held
+        // busy every read takes the other, so each drive demonstrably serves
+        // bytes and every read must come back identical from either.
+        for busy_device in [0_u8, 1] {
+            let _busy = homes.begin(busy_device, 1 << 40);
+            let decode = corpus.read_decode(&homed, 5, &decode_ids).unwrap();
+            assert_eq!(raw_slots(decode.buffers(), 16), expected_decode);
+            drop(decode);
+            // Narrow (inline catalog) and wide (deferred plan) unions both route.
+            let narrow = corpus.read_union(&homed, 5, &decode_ids[..9]).unwrap();
+            assert_eq!(raw_slots(narrow.buffers(), 9), expected_decode[..9]);
+            drop(narrow);
+            let union = corpus.read_union(&homed, 5, &union_ids).unwrap();
+            assert_eq!(raw_slots(union.buffers(), 40), expected_union);
+            drop(union);
+        }
+        let stats = homes.stats();
+        assert!(stats[0].served_bytes > 0 && stats[1].served_bytes > 0, "{stats:?}");
+        // Every read finished, so nothing stays charged in flight. Which
+        // drive would win an idle tie is deliberately not asserted: more than
+        // a window of traffic has flowed, so both drives now carry a measured
+        // rate and the faster measurement rightly wins -- a timing outcome.
+        assert_eq!(homes.outstanding_bytes(), vec![0, 0]);
+    }
+
+    #[test]
+    fn storage_home_reads_really_come_from_the_extra_drive() {
+        use crate::sys::fs::FileExt;
+        let root = TestModelRoot::with_experts(6, 0..16);
+        let home = mirror_home(&root.0);
+        // Deliberately diverge every copy (tests only: a real home is
+        // byte-identical) so the bytes reveal which drive served each slot.
+        for expert in 0..16_u16 {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(expert_path(&home.join("k3-experts"), 6, expert))
+                .unwrap();
+            file.write_at(&[0xff], 0).unwrap();
+        }
+        let corpus = RawExpertCorpus::open_raw_v1(&root.0).unwrap();
+        let (reader, homes) = homed_reader(&root.0, &home, 4, 1);
+        let ids: Vec<u16> = (0..16).collect();
+        // Where a read goes is decided by drive load, so a test that only
+        // runs the reads and counts is at the mercy of thread timing. Hold one
+        // drive busy to pin the choice: every slot then reveals, by its marker
+        // byte, which drive really served it.
+        let from_copy = |busy_device: u8| {
+            let _busy = homes.begin(busy_device, 1 << 40);
+            let batch = corpus.read_decode(&reader, 6, &ids).unwrap();
+            (0..16)
+                .filter(|slot| batch.buffers().other()[slot * K3_EXPERT_SOURCE_BYTES] == 0xff)
+                .count()
+        };
+        assert_eq!(from_copy(0), 16, "with the primary busy every read takes the copy");
+        assert_eq!(from_copy(1), 0, "with the copy busy every read takes the primary");
+    }
+
+    #[test]
+    fn a_failing_storage_home_falls_back_to_another_copy() {
+        let root = TestModelRoot::with_experts(7, 0..16);
+        write_distinct_raw_experts(&root.0, 7, 0..16);
+        let home = mirror_home(&root.0);
+        let corpus = RawExpertCorpus::open_raw_v1(&root.0).unwrap();
+        let reader = Reader::with_arena_capacity(4, 1).unwrap();
+        let ids: Vec<u16> = (0..16).collect();
+        let expected = raw_slots(corpus.read_decode(&reader, 7, &ids).unwrap().buffers(), 16);
+        let (homed, homes) = homed_reader(&root.0, &home, 4, 1);
+        // The drive disappears after startup admitted it.
+        fs::remove_dir_all(&home).unwrap();
+        // Whether any read picks the vanished drive is a load (timing)
+        // outcome, so make the primary look busy: the first choice for every
+        // job is then the dead drive, and each must fall back to the copy.
+        let batch = {
+            let _primary_busy = homes.begin(0, 1 << 40);
+            corpus.read_decode(&homed, 7, &ids).unwrap()
+        };
+        assert_eq!(raw_slots(batch.buffers(), 16), expected);
+        drop(batch);
+        let stats = homes.stats();
+        assert!(stats[1].failures > 0 && stats[1].quarantined, "{stats:?}");
+        // While quarantined it receives nothing more.
+        let before = homes.stats()[1].failures;
+        let again = corpus.read_decode(&homed, 7, &ids).unwrap();
+        assert_eq!(raw_slots(again.buffers(), 16), expected);
+        assert_eq!(homes.stats()[1].failures, before);
+    }
+
+    #[test]
+    fn scale4_reads_spread_over_storage_homes_return_identical_bytes() {
+        let root = TestModelRoot::with_experts(1, []);
+        let _ = write_synthetic_scale4_experts(&root.0, None, 16);
+        let home = mirror_home(&root.0);
+        let names: Vec<_> = (0..16).map(|expert| format!("L1-E{expert}.bin")).collect();
+        let corpus = RawExpertCorpus {
+            storage: ExpertCorpusStorage::Scale4 {
+                manifest: Scale4Manifest::load_for_raw_names(
+                    root.0.join("k3-experts-scale4"),
+                    &names,
+                )
+                .unwrap(),
+                validation: Arc::new(Scale4ValidationCache::default()),
+            },
+            model_root: root.0.clone(),
+            lazy: None,
+            stream_cache_policy: CachePolicy::Streaming,
+        };
+        let reader = Reader::with_arena_capacity(4, 1).unwrap();
+        let ids: Vec<u16> = (0..16).collect();
+        let expected = corpus
+            .read_decode(&reader, 1, &ids)
+            .unwrap()
+            .buffers()
+            .other()
+            .to_vec();
+        let (homed, homes) = homed_reader(&root.0, &home, 4, 1);
+        // The copy must demonstrably serve bytes; pin the choice with load
+        // rather than hoping thread timing happens to spread the reads.
+        let _primary_busy = homes.begin(0, 1 << 40);
+        let batch = corpus.read_decode(&homed, 1, &ids).unwrap();
+        assert!(batch.buffers().other() == &expected[..]);
+        drop(batch);
+        let union = corpus.read_union(&homed, 1, &ids[..5]).unwrap();
+        assert!(union.buffers().other() == &expected[..5 * K3_SCALE4_BLOB_BYTES]);
+        assert!(homes.stats()[1].served_bytes > 0);
+    }
+
     #[test]
     fn scale4_corpus_mixed_hit_miss_verifies_only_the_missing_record() {
         let root = TestModelRoot::with_experts(1, []);
@@ -2532,7 +2835,7 @@ mod tests {
 
     #[test]
     fn scale4_gather_rejects_record_corruption_before_provider_publication() {
-        use std::os::unix::fs::FileExt;
+        use crate::sys::fs::FileExt;
 
         let root = TestModelRoot::with_experts(1, []);
         let (manifest, _, _) = write_synthetic_scale4(&root.0, None);
@@ -2557,7 +2860,7 @@ mod tests {
 
     #[test]
     fn scale4_corpus_miss_rejects_record_corruption_inside_reader_worker() {
-        use std::os::unix::fs::FileExt;
+        use crate::sys::fs::FileExt;
 
         let root = TestModelRoot::with_experts(1, []);
         let (manifest, _, _) = write_synthetic_scale4(&root.0, None);
@@ -2633,7 +2936,7 @@ mod tests {
 
     #[test]
     fn raw_cache_rejects_a_symlink_even_when_its_target_has_the_right_size() {
-        use std::os::unix::fs::symlink;
+        use crate::sys::fs::symlink;
 
         let root = TestModelRoot::with_experts(17, [0]);
         let cache = root.0.join("k3-experts");

@@ -19,6 +19,14 @@ pub mod error;
 mod loader_audit;
 pub mod openai;
 pub mod output;
+// Operating-system primitives live in the shared `deltafin-sys` crate so the
+// build-time installer, the build graph and the runtime use one
+// implementation. The runtime keeps finding them under `crate::sys`.
+#[cfg(any(feature = "runtime", test))]
+#[allow(unused_imports)]
+mod sys {
+    pub(crate) use deltafin_sys::{fs, limits, path, pe};
+}
 pub mod tokenizer;
 #[cfg(any(feature = "runtime", test))]
 mod upgrade;
@@ -41,6 +49,10 @@ pub mod dspark_provider;
 pub mod dspark_runtime;
 #[cfg(feature = "runtime")]
 mod dspark_setup;
+#[cfg(feature = "runtime")]
+mod draft_backend;
+#[cfg(feature = "runtime")]
+pub mod eagle3_provider;
 #[cfg(feature = "runtime")]
 pub mod embedding;
 #[cfg(feature = "runtime")]
@@ -105,6 +117,12 @@ pub mod spine_runtime;
 mod spine_source_use;
 #[cfg(feature = "runtime")]
 pub mod storage;
+#[cfg(feature = "runtime")]
+mod storage_emulation;
+#[cfg(feature = "runtime")]
+pub mod storage_homes;
+#[cfg(all(feature = "runtime", test))]
+mod home_replay;
 #[cfg(feature = "runtime")]
 mod trusted_download;
 #[cfg(feature = "runtime")]

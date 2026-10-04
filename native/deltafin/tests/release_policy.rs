@@ -207,6 +207,7 @@ fn production_source_graph_contains_only_compiled_languages() {
     walk_regular_files(&root.join("native/deltafin/src"), &mut files);
     walk_regular_files(&root.join("native/deltafin-bootstrap/src"), &mut files);
     walk_regular_files(&root.join("native/deltafin-native-build/src"), &mut files);
+    walk_regular_files(&root.join("native/deltafin-sys/src"), &mut files);
     walk_regular_files(&root.join("native/deltafin-xtask/src"), &mut files);
     for path in files {
         assert_eq!(

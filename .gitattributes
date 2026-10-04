@@ -1,0 +1,4 @@
+# Deltafin's policy tests scan and hash source bytes, and the pinned native
+# toolchain manifests are byte-exact. Every platform checks files out with LF
+# endings so none of those answers depends on a user's autocrlf setting.
+* text=auto eol=lf

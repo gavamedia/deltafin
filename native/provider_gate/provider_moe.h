@@ -238,6 +238,10 @@ struct MoeRunOptions {
   /* Default false preserves the public synchronous-borrow ABI. True is legal
    * only when the caller has installed flush-before-arena-retirement hooks. */
   bool metal_retain_expert_wrappers = false;
+  /* Nonzero consumes a staged single-position Metal layer whose edges were
+   * partly computed while their bytes were still arriving. Zero is the
+   * established path; a stale token is ignored, never trusted. */
+  std::uint64_t metal_staged_token = 0;
   MoeExecutionTrace* execution_trace = nullptr;
 };
 
@@ -301,6 +305,54 @@ void flush_metal_expert_cache();
  * whether its T>1 transaction should establish whole-layer host staging. */
 [[nodiscard]] bool moe_positions_select_metal(
     const at::Device& device, const MoeRunOptions& options);
+
+/*
+ * Expert early drain, single-position Metal only.
+ *
+ * A decode layer's missing experts are read from storage one file at a time,
+ * and the established path leaves every expert's matmul waiting until the last
+ * one has landed. These calls let the caller run an expert's independent
+ * GLU/W2 work the moment that expert's own bytes are readable, so the GPU is
+ * busy during the remaining reads.
+ *
+ * What this deliberately does not touch: the weighted combination of each
+ * expert's contribution into the layer's routed output still happens exactly
+ * once, inside the ordinary finish call, over every edge in the router's own
+ * order, from the per-edge results staging produced. Disk arrival order
+ * reaches scheduling only -- never a value, never a summation order -- so the
+ * same prompt produces the same bytes regardless of I/O timing.
+ *
+ * `begin` returns 0 when staging is unavailable for any reason (non-Apple
+ * build, unqualified bridge, wrong backend, multi-position tile); the caller
+ * then simply runs the established path. `stage` returns false when the batch
+ * could not be staged, which is likewise not an error. A begun token must
+ * reach exactly one of `execute_routed_moe_positions_t1` (via
+ * MoeRunOptions::metal_staged_token) or `abandon_staged_routed_moe_t1`.
+ */
+[[nodiscard]] std::uint64_t begin_staged_routed_moe_t1(
+    const PreparedMoeT1& prepared, const at::Tensor& routed_input_cpu,
+    const MoeRunOptions& options);
+
+/* `arrived_expert_ids` and `arrived_span_pointers` describe only the experts
+ * that just became readable: unique ascending IDs, one complete authenticated
+ * span each, borrowed until the layer's finish call returns. */
+[[nodiscard]] bool stage_routed_moe_edges_t1(
+    std::uint64_t token, const PreparedMoeT1& prepared,
+    std::span<const std::uint16_t> arrived_expert_ids,
+    std::span<const std::uint8_t* const> arrived_span_pointers,
+    MoeExpertLayout layout, std::uint64_t expert_span_bytes,
+    const MoeRunOptions& options);
+
+void abandon_staged_routed_moe_t1(std::uint64_t token);
+
+struct StagedMoeStats {
+  std::uint64_t begins = 0;
+  std::uint64_t edges = 0;
+  std::uint64_t reused_finishes = 0;
+  std::uint64_t recomputed_finishes = 0;
+};
+
+[[nodiscard]] StagedMoeStats staged_moe_stats();
 
 /* Bind-time-only, allocation-free qualification of an adjacent gate/up slab. */
 [[nodiscard]] bool qualify_moe_shared_gate_up(MoeSpineT1& spine);

@@ -191,6 +191,8 @@ typedef uint64_t DeltafinProviderTargetStateBranchHandleV1;
 typedef uint64_t DeltafinProviderDSparkHandleV1;
 typedef uint64_t DeltafinProviderDSparkSnapshotHandleV1;
 typedef uint64_t DeltafinProviderQwenHandleV1;
+typedef uint64_t DeltafinProviderEagle3HandleV1;
+typedef uint64_t DeltafinProviderEagle3SnapshotHandleV1;
 typedef uint64_t DeltafinProviderSpineSourceUseHandleV2;
 
 #define DELTAFIN_PROVIDER_DSPARK_TENSOR_COUNT_V1 67u
@@ -310,6 +312,131 @@ typedef struct DeltafinProviderDSparkProposalReportV1 {
   float confidence_logits[DELTAFIN_PROVIDER_DSPARK_QUERY_ROWS_V1];
   uint64_t reserved[4];
 } DeltafinProviderDSparkProposalReportV1;
+
+/*
+ * EAGLE-3.1 single-layer MLA proposal model. Its 19 owned BF16 tensors use
+ * DeltafinProviderDSparkTensorV1 descriptors with the slots below; the token
+ * embedding is K3's own exact BF16 table, which the caller reads and passes
+ * per call, so no copy of it lives in the provider.
+ */
+#define DELTAFIN_PROVIDER_EAGLE3_TENSOR_COUNT_V1 19u
+#define DELTAFIN_PROVIDER_EAGLE3_MAX_DRAFTS_V1 7u
+
+enum DeltafinProviderEagle3CreateFlagV1 {
+  /* Explicitly model-free compact geometry for native/Rust ABI tests only. */
+  DELTAFIN_PROVIDER_EAGLE3_SYNTHETIC_V1 = 1u << 0,
+};
+
+enum DeltafinProviderEagle3SlotV1 {
+  DELTAFIN_PROVIDER_EAGLE3_FC_V1 = 1u,
+  DELTAFIN_PROVIDER_EAGLE3_FC_NORM0_V1 = 2u,
+  DELTAFIN_PROVIDER_EAGLE3_FC_NORM1_V1 = 3u,
+  DELTAFIN_PROVIDER_EAGLE3_FC_NORM2_V1 = 4u,
+  DELTAFIN_PROVIDER_EAGLE3_HIDDEN_NORM_V1 = 5u,
+  DELTAFIN_PROVIDER_EAGLE3_INPUT_NORM_V1 = 6u,
+  DELTAFIN_PROVIDER_EAGLE3_QUERY_A_V1 = 7u,
+  DELTAFIN_PROVIDER_EAGLE3_QUERY_A_NORM_V1 = 8u,
+  DELTAFIN_PROVIDER_EAGLE3_QUERY_B_V1 = 9u,
+  DELTAFIN_PROVIDER_EAGLE3_KEY_VALUE_A_V1 = 10u,
+  DELTAFIN_PROVIDER_EAGLE3_KEY_VALUE_A_NORM_V1 = 11u,
+  DELTAFIN_PROVIDER_EAGLE3_KEY_VALUE_B_V1 = 12u,
+  DELTAFIN_PROVIDER_EAGLE3_OUTPUT_V1 = 13u,
+  DELTAFIN_PROVIDER_EAGLE3_POST_ATTENTION_NORM_V1 = 14u,
+  DELTAFIN_PROVIDER_EAGLE3_GATE_V1 = 15u,
+  DELTAFIN_PROVIDER_EAGLE3_UP_V1 = 16u,
+  DELTAFIN_PROVIDER_EAGLE3_DOWN_V1 = 17u,
+  DELTAFIN_PROVIDER_EAGLE3_FINAL_NORM_V1 = 18u,
+  DELTAFIN_PROVIDER_EAGLE3_HEAD_V1 = 19u,
+};
+
+typedef struct DeltafinProviderEagle3CreateV1 {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  DeltafinProviderSessionHandleV1 session;
+  uint32_t flags;
+  uint32_t tensor_count;
+  const DeltafinProviderDSparkTensorV1* tensors;
+  uint64_t max_positions;
+  uint64_t reserved[5];
+} DeltafinProviderEagle3CreateV1;
+
+typedef struct DeltafinProviderEagle3ReportV1 {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  DeltafinProviderEagle3HandleV1 model;
+  uint64_t token_count;
+  uint64_t cache_length;
+  uint64_t max_positions;
+  uint32_t flags;
+  uint32_t proposing;
+  uint64_t reserved[3];
+} DeltafinProviderEagle3ReportV1;
+
+/*
+ * Advance by committed K3 rows. `target_rows` names the provider-owned BF16
+ * [>=rows,3H] tensor a target sequence captured with
+ * DELTAFIN_PROVIDER_TARGET_SEQUENCE_CAPTURE_EAGLE3_V1; the embeddings are the
+ * exact BF16 rows of the `rows` tokens those positions consumed.
+ */
+typedef struct DeltafinProviderEagle3AdvanceV1 {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  DeltafinProviderSessionHandleV1 session;
+  DeltafinProviderEagle3HandleV1 model;
+  DeltafinProviderTensorHandleV1 target_rows;
+  uint64_t rows;
+  uint64_t expected_token_count;
+  const uint8_t* input_embeddings_bf16;
+  uint64_t input_embedding_bytes;
+  uint64_t reserved[4];
+} DeltafinProviderEagle3AdvanceV1;
+
+enum DeltafinProviderEagle3StepPhaseV1 {
+  /* The embedding names the token K3 just produced for the pending row. */
+  DELTAFIN_PROVIDER_EAGLE3_STEP_BEGIN_V1 = 1u,
+  /* The embedding names the previous draft. */
+  DELTAFIN_PROVIDER_EAGLE3_STEP_CONTINUE_V1 = 2u,
+  /* Discard the chain's speculative rows; no embedding. */
+  DELTAFIN_PROVIDER_EAGLE3_STEP_END_V1 = 3u,
+};
+
+typedef struct DeltafinProviderEagle3StepV1 {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  DeltafinProviderSessionHandleV1 session;
+  DeltafinProviderEagle3HandleV1 model;
+  uint32_t phase;
+  uint32_t reserved32;
+  const uint8_t* embedding_bf16;
+  uint64_t embedding_bytes;
+  uint64_t reserved[4];
+} DeltafinProviderEagle3StepV1;
+
+typedef struct DeltafinProviderEagle3StepReportV1 {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  /* Unverified greedy proposal; zero after END. */
+  uint32_t token_id;
+  uint32_t drafts;
+  uint64_t reserved[4];
+} DeltafinProviderEagle3StepReportV1;
+
+typedef struct DeltafinProviderEagle3SnapshotReportV1 {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  DeltafinProviderEagle3SnapshotHandleV1 snapshot;
+  uint64_t token_count;
+  uint64_t reserved[4];
+} DeltafinProviderEagle3SnapshotReportV1;
+
+typedef struct DeltafinProviderEagle3RestoreV1 {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  DeltafinProviderSessionHandleV1 session;
+  DeltafinProviderEagle3HandleV1 model;
+  DeltafinProviderEagle3SnapshotHandleV1 snapshot;
+  uint64_t reserved[4];
+} DeltafinProviderEagle3RestoreV1;
 
 /* Stateless, proposal-only Qwen3 assistant. It has no target-state operation. */
 #define DELTAFIN_PROVIDER_QWEN_TENSOR_COUNT_V1 310u
@@ -1162,6 +1289,12 @@ enum DeltafinProviderTargetSequenceBeginFlagV1 {
    * The flag is invalid for PREFILL; partial sequence commits fail closed.
    */
   DELTAFIN_PROVIDER_TARGET_SEQUENCE_FULL_COMMIT_ONLY_V1 = 1u << 1,
+  /*
+   * Retain BF16 post-layer target rows at the three EAGLE-3 capture layers
+   * (zero-based 1, 45, 89; the within-block AttnRes prefix sum). Exclusive
+   * with the DSpark capture; exposed through the same opaque rows tensor.
+   */
+  DELTAFIN_PROVIDER_TARGET_SEQUENCE_CAPTURE_EAGLE3_V1 = 1u << 2,
 };
 
 enum DeltafinProviderTargetSequenceStateV1 {
@@ -1313,6 +1446,57 @@ typedef struct DeltafinProviderTargetSequenceFinishExpertSpansRequestV1 {
   uint64_t expert_span_bytes;
   uint64_t reserved[4];
 } DeltafinProviderTargetSequenceFinishExpertSpansRequestV1;
+
+/*
+ * Expert early drain. Same shape as the scattered finish request, but carries
+ * only the experts whose bytes have already landed, so their independent
+ * matmuls can start while the rest of the layer is still being read.
+ *
+ * Advisory in both directions. A refusal is reported in the report's
+ * `staged` flag rather than as an error, and anything the provider does accept
+ * is still recomputed by the finish call if the staged state does not line up
+ * exactly. The finish call remains the sole authority for the route, the fp32
+ * weights, and the single reduction over every edge in the router's order --
+ * disk arrival order never reaches an accumulation.
+ *
+ * Single-row tiles with the Metal expert backend only; every other shape is a
+ * refusal, never an error.
+ */
+typedef struct DeltafinProviderTargetSequenceStageExpertSpansRequestV1 {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  DeltafinProviderSessionHandleV1 session;
+  DeltafinProviderTargetSequenceHandleV1 sequence;
+  uint64_t spine_generation;
+  uint32_t layer_index;
+  uint32_t first_row;
+  uint32_t row_count;
+  uint32_t expert_backend;
+  uint32_t cpu_threads;
+  uint32_t expert_count;
+  uint32_t flags;
+  uint32_t expert_layout;
+  uint16_t expert_ids[DELTAFIN_PROVIDER_TARGET_SEQUENCE_MAX_EXPERTS_V1];
+  const uint8_t*
+      expert_span_pointers[DELTAFIN_PROVIDER_TARGET_SEQUENCE_MAX_EXPERTS_V1];
+  const char* metal_shader_path;
+  uint64_t metal_shader_path_length;
+  uint64_t expert_span_bytes;
+  uint64_t reserved[4];
+} DeltafinProviderTargetSequenceStageExpertSpansRequestV1;
+
+typedef struct DeltafinProviderTargetSequenceStageExpertSpansReportV1 {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  DeltafinProviderTargetSequenceHandleV1 sequence;
+  uint64_t spine_generation;
+  uint32_t layer_index;
+  uint32_t first_row;
+  uint32_t expert_count;
+  /* 1 when the provider started work for these experts, 0 when it declined. */
+  uint32_t staged;
+  uint64_t reserved[2];
+} DeltafinProviderTargetSequenceStageExpertSpansReportV1;
 
 /*
  * Additive full-tile union form. V1 remains the hot ABI for unions of at most
@@ -1823,6 +2007,12 @@ int32_t deltafin_provider_target_sequence_finish_expert_spans_v1(
     char* error,
     size_t error_capacity);
 
+int32_t deltafin_provider_target_sequence_stage_expert_spans_v1(
+    const DeltafinProviderTargetSequenceStageExpertSpansRequestV1* request,
+    DeltafinProviderTargetSequenceStageExpertSpansReportV1* report,
+    char* error,
+    size_t error_capacity);
+
 int32_t deltafin_provider_target_sequence_finish_experts_v2(
     const DeltafinProviderTargetSequenceFinishExpertsRequestV2* request,
     DeltafinProviderTargetSequenceFinishExpertsReportV1* report,
@@ -1852,6 +2042,11 @@ int32_t deltafin_provider_target_sequence_finish_tail_v1(
     char* error,
     size_t error_capacity);
 
+/*
+ * Export the rows a completed sequence captured for its proposal model:
+ * BF16 [positions, 5*7168] for DSpark or [positions, 3*7168] for EAGLE-3,
+ * per the begin flag. The report's columns say which.
+ */
 int32_t deltafin_provider_target_sequence_dspark_rows_v1(
     const DeltafinProviderResourceRequestV1* request,
     DeltafinProviderTensorReportV1* report,
@@ -1905,6 +2100,33 @@ int32_t deltafin_provider_dspark_snapshot_destroy_v1(
 int32_t deltafin_provider_dspark_propose_v1(
     const DeltafinProviderDSparkProposeV1* request,
     DeltafinProviderDSparkProposalReportV1* report, char* error,
+    size_t error_capacity);
+
+int32_t deltafin_provider_eagle3_create_v1(
+    const DeltafinProviderEagle3CreateV1* request,
+    DeltafinProviderEagle3ReportV1* report, char* error,
+    size_t error_capacity);
+int32_t deltafin_provider_eagle3_destroy_v1(
+    const DeltafinProviderResourceRequestV1* request, char* error,
+    size_t error_capacity);
+int32_t deltafin_provider_eagle3_advance_v1(
+    const DeltafinProviderEagle3AdvanceV1* request,
+    DeltafinProviderEagle3ReportV1* report, char* error,
+    size_t error_capacity);
+int32_t deltafin_provider_eagle3_step_v1(
+    const DeltafinProviderEagle3StepV1* request,
+    DeltafinProviderEagle3StepReportV1* report, char* error,
+    size_t error_capacity);
+int32_t deltafin_provider_eagle3_snapshot_v1(
+    const DeltafinProviderResourceRequestV1* request,
+    DeltafinProviderEagle3SnapshotReportV1* report, char* error,
+    size_t error_capacity);
+int32_t deltafin_provider_eagle3_restore_v1(
+    const DeltafinProviderEagle3RestoreV1* request,
+    DeltafinProviderEagle3ReportV1* report, char* error,
+    size_t error_capacity);
+int32_t deltafin_provider_eagle3_snapshot_destroy_v1(
+    const DeltafinProviderResourceRequestV1* request, char* error,
     size_t error_capacity);
 
 int32_t deltafin_provider_qwen_create_v1(

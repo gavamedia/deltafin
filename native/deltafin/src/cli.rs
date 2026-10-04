@@ -18,6 +18,7 @@ Usage:\n\
   deltafin setup-qwen [--check] [--model-root PATH]\n\
   deltafin fetch-weights [OPTIONS]\n\
   deltafin warm-expert-cache [OPTIONS]\n\
+  deltafin populate-storage-home --dir PATH [--budget-gb GB] [--verify-existing] [--workers N] [--model-root PATH]\n\
   deltafin convert-spine-int8 [OPTIONS]\n\
   deltafin convert-experts-scale4 [OPTIONS]\n\
   deltafin pack-spine [OPTIONS]\n\
@@ -243,6 +244,17 @@ pub struct FetchWeightsArgs {
     pub model_root: Option<PathBuf>,
 }
 
+/// Copy the int8 spine and the hottest experts onto another drive for
+/// `K3_STORAGE_HOMES`.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PopulateStorageHomeArgs {
+    pub model_root: Option<PathBuf>,
+    pub dir: PathBuf,
+    pub budget_bytes: Option<u64>,
+    pub verify_existing: bool,
+    pub workers: usize,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct WarmExpertCacheArgs {
     pub model_root: Option<PathBuf>,
@@ -445,6 +457,7 @@ pub enum Command {
     SetupQwen(SetupQwenArgs),
     FetchWeights(FetchWeightsArgs),
     WarmExpertCache(WarmExpertCacheArgs),
+    PopulateStorageHome(PopulateStorageHomeArgs),
     ConvertSpineInt8(ConvertSpineInt8Args),
     ConvertExpertsScale4(ConvertExpertsScale4Args),
     Doctor(DoctorArgs),
@@ -525,6 +538,12 @@ where
         return parse_warm_expert_cache(&values).map(Command::WarmExpertCache);
     } else if values
         .first()
+        .is_some_and(|value| value == "populate-storage-home")
+    {
+        values.remove(0);
+        return parse_populate_storage_home(&values).map(Command::PopulateStorageHome);
+    } else if values
+        .first()
         .is_some_and(|value| value == "convert-spine-int8")
     {
         values.remove(0);
@@ -595,7 +614,21 @@ where
         }
         index += 1;
     }
+    require_continuable_prompt("--prompt", &run.prompt, run.chat)?;
     Ok(Command::Run(run))
+}
+
+/// Refuse a raw completion with no text to continue, here at argument
+/// parsing, instead of after the engine has spent minutes loading the model
+/// and then rejected it (the HTTP server refuses the same input with a 400).
+/// A chat turn is rendered through the template first, so it is never empty.
+fn require_continuable_prompt(option: &str, prompt: &str, chat: bool) -> Result<()> {
+    if prompt.is_empty() && !chat {
+        return Err(DeltafinError::new(format!(
+            "{option} must not be empty: a raw completion needs text to continue (use --chat for a chat turn)"
+        )));
+    }
+    Ok(())
 }
 
 fn is_subcommand(value: &str) -> bool {
@@ -612,6 +645,7 @@ fn is_subcommand(value: &str) -> bool {
             | "setup-qwen"
             | "fetch-weights"
             | "warm-expert-cache"
+            | "populate-storage-home"
             | "convert-spine-int8"
             | "convert-experts-scale4"
             | "pack-spine"
@@ -776,6 +810,7 @@ fn parse_benchmark(values: &[String]) -> Result<BenchmarkArgs> {
             })
             .collect::<Result<Vec<_>>>()?;
     }
+    require_continuable_prompt("--prompt", &benchmark.prompt, benchmark.chat)?;
     Ok(benchmark)
 }
 
@@ -1189,6 +1224,60 @@ fn parse_warm_expert_cache(values: &[String]) -> Result<WarmExpertCacheArgs> {
         ));
     }
     Ok(warm)
+}
+
+fn parse_populate_storage_home(values: &[String]) -> Result<PopulateStorageHomeArgs> {
+    let mut dir = None;
+    let mut model_root = None;
+    let mut budget_bytes = None;
+    let mut verify_existing = false;
+    let mut workers = 4;
+    let mut index = 0;
+    while index < values.len() {
+        let option = values[index].as_str();
+        match option {
+            "--dir" => dir = Some(PathBuf::from(take_value(values, &mut index, option)?)),
+            "--model-root" => {
+                model_root = Some(PathBuf::from(take_value(values, &mut index, option)?));
+            }
+            "--budget-gb" => {
+                let raw = take_value(values, &mut index, option)?;
+                let gigabytes = raw
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|value| value.is_finite() && *value > 0.0)
+                    .ok_or_else(|| DeltafinError::new("--budget-gb must be a positive number"))?;
+                budget_bytes = Some((gigabytes * 1e9) as u64);
+            }
+            "--verify-existing" => verify_existing = true,
+            "--workers" => {
+                let raw = take_value(values, &mut index, option)?;
+                workers = raw
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|value| (1..=16).contains(value))
+                    .ok_or_else(|| DeltafinError::new("--workers must be an integer in 1..=16"))?;
+            }
+            "-h" | "--help" => return Err(DeltafinError::new(HELP)),
+            _ => {
+                return Err(DeltafinError::new(format!(
+                    "unknown populate-storage-home argument {option:?}; run deltafin --help"
+                )));
+            }
+        }
+        index += 1;
+    }
+    let dir = dir.ok_or_else(|| DeltafinError::new("populate-storage-home needs --dir PATH"))?;
+    if !dir.is_absolute() {
+        return Err(DeltafinError::new("--dir must be an absolute path"));
+    }
+    Ok(PopulateStorageHomeArgs {
+        model_root,
+        dir,
+        budget_bytes,
+        verify_existing,
+        workers,
+    })
 }
 
 fn parse_setup_qwen(values: &[String]) -> Result<SetupQwenArgs> {
@@ -1615,6 +1704,30 @@ mod tests {
         assert!(parse(["deltafin", "--prompt"]).is_err());
         assert!(parse(["deltafin", "--max-new", "-1"]).is_err());
         assert!(parse(["deltafin", "--unknown"]).is_err());
+    }
+
+    #[test]
+    fn an_empty_raw_prompt_is_refused_before_the_engine_loads() {
+        // The engine rejects it too, but only after minutes of model loading;
+        // the HTTP server refuses the same input up front with a 400.
+        for arguments in [
+            &["deltafin", "--prompt", ""][..],
+            &["deltafin", "run", "--prompt", ""][..],
+            &["deltafin", "benchmark", "--prompt", ""][..],
+        ] {
+            let error = parse(arguments.iter().copied())
+                .err()
+                .unwrap_or_else(|| panic!("{arguments:?} was accepted"))
+                .to_string();
+            assert!(error.contains("--prompt must not be empty"), "{error}");
+        }
+        // A chat turn is rendered through the template first, so an empty
+        // message is a legitimate (if unusual) turn; whitespace is text.
+        assert!(parse(["deltafin", "--chat", "--prompt", ""]).is_ok());
+        assert!(parse(["deltafin", "--prompt", "", "--chat"]).is_ok());
+        assert!(parse(["deltafin", "benchmark", "--chat", "--prompt", ""]).is_ok());
+        assert!(parse(["deltafin", "--prompt", " "]).is_ok());
+        assert!(parse(["deltafin"]).is_ok(), "the default prompt is non-empty");
     }
 
     #[test]

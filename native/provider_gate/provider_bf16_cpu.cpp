@@ -25,10 +25,22 @@
 #include <xmmintrin.h>
 #endif
 
+// GCC and Clang need a target attribute to accept AVX2 intrinsics in a
+// translation unit built for a lower baseline. MSVC accepts every intrinsic
+// regardless of /arch and emits AVX2 only where one is written, so the same
+// isolation needs no attribute there; the baseline stays /arch:AVX and the
+// AVX2 kernel is chosen at run time by CPUID.
 #if (defined(__x86_64__) || defined(_M_X64)) &&                                \
-    (defined(__GNUC__) || defined(__clang__)) && !defined(_MSC_VER)
+    (defined(__GNUC__) || defined(__clang__))
 #include <immintrin.h>
 #define DELTAFIN_BF16_CPU_HAVE_AVX2_TARGET 1
+#define DELTAFIN_BF16_CPU_AVX2_TARGET_ATTRIBUTE                               \
+  __attribute__((target("avx2,fma")))
+#elif defined(_M_X64) && defined(_MSC_VER)
+#include <immintrin.h>
+#include <intrin.h>
+#define DELTAFIN_BF16_CPU_HAVE_AVX2_TARGET 1
+#define DELTAFIN_BF16_CPU_AVX2_TARGET_ATTRIBUTE
 #else
 #define DELTAFIN_BF16_CPU_HAVE_AVX2_TARGET 0
 #endif
@@ -186,7 +198,7 @@ void validate_apply(std::span<const std::uint16_t> weights,
 #endif
 
 #if DELTAFIN_BF16_CPU_HAVE_AVX2_TARGET
-__attribute__((target("avx2,fma")))
+DELTAFIN_BF16_CPU_AVX2_TARGET_ATTRIBUTE
 [[nodiscard]] float dot_avx2_fma(const std::uint16_t *weights,
                                  const float *input,
                                  const std::size_t columns) noexcept {
@@ -238,10 +250,32 @@ __attribute__((target("avx2,fma")))
   return accumulator;
 }
 
+#if defined(_MSC_VER) && !defined(__clang__)
+// What `__builtin_cpu_supports` answers on GCC and Clang, spelled with the
+// intrinsics MSVC provides: the CPUID bit for each instruction set and the
+// operating system's agreement to save the YMM state AVX code uses.
+[[nodiscard]] bool avx2_fma_available() noexcept {
+  int registers[4];
+  __cpuid(registers, 0);
+  if (registers[0] < 7) {
+    return false;
+  }
+  __cpuid(registers, 1);
+  const bool fma = (registers[2] & (1 << 12)) != 0;
+  const bool avx = (registers[2] & (1 << 28)) != 0;
+  const bool osxsave = (registers[2] & (1 << 27)) != 0;
+  if (!fma || !avx || !osxsave || (_xgetbv(0) & 0x6U) != 0x6U) {
+    return false;
+  }
+  __cpuidex(registers, 7, 0);
+  return (registers[1] & (1 << 5)) != 0;
+}
+#else
 [[nodiscard]] bool avx2_fma_available() noexcept {
   __builtin_cpu_init();
   return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
 }
+#endif
 #else
 [[nodiscard]] bool avx2_fma_available() noexcept { return false; }
 #endif

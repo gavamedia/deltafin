@@ -1,17 +1,25 @@
 //! Bounded, non-executing audit of the native loader dependency closure.
 //!
-//! This deliberately parses Mach-O and ELF metadata itself. Calling `otool`,
-//! `ldd`, or a shell would either reintroduce an interpreted production path
-//! or, in `ldd`'s case, risk executing an untrusted object while inspecting it.
+//! This deliberately parses Mach-O, ELF and PE metadata itself. Calling `otool`,
+//! `ldd`, `dumpbin`, or a shell would either reintroduce an interpreted
+//! production path or, in `ldd`'s case, risk executing an untrusted object
+//! while inspecting it.
+//!
+//! Windows has no RPATH. The loader looks for an implicitly linked DLL in the
+//! application directory, then the system directory, then the directories on
+//! `PATH`. The audit models exactly the first two: a non-system DLL must sit
+//! beside the executable, and anything that would only resolve through `PATH`
+//! (which the environment, not the install, controls) is refused as an
+//! unprovable closure.
 
 use std::collections::{HashSet, VecDeque};
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
 use crate::error::{DeltafinError, Result};
+use crate::sys::path::{os_str_bytes, os_string_from_bytes};
 
 const MAX_FILES: usize = 2_048;
 const MAX_DEPTH: usize = 64;
@@ -46,7 +54,7 @@ where
             )));
         }
         let name = name.as_ref();
-        let bytes = name.as_bytes();
+        let bytes = os_str_bytes(name);
         if bytes.len() > MAX_PROCESS_ENVIRONMENT_NAME_BYTES {
             return Err(DeltafinError::new(format!(
                 "process environment contains a variable name longer than the bounded {MAX_PROCESS_ENVIRONMENT_NAME_BYTES}-byte native runtime limit"
@@ -63,7 +71,7 @@ where
 }
 
 pub(crate) fn is_dynamic_loader_environment_name(name: &OsStr) -> bool {
-    let name = name.as_bytes();
+    let name = os_str_bytes(name);
     name.starts_with(b"DYLD_")
         || name.starts_with(b"LD_")
         || matches!(
@@ -76,6 +84,7 @@ pub(crate) fn is_dynamic_loader_environment_name(name: &OsStr) -> bool {
 enum ImageFormat {
     MachO,
     Elf,
+    Pe,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -111,6 +120,9 @@ pub(crate) struct LoaderAuditPolicy {
     /// its absolute executable rpaths become the bounded roots instead.
     controlled_roots: Vec<PathBuf>,
     operator_supplied: bool,
+    /// Where the platform keeps its own DLLs, for a PE audit. `None` asks the
+    /// operating system; a test substitutes a fixture directory.
+    system_directory: Option<PathBuf>,
 }
 
 impl LoaderAuditPolicy {
@@ -122,7 +134,22 @@ impl LoaderAuditPolicy {
         Self {
             controlled_roots: roots,
             operator_supplied: true,
+            system_directory: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_system_directory(mut self, directory: PathBuf) -> Self {
+        self.system_directory = Some(directory);
+        self
+    }
+
+    /// The directory a PE dependency may resolve from as a platform DLL.
+    fn pe_system_directory(&self) -> Option<PathBuf> {
+        if let Some(directory) = &self.system_directory {
+            return Some(directory.clone());
+        }
+        crate::sys::fs::system_directory().ok()
     }
 }
 
@@ -200,7 +227,7 @@ pub(crate) fn audit_loader_closure(
             artifact.display()
         )));
     }
-    let artifact = fs::canonicalize(artifact).map_err(|error| {
+    let artifact = crate::sys::fs::canonicalize(artifact).map_err(|error| {
         DeltafinError::new(format!(
             "resolve native runtime artifact {}: {error}",
             artifact.display()
@@ -213,7 +240,7 @@ pub(crate) fn audit_loader_closure(
 
     let mut allowed_roots = vec![executable_directory.clone()];
     for root in &policy.controlled_roots {
-        let canonical = fs::canonicalize(root).map_err(|error| {
+        let canonical = crate::sys::fs::canonicalize(root).map_err(|error| {
             DeltafinError::new(format!(
                 "resolve recorded native dependency root {}: {error}",
                 root.display()
@@ -258,7 +285,7 @@ pub(crate) fn audit_loader_closure(
                 entry.path.display()
             )));
         }
-        let canonical = fs::canonicalize(&entry.path).map_err(|error| {
+        let canonical = crate::sys::fs::canonicalize(&entry.path).map_err(|error| {
             DeltafinError::new(format!(
                 "resolve native loader image {}: {error}",
                 entry.path.display()
@@ -318,6 +345,7 @@ pub(crate) fn audit_loader_closure(
                 &entry.mach_rpaths,
                 &entry.elf_rpaths,
                 &allowed_roots,
+                policy,
             )?
             else {
                 continue;
@@ -414,12 +442,17 @@ fn expand_loader_path(
                     "Mach-O LC_RPATH may not recursively contain @rpath",
                 ));
             } else {
-                PathBuf::from(OsString::from_vec(raw.to_vec()))
+                PathBuf::from(os_string_from_bytes(raw.to_vec()))
             }
         }
         ImageFormat::Elf => {
-            let expanded = replace_origin(raw, loader.as_os_str().as_bytes())?;
-            PathBuf::from(OsString::from_vec(expanded))
+            let expanded = replace_origin(raw, os_str_bytes(loader.as_os_str()))?;
+            PathBuf::from(os_string_from_bytes(expanded))
+        }
+        ImageFormat::Pe => {
+            return Err(DeltafinError::new(
+                "a PE image has no loader search paths to expand",
+            ));
         }
     };
     if !path.is_absolute() {
@@ -438,7 +471,7 @@ fn append_loader_suffix(base: &Path, suffix: &[u8]) -> Result<PathBuf> {
     let suffix = suffix.strip_prefix(b"/").ok_or_else(|| {
         DeltafinError::new("Mach-O loader token must be followed by '/' or terminate")
     })?;
-    Ok(base.join(OsString::from_vec(suffix.to_vec())))
+    Ok(base.join(os_string_from_bytes(suffix.to_vec())))
 }
 
 fn replace_origin(raw: &[u8], origin: &[u8]) -> Result<Vec<u8>> {
@@ -474,7 +507,7 @@ fn admit_root_search(
     {
         return Ok(());
     }
-    let Ok(canonical) = fs::canonicalize(directory) else {
+    let Ok(canonical) = crate::sys::fs::canonicalize(directory) else {
         // An unused rpath is harmless. A dependency that needs it will fail
         // resolution below rather than silently escaping the audit.
         return Ok(());
@@ -508,7 +541,7 @@ fn validate_search_directories(
         {
             continue;
         }
-        if let Ok(canonical) = fs::canonicalize(path)
+        if let Ok(canonical) = crate::sys::fs::canonicalize(path)
             && policy.operator_supplied
             && !path_within_roots(&canonical, allowed_roots)
         {
@@ -532,9 +565,13 @@ fn resolve_dependency(
     inherited_mach: &[PathBuf],
     inherited_elf: &[PathBuf],
     allowed_roots: &[PathBuf],
+    policy: &LoaderAuditPolicy,
 ) -> Result<Option<PathBuf>> {
+    if format == ImageFormat::Pe {
+        return resolve_pe_dependency(image_path, executable, dependency, allowed_roots, policy);
+    }
     let raw = &dependency.path;
-    let raw_path = PathBuf::from(OsString::from_vec(raw.clone()));
+    let raw_path = PathBuf::from(os_string_from_bytes(raw.clone()));
     if raw_path.is_absolute() {
         if system_absolute_path(&raw_path, format) {
             return Ok(None);
@@ -560,7 +597,7 @@ fn resolve_dependency(
                     DeltafinError::new("Mach-O @rpath dependency lacks a '/' suffix")
                 })?;
                 for directory in searches.mach.iter().chain(inherited_mach.iter()) {
-                    candidates.push(directory.join(OsString::from_vec(suffix.to_vec())));
+                    candidates.push(directory.join(os_string_from_bytes(suffix.to_vec())));
                 }
             } else {
                 return Err(DeltafinError::new(format!(
@@ -570,17 +607,19 @@ fn resolve_dependency(
                 )));
             }
         }
+        ImageFormat::Pe => unreachable!("PE dependencies are resolved above"),
         ImageFormat::Elf => {
             if raw.contains(&b'/') {
                 let expanded = replace_origin(
                     raw,
-                    image_path
-                        .parent()
-                        .expect("audited image parent")
-                        .as_os_str()
-                        .as_bytes(),
+                    os_str_bytes(
+                        image_path
+                            .parent()
+                            .expect("audited image parent")
+                            .as_os_str(),
+                    ),
                 )?;
-                let expanded = PathBuf::from(OsString::from_vec(expanded));
+                let expanded = PathBuf::from(os_string_from_bytes(expanded));
                 if !expanded.is_absolute() {
                     return Err(DeltafinError::new(format!(
                         "ELF dependency uses an unauditable relative path in {}: {:?}",
@@ -600,7 +639,7 @@ fn resolve_dependency(
                     searches.elf_runpath.iter().collect::<Vec<_>>()
                 };
                 for directory in active {
-                    candidates.push(directory.join(OsString::from_vec(raw.clone())));
+                    candidates.push(directory.join(os_string_from_bytes(raw.clone())));
                 }
             }
         }
@@ -649,7 +688,7 @@ fn resolve_candidate(
             candidate.display()
         )));
     }
-    let canonical = fs::canonicalize(candidate).map_err(|error| {
+    let canonical = crate::sys::fs::canonicalize(candidate).map_err(|error| {
         DeltafinError::new(format!(
             "resolve native dependency {}: {error}",
             candidate.display()
@@ -674,7 +713,59 @@ fn system_absolute_path(path: &Path, format: ImageFormat) -> bool {
                 || path.starts_with("/usr/lib")
                 || path.starts_with("/usr/lib64")
         }
+        // A PE import is a bare name, never a path; the platform's own DLLs
+        // are recognized by name and directory in `resolve_pe_dependency`.
+        ImageFormat::Pe => false,
     }
+}
+
+/// An API-set contract name (`api-ms-win-core-synch-l1-2-0.dll`): a virtual
+/// module the loader maps onto the real implementation, with no file of its
+/// own to audit.
+fn pe_api_set(lowercase: &[u8]) -> bool {
+    lowercase.starts_with(b"api-ms-win-") || lowercase.starts_with(b"ext-ms-win-")
+}
+
+/// Resolve a PE import the way the loader does for an implicitly linked DLL,
+/// minus `PATH`: the application directory first, then the system directory.
+fn resolve_pe_dependency(
+    image_path: &Path,
+    executable: &Path,
+    dependency: &Dependency,
+    allowed_roots: &[PathBuf],
+    policy: &LoaderAuditPolicy,
+) -> Result<Option<PathBuf>> {
+    let raw = &dependency.path;
+    if raw.iter().any(|byte| matches!(byte, b'/' | b'\\' | b':')) {
+        return Err(DeltafinError::new(format!(
+            "PE image {} imports {:?}, a path rather than a DLL name; the loader would resolve it against process state",
+            image_path.display(),
+            String::from_utf8_lossy(raw)
+        )));
+    }
+    let lowercase = raw.to_ascii_lowercase();
+    if pe_api_set(&lowercase) {
+        return Ok(None);
+    }
+    let name = os_string_from_bytes(raw.clone());
+    let application = executable
+        .parent()
+        .ok_or_else(|| DeltafinError::new("native executable has no parent directory"))?
+        .join(&name);
+    if fs::symlink_metadata(&application).is_ok() {
+        return resolve_candidate(&application, dependency, allowed_roots, image_path);
+    }
+    if let Some(system) = policy.pe_system_directory()
+        && system.join(&name).is_file()
+    {
+        return Ok(None);
+    }
+    Err(DeltafinError::new(format!(
+        "cannot prove the native dependency closure: {} references unresolved non-system dependency {:?}; \
+         it is neither beside the executable nor in the Windows system directory, and PATH is not an audited location",
+        image_path.display(),
+        String::from_utf8_lossy(raw)
+    )))
 }
 
 fn system_elf_soname(path: &[u8]) -> bool {
@@ -771,6 +862,9 @@ fn forbidden_python_loader_basename(path: &[u8]) -> Option<&'static str> {
     for (prefix, label) in [
         (b"libtorch_python".as_slice(), "libtorch_python"),
         (b"libpython".as_slice(), "libpython"),
+        // Windows spells them without the `lib` prefix: torch_python.dll,
+        // python3.dll, python313.dll, python313_d.dll.
+        (b"torch_python".as_slice(), "torch_python"),
     ] {
         if basename
             .get(..prefix.len())
@@ -778,6 +872,15 @@ fn forbidden_python_loader_basename(path: &[u8]) -> Option<&'static str> {
         {
             return Some(label);
         }
+    }
+    // `python` followed by a version digit is the interpreter's own DLL;
+    // `pythoncom` and friends are not a dependency a native build can have.
+    if basename
+        .get(..6)
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(b"python"))
+        && basename.get(6).is_some_and(u8::is_ascii_digit)
+    {
+        return Some("python");
     }
     None
 }
@@ -909,10 +1012,59 @@ fn parse_loader_image(reader: &mut impl RegionReader) -> Result<LoaderImage> {
     match magic.as_slice() {
         [0xcf, 0xfa, 0xed, 0xfe] => parse_macho(reader),
         [0x7f, b'E', b'L', b'F'] => parse_elf(reader),
+        [b'M', b'Z', _, _] => parse_pe(reader),
         _ => Err(DeltafinError::new(
-            "native loader image is neither supported little-endian 64-bit Mach-O nor ELF",
+            "native loader image is neither supported little-endian 64-bit Mach-O, ELF, nor x86-64 PE",
         )),
     }
+}
+
+/// Reads of a PE image go through the audit's accounting reader, so the import
+/// tables of a hostile image cost its metadata budget like any other format.
+struct PeRegions<'a, R: RegionReader>(&'a mut R);
+
+impl<R: RegionReader> crate::sys::pe::ImageSource for PeRegions<'_, R> {
+    fn len(&self) -> u64 {
+        self.0.len()
+    }
+
+    fn read_exact_at(&mut self, buffer: &mut [u8], offset: u64) -> std::io::Result<()> {
+        let bytes = self
+            .0
+            .read_region(offset, buffer.len(), "PE metadata")
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        buffer.copy_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+fn parse_pe(reader: &mut impl RegionReader) -> Result<LoaderImage> {
+    let image = crate::sys::pe::parse_image(&mut PeRegions(reader))
+        .map_err(|error| DeltafinError::new(format!("malformed PE loader image: {error}")))?;
+    if image.headers.machine != crate::sys::pe::MACHINE_AMD64 || !image.headers.pe32_plus {
+        return Err(DeltafinError::new(format!(
+            "PE loader image targets machine {:#06x}; only x86-64 images are supported",
+            image.headers.machine
+        )));
+    }
+    if image.imports.load_time.len() + image.imports.delay_load.len() > MAX_PATHS_PER_IMAGE {
+        return Err(DeltafinError::new("PE import table exceeds its audit bound"));
+    }
+    // A delay-load import is a dependency like any other for this audit: the
+    // closure is whatever the image may ever load, not only what it loads first.
+    let dependencies = image
+        .imports
+        .all()
+        .map(|name| Dependency {
+            path: name.as_bytes().to_vec(),
+            optional: false,
+        })
+        .collect();
+    Ok(LoaderImage {
+        format: ImageFormat::Pe,
+        dependencies,
+        search_paths: Vec::new(),
+    })
 }
 
 fn parse_macho(reader: &mut impl RegionReader) -> Result<LoaderImage> {
@@ -1174,7 +1326,7 @@ mod tests {
                 SERIAL.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir_all(&root).unwrap();
-            Self(fs::canonicalize(root).unwrap())
+            Self(crate::sys::fs::canonicalize(root).unwrap())
         }
     }
 
@@ -1279,7 +1431,7 @@ mod tests {
         write_macho(
             &executable,
             &[
-                (0x8000_001c, lib.as_os_str().as_bytes()),
+                (0x8000_001c, os_str_bytes(lib.as_os_str())),
                 (0x0000_000c, b"@rpath/libtorch.dylib"),
             ],
         );
@@ -1301,6 +1453,8 @@ mod tests {
         assert!(error.to_string().contains("libtorch_python.dylib"));
     }
 
+    // `/usr/lib/libSystem.B.dylib` is an absolute path only on a Unix host.
+    #[cfg(unix)]
     #[test]
     fn follows_cycles_once_and_accepts_platform_system_libraries() {
         let fixture = Fixture::new();
@@ -1310,7 +1464,7 @@ mod tests {
         write_macho(
             &executable,
             &[
-                (0x8000_001c, lib.as_os_str().as_bytes()),
+                (0x8000_001c, os_str_bytes(lib.as_os_str())),
                 (0x0000_000c, b"@rpath/liba.dylib"),
                 (0x0000_000c, b"/usr/lib/libSystem.B.dylib"),
             ],
@@ -1400,7 +1554,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn operator_root_rejects_symlink_escape() {
-        use std::os::unix::fs::symlink;
+        use crate::sys::fs::symlink;
 
         let fixture = Fixture::new();
         let root = fixture.0.join("torch");
@@ -1415,7 +1569,7 @@ mod tests {
         write_macho(
             &executable,
             &[
-                (0x8000_001c, lib.as_os_str().as_bytes()),
+                (0x8000_001c, os_str_bytes(lib.as_os_str())),
                 (0x0000_000c, b"@rpath/libtorch.dylib"),
             ],
         );
@@ -1505,5 +1659,228 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("variable name longer"));
+    }
+
+    mod pe {
+        use deltafin_sys::pe::testing::SyntheticImage;
+
+        use super::*;
+
+        /// A directory standing in for `System32`, holding the named DLLs.
+        fn system_directory(fixture: &Fixture, names: &[&str]) -> PathBuf {
+            let directory = fixture.0.join("system32");
+            fs::create_dir_all(&directory).unwrap();
+            for name in names {
+                fs::write(directory.join(name), SyntheticImage::dll().build()).unwrap();
+            }
+            directory
+        }
+
+        fn write_image(path: &Path, image: SyntheticImage) {
+            fs::write(path, image.build()).unwrap();
+        }
+
+        fn policy(system: &Path) -> LoaderAuditPolicy {
+            LoaderAuditPolicy::bootstrap().with_system_directory(system.to_path_buf())
+        }
+
+        #[test]
+        fn imports_become_dependencies_including_delay_loaded_ones() {
+            let image = SyntheticImage::executable()
+                .importing(&["KERNEL32.dll", "c10.dll"])
+                .delay_importing(&["winhttp.dll"])
+                .build();
+            let parsed = inspect_bytes(&image).unwrap();
+            assert_eq!(parsed.format, ImageFormat::Pe);
+            assert!(parsed.search_paths.is_empty());
+            let names: Vec<_> = parsed
+                .dependencies
+                .iter()
+                .map(|dependency| String::from_utf8(dependency.path.clone()).unwrap())
+                .collect();
+            assert_eq!(names, ["KERNEL32.dll", "c10.dll", "winhttp.dll"]);
+            assert!(parsed.dependencies.iter().all(|dependency| !dependency.optional));
+        }
+
+        #[test]
+        fn dlls_beside_the_executable_and_in_the_system_directory_close_the_graph() {
+            let fixture = Fixture::new();
+            let system = system_directory(&fixture, &["kernel32.dll", "vcruntime140.dll"]);
+            let bin = fixture.0.join("bin");
+            fs::create_dir(&bin).unwrap();
+            let executable = bin.join("deltafin.exe");
+            write_image(
+                &executable,
+                SyntheticImage::executable().importing(&[
+                    "kernel32.dll",
+                    "api-ms-win-core-synch-l1-2-0.dll",
+                    "ext-ms-win-gdi-desktop-l1-1-0.dll",
+                    "c10.dll",
+                    "torch_cpu.dll",
+                    "vcruntime140.dll",
+                ]),
+            );
+            write_image(
+                &bin.join("c10.dll"),
+                SyntheticImage::dll().importing(&["kernel32.dll", "vcruntime140.dll"]),
+            );
+            // torch_cpu imports c10 back: a cycle that must be walked once.
+            write_image(
+                &bin.join("torch_cpu.dll"),
+                SyntheticImage::dll().importing(&["c10.dll", "kernel32.dll"]),
+            );
+
+            let report = audit_loader_closure(&executable, &policy(&system)).unwrap();
+
+            assert_eq!(report.audited_files, 3);
+            assert!(report.metadata_bytes < 1 << 20);
+        }
+
+        #[test]
+        fn a_dll_that_only_path_could_supply_is_an_unprovable_closure() {
+            let fixture = Fixture::new();
+            let system = system_directory(&fixture, &["kernel32.dll"]);
+            let elsewhere = fixture.0.join("elsewhere");
+            fs::create_dir(&elsewhere).unwrap();
+            write_image(&elsewhere.join("torch_cpu.dll"), SyntheticImage::dll());
+            let bin = fixture.0.join("bin");
+            fs::create_dir(&bin).unwrap();
+            let executable = bin.join("deltafin.exe");
+            write_image(
+                &executable,
+                SyntheticImage::executable().importing(&["kernel32.dll", "torch_cpu.dll"]),
+            );
+
+            let error = audit_loader_closure(&executable, &policy(&system)).unwrap_err();
+
+            let message = error.to_string();
+            assert!(message.contains("unresolved non-system dependency"), "{message}");
+            assert!(message.contains("torch_cpu.dll") && message.contains("PATH"), "{message}");
+        }
+
+        #[test]
+        fn a_missing_delay_loaded_dll_is_as_unprovable_as_a_missing_load_time_one() {
+            let fixture = Fixture::new();
+            let system = system_directory(&fixture, &["kernel32.dll"]);
+            let executable = fixture.0.join("deltafin.exe");
+            write_image(
+                &executable,
+                SyntheticImage::executable()
+                    .importing(&["kernel32.dll"])
+                    .delay_importing(&["nowhere.dll"]),
+            );
+            let error = audit_loader_closure(&executable, &policy(&system)).unwrap_err();
+            assert!(error.to_string().contains("nowhere.dll"));
+        }
+
+        #[test]
+        fn python_dlls_are_refused_at_any_depth() {
+            for forbidden in ["python312.dll", "python3.dll", "torch_python.dll", "PYTHON313_d.dll"] {
+                let fixture = Fixture::new();
+                let system = system_directory(&fixture, &["kernel32.dll"]);
+                let executable = fixture.0.join("deltafin.exe");
+                write_image(
+                    &executable,
+                    SyntheticImage::executable().importing(&["kernel32.dll", "c10.dll"]),
+                );
+                write_image(
+                    &fixture.0.join("c10.dll"),
+                    SyntheticImage::dll().importing(&["middle.dll"]),
+                );
+                write_image(
+                    &fixture.0.join("middle.dll"),
+                    SyntheticImage::dll().importing(&[forbidden]),
+                );
+                // Even a Python DLL that is present must never be followed.
+                write_image(&fixture.0.join(forbidden), SyntheticImage::dll());
+
+                let error = audit_loader_closure(&executable, &policy(&system)).unwrap_err();
+
+                let message = error.to_string();
+                assert!(message.contains("at any depth"), "{forbidden}: {message}");
+                assert!(message.contains(forbidden), "{forbidden}: {message}");
+            }
+        }
+
+        #[test]
+        fn lookalike_names_are_not_mistaken_for_the_interpreter() {
+            assert_eq!(forbidden_python_loader_basename(b"python312.dll"), Some("python"));
+            assert_eq!(forbidden_python_loader_basename(b"torch_python.dll"), Some("torch_python"));
+            for fine in [&b"pythonista.dll"[..], b"c10.dll", b"torch_cpu.dll", b"my_python3.dll", b"python.dll"] {
+                assert_eq!(forbidden_python_loader_basename(fine), None, "{fine:?}");
+            }
+        }
+
+        #[test]
+        fn an_import_that_is_a_path_is_refused_not_resolved() {
+            for name in ["sub\\evil.dll", "C:evil.dll", "..\\evil.dll", "a/b.dll", "\\\\host\\share\\x.dll"] {
+                let fixture = Fixture::new();
+                let system = system_directory(&fixture, &["kernel32.dll"]);
+                let executable = fixture.0.join("deltafin.exe");
+                write_image(&executable, SyntheticImage::executable().importing(&[name]));
+                let error = audit_loader_closure(&executable, &policy(&system)).unwrap_err();
+                assert!(error.to_string().contains("a path rather than a DLL name"), "{name}: {error}");
+            }
+        }
+
+        #[test]
+        fn another_cpu_or_a_32_bit_image_is_refused() {
+            let fixture = Fixture::new();
+            let system = system_directory(&fixture, &[]);
+            for (machine, pe32_plus) in [(0x014c_u16, false), (0xaa64, true), (0x8664, false)] {
+                let mut image = SyntheticImage::executable();
+                image.machine = machine;
+                image.pe32_plus = pe32_plus;
+                let executable = fixture.0.join("deltafin.exe");
+                fs::write(&executable, image.build()).unwrap();
+                let error = audit_loader_closure(&executable, &policy(&system)).unwrap_err();
+                assert!(error.to_string().contains("only x86-64 images"), "{machine:#x}: {error}");
+            }
+        }
+
+        #[test]
+        fn a_malformed_image_is_refused_with_its_reason() {
+            let fixture = Fixture::new();
+            let system = system_directory(&fixture, &[]);
+            let executable = fixture.0.join("deltafin.exe");
+            let mut image = SyntheticImage::executable().importing(&["kernel32.dll"]).build();
+            image[0x3c..0x40].copy_from_slice(&u32::MAX.to_le_bytes());
+            fs::write(&executable, image).unwrap();
+            let error = audit_loader_closure(&executable, &policy(&system)).unwrap_err();
+            assert!(error.to_string().contains("malformed PE loader image"), "{error}");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_dll_symlinked_out_of_the_install_is_refused() {
+            use crate::sys::fs::symlink;
+
+            let fixture = Fixture::new();
+            let system = system_directory(&fixture, &["kernel32.dll"]);
+            let outside = fixture.0.join("outside.dll");
+            write_image(&outside, SyntheticImage::dll());
+            let bin = fixture.0.join("bin");
+            fs::create_dir(&bin).unwrap();
+            symlink(&outside, bin.join("c10.dll")).unwrap();
+            let executable = bin.join("deltafin.exe");
+            write_image(
+                &executable,
+                SyntheticImage::executable().importing(&["kernel32.dll", "c10.dll"]),
+            );
+
+            let error = audit_loader_closure(&executable, &policy(&system)).unwrap_err();
+
+            assert!(error.to_string().contains("escapes every audited root"), "{error}");
+        }
+
+        /// The real thing, on the one host where a real PE exists: the test
+        /// executable itself, audited against the real system directory.
+        #[cfg(all(windows, not(feature = "runtime")))]
+        #[test]
+        fn the_real_test_executable_closes_against_the_real_system_directory() {
+            let executable = std::env::current_exe().unwrap();
+            let report = audit_loader_closure(&executable, &LoaderAuditPolicy::bootstrap()).unwrap();
+            assert!(report.audited_files >= 1);
+        }
     }
 }

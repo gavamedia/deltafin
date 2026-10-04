@@ -26,7 +26,7 @@ runtime = ["dep:sha2"]
 
 [dependencies]
 base64 = "=0.22.1"
-curl = { version = "=0.4.50", default-features = false, features = ["force-system-lib-on-osx"] }
+deltafin-sys = { path = "../deltafin-sys" }
 half = "=2.7.1"
 libc = "=0.2.189"
 regex = "=1.13.0"
@@ -43,4 +43,12 @@ deltafin-native-build = { path = "../deltafin-native-build" }
 
 [dev-dependencies]
 deltafin-native-build = { path = "../deltafin-native-build" }
+deltafin-sys = { path = "../deltafin-sys", features = ["testing"] }
 syn = { version = "=2.0.119", features = ["full", "visit"] }
+
+# The setup/fetch transport links the reviewed system libcurl on macOS and
+# Linux. Windows ships no libcurl, so it speaks HTTPS through the operating
+# system's own WinHTTP/Schannel stack instead and links no third-party
+# transfer library at all.
+[target.'cfg(not(windows))'.dependencies]
+curl = { version = "=0.4.50", default-features = false, features = ["force-system-lib-on-osx"] }

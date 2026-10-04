@@ -1,7 +1,6 @@
 //! Production command-line application built on the reusable Deltafin core.
 
 use std::fs;
-use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Mutex;
@@ -9,7 +8,7 @@ use std::time::Duration;
 
 use crate::cli::{
     BenchmarkArgs, Command, ConvertExpertsScale4Args, ConvertSpineInt8Args, DoctorArgs,
-    FetchWeightsArgs, SetupArgs, WarmExpertCacheArgs,
+    FetchWeightsArgs, PopulateStorageHomeArgs, SetupArgs, WarmExpertCacheArgs,
 };
 use crate::config::RuntimeConfig;
 use crate::engine::NativeTargetEngine;
@@ -18,6 +17,7 @@ use crate::openai::{OpenAiHttpServer, ServerConfig};
 use crate::platform::Host;
 use crate::provider::NativeProvider;
 use crate::run_interrupt::RunInterruptGuard;
+use crate::sys::fs as sys_fs;
 
 fn run() -> Result<()> {
     let command = crate::cli::parse(std::env::args_os())?;
@@ -135,6 +135,7 @@ fn run() -> Result<()> {
         Command::SetupQwen(arguments) => crate::setup_qwen::run(arguments),
         Command::FetchWeights(arguments) => run_fetch_weights(arguments),
         Command::WarmExpertCache(arguments) => run_warm_expert_cache(arguments),
+        Command::PopulateStorageHome(arguments) => run_populate_storage_home(arguments),
         Command::ConvertSpineInt8(arguments) => run_convert_spine_int8(arguments),
         Command::ConvertExpertsScale4(arguments) => run_convert_experts_scale4(arguments),
         Command::PackSpine(arguments) => crate::pack_command::run(arguments),
@@ -247,8 +248,9 @@ fn run() -> Result<()> {
                 status.context_growth.model_max_context_tokens,
             );
             eprintln!(
-                "[native] verify snapshots: {:.2} MiB per candidate boundary, width 1..={} (fresh peak admission; otherwise ordinary exact decode)",
+                "[native] verify: one {:.2} MiB KDA generation plus a {:.2} MiB prefix record per row, width 1..={} (fresh peak admission; otherwise ordinary exact decode)",
                 status.verify_snapshots.bytes_per_kda_generation as f64 / (1_u64 << 20) as f64,
+                status.verify_snapshots.replay_bytes_per_position as f64 / (1_u64 << 20) as f64,
                 status.verify_snapshots.max_positions,
             );
             eprintln!("[native] {}", status.readiness);
@@ -365,6 +367,7 @@ fn command_requires_native_runtime_preflight(command: &Command) -> bool {
         | Command::SetupQwen(_)
         | Command::FetchWeights(_)
         | Command::WarmExpertCache(_)
+        | Command::PopulateStorageHome(_)
         | Command::ConvertSpineInt8(_)
         | Command::ConvertExpertsScale4(_)
         | Command::Doctor(_)
@@ -419,6 +422,33 @@ fn run_native_benchmark(arguments: BenchmarkArgs) -> Result<()> {
         })?
     );
     require_successful_benchmark(&report)
+}
+
+fn run_populate_storage_home(arguments: PopulateStorageHomeArgs) -> Result<()> {
+    let model_root = fetch_model_root(arguments.model_root.as_deref())?;
+    let started = std::time::Instant::now();
+    let report = crate::storage_homes::populate(&crate::storage_homes::PopulateOptions {
+        model_root,
+        destination: arguments.dir.clone(),
+        budget_bytes: arguments.budget_bytes,
+        verify_existing: arguments.verify_existing,
+        workers: arguments.workers,
+    })?;
+    println!(
+        "storage home {}: copied {} files ({:.1} GB) in {:.0}s, {} already present{}, {} missing on primary",
+        arguments.dir.display(),
+        report.copied,
+        report.copied_bytes as f64 / 1e9,
+        started.elapsed().as_secs_f64(),
+        report.already_present,
+        if arguments.verify_existing { " and verified" } else { "" },
+        report.missing_on_primary,
+    );
+    println!(
+        "use it with: K3_STORAGE_HOMES={}",
+        arguments.dir.display()
+    );
+    Ok(())
 }
 
 fn run_warm_expert_cache(arguments: WarmExpertCacheArgs) -> Result<()> {
@@ -635,7 +665,7 @@ fn run_one_shot_setup(arguments: SetupArgs) -> Result<()> {
 }
 
 fn ensure_model_root(root: &Path) -> Result<()> {
-    match fs::symlink_metadata(root) {
+    match sys_fs::lstat(root) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
         Ok(_) => Err(DeltafinError::new(format!(
             "model root is not a real directory: {}",
@@ -645,7 +675,7 @@ fn ensure_model_root(root: &Path) -> Result<()> {
             let parent = root.parent().ok_or_else(|| {
                 DeltafinError::new(format!("model root has no parent: {}", root.display()))
             })?;
-            let parent_metadata = fs::symlink_metadata(parent).map_err(|error| {
+            let parent_metadata = sys_fs::lstat(parent).map_err(|error| {
                 DeltafinError::new(format!(
                     "inspect model-root parent {}: {error}",
                     parent.display()
@@ -657,12 +687,9 @@ fn ensure_model_root(root: &Path) -> Result<()> {
                     parent.display()
                 )));
             }
-            fs::DirBuilder::new()
-                .mode(0o700)
-                .create(root)
-                .map_err(|error| {
-                    DeltafinError::new(format!("create model root {}: {error}", root.display()))
-                })?;
+            crate::sys::fs::create_private_directory(root).map_err(|error| {
+                DeltafinError::new(format!("create model root {}: {error}", root.display()))
+            })?;
             crate::trusted_download::fsync_directory(parent)
         }
         Err(error) => Err(DeltafinError::new(format!(

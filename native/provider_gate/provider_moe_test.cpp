@@ -1035,6 +1035,155 @@ void contract_test() {
 
 }  // namespace
 
+#if defined(__APPLE__)
+/*
+ * Expert early drain must be packaging, not arithmetic.
+ *
+ * The staged path runs each expert's GLU/W2 as its bytes arrive, in whatever
+ * order storage delivered them, spread across however many command buffers
+ * that took; the established path runs the whole layer at once. If those two
+ * can differ by a single bit, decode output becomes a function of disk timing.
+ * This drives the bridge directly with exact K3 raw-v1 spans and demands
+ * byte-identical results.
+ */
+constexpr int kStagedEdges = 16;
+constexpr std::size_t kStagedHidden = 3584;
+
+void fill_staged_expert(std::vector<std::uint8_t>& blob, const std::size_t seed) {
+  constexpr std::uint32_t packed_bytes = 5505024;
+  constexpr std::uint32_t scale_bytes = 344064;
+  std::uint64_t state = 0x9E3779B97F4A7C15ULL * (seed + 1);
+  for (std::size_t index = 0; index < blob.size(); ++index) {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    blob[index] = static_cast<std::uint8_t>(state >> 24);
+  }
+  // Constrain only the three scale planes. An unbounded MXFP4 exponent decodes
+  // to inf, and a comparison against inf/NaN would prove nothing.
+  const std::array<std::uint32_t, 3> scale_offsets = {
+      packed_bytes, 2 * packed_bytes + scale_bytes,
+      3 * packed_bytes + 2 * scale_bytes};
+  for (const std::uint32_t offset : scale_offsets) {
+    for (std::uint32_t index = 0; index < scale_bytes; ++index) {
+      blob[offset + index] =
+          static_cast<std::uint8_t>(120 + (blob[offset + index] % 11U));
+    }
+  }
+}
+
+bool metal_staged_equivalence_test() {
+  const auto capabilities =
+      deltafin::provider_internal::qualify_metal_expert_layouts(
+          K3_METAL_MOE_EMBEDDED_SOURCE_V1);
+  if (capabilities.descriptor_abi != K3_DESCRIPTOR_ABI_V1 ||
+      (capabilities.layout_capabilities & K3_CAP_RAW_V1) == 0 ||
+      capabilities.raw_span_bytes != K3_RAW_V1_EXPERT_SPAN) {
+    return false;
+  }
+  std::vector<std::vector<std::uint8_t>> blobs(
+      kStagedEdges, std::vector<std::uint8_t>(K3_RAW_V1_EXPERT_SPAN));
+  std::vector<K3MetalExpertDescriptorV1> descriptors(kStagedEdges);
+  for (std::size_t edge = 0; edge < blobs.size(); ++edge) {
+    fill_staged_expert(blobs[edge], edge);
+    descriptors[edge] = K3MetalExpertDescriptorV1{
+        .abi_version = K3_DESCRIPTOR_ABI_V1,
+        .struct_bytes = sizeof(K3MetalExpertDescriptorV1),
+        .layout_id = K3_LAYOUT_RAW_V1,
+        .reserved = 0,
+        .blob_bytes = K3_RAW_V1_EXPERT_SPAN,
+        .blob = blobs[edge].data()};
+  }
+  std::array<float, kStagedHidden> input{};
+  for (std::size_t index = 0; index < input.size(); ++index) {
+    input[index] = static_cast<float>((index % 17)) * 0.031F - 0.25F;
+  }
+  std::array<float, kStagedEdges> weights{};
+  for (std::size_t edge = 0; edge < weights.size(); ++edge) {
+    weights[edge] = 0.02F + static_cast<float>(edge) * 0.011F;
+  }
+
+  std::array<float, kStagedHidden> reference{};
+  if (k3_metal_moe_layer_desc_v1(descriptors.data(), kStagedEdges,
+                                 weights.data(), input.data(),
+                                 reference.data()) != 0) {
+    throw std::runtime_error("established Metal layer call failed");
+  }
+  for (const float value : reference) {
+    if (!std::isfinite(value)) {
+      throw std::runtime_error(
+          "staged-equivalence fixture produced a non-finite reference");
+    }
+  }
+
+  // Arrival order deliberately bears no relation to route order, and the waves
+  // are uneven, so a reduction that followed arrival could not survive this.
+  const std::array<std::array<int, 4>, 3> waves = {
+      std::array<int, 4>{9, 2, 15, 7}, std::array<int, 4>{0, 11, 4, 13},
+      std::array<int, 4>{6, 1, 8, 3}};
+  for (const std::size_t staged_waves : {std::size_t{1}, std::size_t{3}}) {
+    const std::uint64_t token =
+        k3_metal_moe_stage_begin_v1(kStagedEdges, input.data());
+    if (token == 0) {
+      throw std::runtime_error("Metal expert staging refused to begin");
+    }
+    for (std::size_t wave = 0; wave < staged_waves; ++wave) {
+      std::array<K3MetalExpertDescriptorV1, 4> staged_descriptors{};
+      for (std::size_t slot = 0; slot < waves[wave].size(); ++slot) {
+        staged_descriptors[slot] = descriptors[waves[wave][slot]];
+      }
+      if (k3_metal_moe_stage_edges_v1(token, staged_descriptors.data(),
+                                      waves[wave].data(),
+                                      static_cast<int>(waves[wave].size())) !=
+          0) {
+        throw std::runtime_error("Metal expert staging rejected a wave");
+      }
+    }
+    std::array<float, kStagedHidden> staged{};
+    if (k3_metal_moe_stage_finish_v1(token, descriptors.data(), kStagedEdges,
+                                     weights.data(), input.data(),
+                                     staged.data()) != 0) {
+      throw std::runtime_error("staged Metal layer finish failed");
+    }
+    if (std::memcmp(reference.data(), staged.data(),
+                    sizeof(float) * kStagedHidden) != 0) {
+      throw std::runtime_error(
+          "expert early drain changed the layer output; reduction or "
+          "arithmetic is no longer independent of arrival order");
+    }
+  }
+
+  // An abandoned layer must leave nothing behind that a later layer could
+  // mistake for its own staged work.
+  const std::uint64_t abandoned =
+      k3_metal_moe_stage_begin_v1(kStagedEdges, input.data());
+  if (abandoned == 0) {
+    throw std::runtime_error("Metal expert staging refused a second layer");
+  }
+  std::array<K3MetalExpertDescriptorV1, 4> abandoned_descriptors{};
+  for (std::size_t slot = 0; slot < waves[0].size(); ++slot) {
+    abandoned_descriptors[slot] = descriptors[waves[0][slot]];
+  }
+  if (k3_metal_moe_stage_edges_v1(abandoned, abandoned_descriptors.data(),
+                                  waves[0].data(),
+                                  static_cast<int>(waves[0].size())) != 0) {
+    throw std::runtime_error("Metal expert staging rejected an abandoned wave");
+  }
+  k3_metal_moe_stage_abandon_v1(abandoned);
+  std::array<float, kStagedHidden> after_abandon{};
+  if (k3_metal_moe_stage_finish_v1(abandoned, descriptors.data(), kStagedEdges,
+                                   weights.data(), input.data(),
+                                   after_abandon.data()) != 0) {
+    throw std::runtime_error("finish after abandon failed");
+  }
+  if (std::memcmp(reference.data(), after_abandon.data(),
+                  sizeof(float) * kStagedHidden) != 0) {
+    throw std::runtime_error("a finish on an abandoned token was not exact");
+  }
+  return true;
+}
+#endif
+
 int main() {
   try {
     parity_test();
@@ -1044,8 +1193,15 @@ int main() {
     full_position_union_ceiling_test();
     contract_test();
     const bool mps = mps_parity_test();
+#if defined(__APPLE__)
+    const bool staged = metal_staged_equivalence_test();
+#else
+    const bool staged = false;
+#endif
     std::cout << "provider_moe.parity=PASS\n"
               << "provider_moe.mps_parity=" << (mps ? "PASS" : "SKIP") << '\n'
+              << "provider_moe.staged_expert_equivalence="
+              << (staged ? "PASS" : "SKIP") << '\n'
               << "provider_moe.full_k3_span=17547264\n"
               << "provider_moe.python_runtime=ABSENT\n";
     return 0;

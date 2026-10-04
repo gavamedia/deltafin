@@ -1,0 +1,22 @@
+[
+  {
+    "slug": "france",
+    "prompt": "The capital of France is"
+  },
+  {
+    "slug": "gold",
+    "prompt": "The chemical symbol for gold is"
+  },
+  {
+    "slug": "code",
+    "prompt": "def merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    mid ="
+  },
+  {
+    "slug": "narrative",
+    "prompt": "The old lighthouse keeper spotted something strange floating in the harbor at dawn, and"
+  },
+  {
+    "slug": "explain",
+    "prompt": "Explain to a five-year-old why the sky is blue, using simple words and a fun analogy."
+  }
+]

@@ -6,9 +6,8 @@
 //! each row for crash-oriented debugging and may therefore retain a partial
 //! pass, matching its explicit durability tradeoff.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -16,6 +15,7 @@ use serde::Serialize;
 use crate::error::{DeltafinError, Result};
 use crate::experts::{K3_EXPERTS_PER_LAYER, K3_MOE_LAYER_FIRST, K3_MOE_LAYER_LAST};
 use crate::provider::TargetSequenceMailbox;
+use crate::sys::fs::{self as sys_fs, Open};
 
 pub const MAX_ROUTER_TRACE_BYTES: u64 = 8 << 30;
 pub const ROUTER_TRACE_HOST_RESERVE_BYTES: u64 = 5 * 1024 * 1024;
@@ -96,7 +96,7 @@ impl RouterTrace {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let parent_meta = fs::symlink_metadata(parent)
+        let parent_meta = sys_fs::lstat(parent)
             .map_err(|error| io_error("inspect router-trace parent", parent, error))?;
         if parent_meta.file_type().is_symlink() || !parent_meta.is_dir() {
             return Err(DeltafinError::new(format!(
@@ -104,7 +104,7 @@ impl RouterTrace {
                 parent.display()
             )));
         }
-        let before = match fs::symlink_metadata(path) {
+        let before = match sys_fs::lstat(path) {
             Ok(metadata) => {
                 validate_existing(path, &metadata)?;
                 Some(metadata)
@@ -112,15 +112,14 @@ impl RouterTrace {
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(io_error("inspect router trace", path, error)),
         };
-        let file = OpenOptions::new()
+        let file = Open::new()
             .append(true)
             .create(true)
             .mode(0o600)
-            .custom_flags(open_nofollow_cloexec())
+            .no_follow()
             .open(path)
             .map_err(|error| io_error("open router trace without following links", path, error))?;
-        let opened = file
-            .metadata()
+        let opened = sys_fs::fstat(&file)
             .map_err(|error| io_error("stat opened router trace", path, error))?;
         if !opened.is_file() || opened.len() > MAX_ROUTER_TRACE_BYTES {
             return Err(DeltafinError::new(format!(
@@ -350,7 +349,7 @@ fn ensure_below_limit(bytes: u64) -> Result<()> {
     Ok(())
 }
 
-fn validate_existing(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+fn validate_existing(path: &Path, metadata: &sys_fs::Stat) -> Result<()> {
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
         || metadata.len() > MAX_ROUTER_TRACE_BYTES
@@ -363,18 +362,8 @@ fn validate_existing(path: &Path, metadata: &fs::Metadata) -> Result<()> {
     Ok(())
 }
 
-fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+fn same_file(left: &sys_fs::Stat, right: &sys_fs::Stat) -> bool {
     left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(target_os = "macos")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x0100_0000 | 0x0000_0100
-}
-
-#[cfg(target_os = "linux")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x0008_0000 | 0x0002_0000
 }
 
 fn io_error(operation: &str, path: &Path, error: io::Error) -> DeltafinError {
@@ -384,6 +373,7 @@ fn io_error(operation: &str, path: &Path, error: io::Error) -> DeltafinError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use serde_json::Value;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -475,7 +465,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn trace_open_never_follows_a_symlink() {
-        use std::os::unix::fs::symlink;
+        use crate::sys::fs::symlink;
 
         let root = TempDir::create();
         let target = root.0.join("target");

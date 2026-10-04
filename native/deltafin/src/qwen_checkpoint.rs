@@ -1,10 +1,9 @@
 //! Strict, Python-free admission for Deltafin's two pinned Qwen3 assistants.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Read;
 use std::ops::Range;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -12,6 +11,7 @@ use serde_json::Value;
 use crate::dspark_checkpoint::{digest_from_hex, strict_json};
 use crate::error::{DeltafinError, Result};
 use crate::packfile::{digest_bytes, digest_open_file};
+use crate::sys::fs::{self as sys_fs, Open};
 
 const MAX_HEADER_BYTES: u64 = 1 << 20;
 const CONFIG_BYTES: u64 = 727;
@@ -118,7 +118,7 @@ struct FileIdentity {
 }
 
 impl FileIdentity {
-    fn from(metadata: &std::fs::Metadata) -> Self {
+    fn from(metadata: &sys_fs::Stat) -> Self {
         Self {
             device: metadata.dev(),
             inode: metadata.ino(),
@@ -131,8 +131,7 @@ impl FileIdentity {
     }
 
     fn validate(self, file: &File, path: &Path) -> Result<()> {
-        let metadata = file
-            .metadata()
+        let metadata = sys_fs::fstat(&file)
             .map_err(|error| io_error("restat Qwen file", path, error))?;
         if !metadata.is_file() || Self::from(&metadata) != self {
             return Err(DeltafinError::new(format!(
@@ -396,13 +395,12 @@ fn parse_u64_array(value: Option<&Value>, name: &str) -> Result<Vec<u64>> {
 }
 
 fn open_regular(path: &Path, expected_bytes: u64) -> Result<(File, FileIdentity)> {
-    let file = OpenOptions::new()
+    let file = Open::new()
         .read(true)
-        .custom_flags(open_nofollow_cloexec())
+        .no_follow()
         .open(path)
         .map_err(|error| io_error("open pinned Qwen file", path, error))?;
-    let metadata = file
-        .metadata()
+    let metadata = sys_fs::fstat(&file)
         .map_err(|error| io_error("stat pinned Qwen file", path, error))?;
     if !metadata.is_file() || metadata.len() != expected_bytes {
         return Err(DeltafinError::new(format!(
@@ -411,15 +409,6 @@ fn open_regular(path: &Path, expected_bytes: u64) -> Result<(File, FileIdentity)
         )));
     }
     Ok((file, FileIdentity::from(&metadata)))
-}
-
-#[cfg(target_os = "macos")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x0100_0100
-}
-#[cfg(target_os = "linux")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x000a_0000
 }
 
 fn io_error(operation: &str, path: &Path, error: std::io::Error) -> DeltafinError {

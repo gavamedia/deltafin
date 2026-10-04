@@ -841,11 +841,33 @@ KdaConvolvedPositions kda_short_convolve_positions(
       std::move(key_conv.source), std::move(value_conv.source)};
 }
 
+namespace {
+
+/*
+ * One row of the KDA delta-rule recurrence. The positions loop and prefix
+ * replay both call exactly this, which is what makes a replayed boundary
+ * bit-identical to the one the loop held.
+ */
+at::Tensor kda_recurrent_row_update(const at::Tensor& recurrent,
+                                    const at::Tensor& decay_row,
+                                    const at::Tensor& key_row,
+                                    const at::Tensor& value_row,
+                                    const at::Tensor& beta_row) {
+  const at::Tensor decayed = recurrent * at::exp(decay_row).unsqueeze(-1);
+  const at::Tensor delta =
+      value_row - (key_row.unsqueeze(-1) * decayed).sum(-2);
+  return decayed + at::einsum("bhk,bhv->bhkv",
+                              {beta_row.unsqueeze(-1) * key_row, delta});
+}
+
+}  // namespace
+
 KdaPositionsRecurrentResult kda_recur_convolved_positions(
     const at::Tensor& hidden_rows, const KdaWeights& weights,
     const KdaState& state, const KdaConvolvedPositions& convolved,
     const KdaDependentPositions& dependent,
-    const bool retain_boundaries, const bool exact_k3) {
+    const bool retain_boundaries, const bool exact_k3,
+    KdaRecurrenceRecord* const record) {
   if (!hidden_rows.defined() || hidden_rows.dim() != 2 ||
       hidden_rows.size(0) < 2 || hidden_rows.size(0) > 64 ||
       hidden_rows.scalar_type() != at::kFloat ||
@@ -916,18 +938,26 @@ KdaPositionsRecurrentResult kda_recur_convolved_positions(
   at::Tensor recurrent = state.recurrent;
   const double scale =
       std::sqrt(static_cast<double>(shape.head_width));
+  if (record != nullptr) {
+    *record = KdaRecurrenceRecord{
+        .initial_recurrent = state.recurrent,
+        .gated_decay = gated_decay,
+        .key = key,
+        .value = value,
+        .beta = beta,
+        .query_source = convolved.query_source,
+        .key_source = convolved.key_source,
+        .value_source = convolved.value_source,
+        .positions = positions,
+        .convolution_width = shape.convolution_width,
+    };
+  }
   for (std::int64_t position = 0; position < positions; ++position) {
     const at::Tensor query_token = query.narrow(0, position, 1) / scale;
-    const at::Tensor key_token = key.narrow(0, position, 1);
-    const at::Tensor value_token = value.narrow(0, position, 1);
-    const at::Tensor beta_token = beta.narrow(0, position, 1);
-    recurrent = recurrent *
-        at::exp(gated_decay.narrow(0, position, 1)).unsqueeze(-1);
-    const at::Tensor delta = value_token -
-        (key_token.unsqueeze(-1) * recurrent).sum(-2);
-    recurrent = recurrent + at::einsum(
-        "bhk,bhv->bhkv",
-        {beta_token.unsqueeze(-1) * key_token, delta});
+    recurrent = kda_recurrent_row_update(
+        recurrent, gated_decay.narrow(0, position, 1),
+        key.narrow(0, position, 1), value.narrow(0, position, 1),
+        beta.narrow(0, position, 1));
     recurrent_outputs.push_back(at::einsum(
         "bhk,bhkv->bhv", {query_token, recurrent}));
     if (retain_boundaries) {
@@ -963,6 +993,44 @@ KdaPositionsRecurrentResult kda_recur_convolved_positions(
   };
   return KdaPositionsRecurrentResult{
       std::move(output), std::move(final_state), std::move(boundaries)};
+}
+
+KdaState kda_replay_recorded_state(const KdaRecurrenceRecord& record,
+                                   const std::int64_t positions) {
+  if (!record.initial_recurrent.defined() || record.positions < 1 ||
+      positions < 1 || positions > record.positions ||
+      record.convolution_width < 1) {
+    throw std::invalid_argument(
+        "KDA prefix replay needs 1..T rows of a complete record");
+  }
+  at::Tensor recurrent = record.initial_recurrent;
+  for (std::int64_t position = 0; position < positions; ++position) {
+    recurrent = kda_recurrent_row_update(
+        recurrent, record.gated_decay.narrow(0, position, 1),
+        record.key.narrow(0, position, 1),
+        record.value.narrow(0, position, 1),
+        record.beta.narrow(0, position, 1));
+  }
+  const std::int64_t start = positions - 1;
+  return KdaState{
+      record.query_source.narrow(2, start, record.convolution_width),
+      record.key_source.narrow(2, start, record.convolution_width),
+      record.value_source.narrow(2, start, record.convolution_width),
+      std::move(recurrent),
+  };
+}
+
+std::uint64_t kda_recurrence_record_bytes(const KdaRecurrenceRecord& record) {
+  std::uint64_t bytes = 0;
+  for (const at::Tensor* tensor :
+       {&record.gated_decay, &record.key, &record.value, &record.beta,
+        &record.query_source, &record.key_source, &record.value_source}) {
+    if (tensor->defined()) {
+      bytes += static_cast<std::uint64_t>(tensor->numel()) *
+               static_cast<std::uint64_t>(tensor->element_size());
+    }
+  }
+  return bytes;
 }
 
 KdaDecodeResult kda_decode_one_unfused_for_test(

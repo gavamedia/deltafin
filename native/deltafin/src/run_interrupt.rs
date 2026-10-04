@@ -19,7 +19,7 @@ use crate::error::{DeltafinError, Result};
 compile_error!("cooperative SIGINT requires a lock-free 8-bit atomic target");
 
 static RUN_INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 static RUN_HANDLER_ARMED: AtomicBool = AtomicBool::new(false);
 
 /// Read-only cancellation source used by the target transaction loop.
@@ -52,6 +52,8 @@ impl InterruptSource for AtomicInterrupt<'_> {
 pub(crate) struct RunInterruptGuard {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     previous: libc::sigaction,
+    #[cfg(windows)]
+    _ctrl_c: deltafin_sys::console::CtrlCGuard,
 }
 
 impl RunInterruptGuard {
@@ -88,10 +90,32 @@ impl RunInterruptGuard {
             Ok(Self { previous })
         }
 
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(windows)]
+        {
+            if RUN_HANDLER_ARMED
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(DeltafinError::new(
+                    "native run Ctrl-C handler is already armed",
+                ));
+            }
+            RUN_INTERRUPT_REQUESTED.store(false, Ordering::Relaxed);
+            match deltafin_sys::console::interrupt_on_ctrl_c(&RUN_INTERRUPT_REQUESTED) {
+                Ok(guard) => Ok(Self { _ctrl_c: guard }),
+                Err(error) => {
+                    RUN_HANDLER_ARMED.store(false, Ordering::Release);
+                    Err(DeltafinError::new(format!(
+                        "arm native run Ctrl-C handler: {error}"
+                    )))
+                }
+            }
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {
             Err(DeltafinError::new(
-                "cooperative native-run Ctrl-C is currently supported on macOS and Linux",
+                "cooperative native-run Ctrl-C is supported on macOS, Linux and Windows",
             ))
         }
     }
@@ -120,6 +144,13 @@ impl Drop for RunInterruptGuard {
             // SAFETY: `previous` was filled by the successful arm operation
             // and remains live for this synchronous restoration call.
             let _ = unsafe { libc::sigaction(libc::SIGINT, &self.previous, std::ptr::null_mut()) };
+            RUN_INTERRUPT_REQUESTED.store(false, Ordering::Relaxed);
+            RUN_HANDLER_ARMED.store(false, Ordering::Release);
+        }
+        // The console guard disarms the handler when its field drops; the
+        // flags are cleared here, after, for the next run.
+        #[cfg(windows)]
+        {
             RUN_INTERRUPT_REQUESTED.store(false, Ordering::Relaxed);
             RUN_HANDLER_ARMED.store(false, Ordering::Release);
         }

@@ -115,6 +115,12 @@ struct TargetSequenceStats {
   std::uint64_t pilot_max_union_candidates = 0;
   std::uint64_t pilot_score_materializations = 0;
   std::uint64_t pilot_score_elisions = 0;
+  /* Expert early drain: layers that opened a staging token, experts whose
+   * matmul started while the rest of the layer was still being read, and
+   * staging offers the tape declined. */
+  std::uint64_t expert_stage_layers = 0;
+  std::uint64_t expert_stage_experts = 0;
+  std::uint64_t expert_stage_declines = 0;
 };
 
 /*
@@ -126,19 +132,23 @@ struct TargetSequenceStats {
  * complete.
  *
  * Persistent caches are never mutated during compute.  Prefill publishes all
- * rows only after every layer and tail succeeds.  Verify retains KDA row
- * boundaries and MLA's contiguous candidate rows, allowing an accepted prefix
- * to publish without replaying target math.  The memory cost of those KDA
- * boundaries is reported exactly in stats().verify_snapshot_bytes.  The
- * optional full-commit-only Verify contract instead retains exactly one final
- * KDA state per layer and rejects every partial publication.
+ * rows only after every layer and tail succeeds.  Verify retains MLA's
+ * contiguous candidate rows and, per KDA layer, the final state plus the
+ * recurrence inputs of every row; an accepted shorter prefix replays only the
+ * KDA recurrence for those rows (bit-identical to the state the pass held
+ * there, no target math), at about 19 MiB a row on K3 instead of a 453 MiB
+ * state per row.  The record's cost is reported exactly in
+ * stats().verify_snapshot_bytes.  The optional full-commit-only Verify
+ * contract instead retains exactly one final KDA state per layer and rejects
+ * every partial publication.
  */
 class TargetSequenceTape {
  public:
   TargetSequenceTape(const TargetPositionBindings& bindings,
                      at::Tensor input_hidden_rows, TargetSequenceMode mode,
                      bool capture_dspark_rows = false,
-                     bool full_commit_only = false);
+                     bool full_commit_only = false,
+                     bool capture_eagle3_rows = false);
   ~TargetSequenceTape();
 
   TargetSequenceTape(const TargetSequenceTape&) = delete;
@@ -156,6 +166,28 @@ class TargetSequenceTape {
                          const CanonicalExpertBatchT1& experts,
                          const MoeRunOptions& options);
   void finish_expert_tile(
+      std::uint16_t first_row, std::uint16_t row_count,
+      std::uint64_t spine_generation,
+      const CanonicalExpertPositionTileT1& experts,
+      const MoeRunOptions& options);
+
+  /*
+   * Expert early drain. Start the independent per-expert work for the experts
+   * whose bytes have already landed, without waiting for the rest of this
+   * layer's reads. Advisory in both directions: the tape may decline (returns
+   * false, nothing changes), and whatever it accepts is still recomputed by
+   * finish_expert_tile if anything about the staged state does not line up.
+   *
+   * What staging can never move is the reduction: each expert's weighted
+   * contribution enters the layer's routed output only inside
+   * finish_expert_tile, over every edge, in the router's own order. Arrival
+   * order therefore cannot change a single emitted byte.
+   *
+   * Single-position layers with the Metal expert backend only. `experts`
+   * carries just the arrived subset -- unique ascending IDs with one complete
+   * authenticated span each, borrowed until finish_expert_tile returns.
+   */
+  [[nodiscard]] bool stage_expert_spans(
       std::uint16_t first_row, std::uint16_t row_count,
       std::uint64_t spine_generation,
       const CanonicalExpertPositionTileT1& experts,

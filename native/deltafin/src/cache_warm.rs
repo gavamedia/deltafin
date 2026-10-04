@@ -5,9 +5,7 @@
 //! inventory and the same transactional range fetcher as ordinary inference.
 
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -20,6 +18,7 @@ use crate::experts::{
 };
 use crate::inventory::K3Inventory;
 use crate::weight_fetch::{ExpertFetchCatalog, FetchLimits, ProgressSink, WeightFetchProgress};
+use crate::sys::fs::{self as sys_fs, Open};
 
 const MAX_TRACE_BYTES: u64 = 8 << 30;
 const MAX_TRACE_LINE_BYTES: usize = 1 << 20;
@@ -154,7 +153,7 @@ fn parse_trace(
     counts: &mut BTreeMap<ObservedExpert, u64>,
     observed_routes: &mut u64,
 ) -> Result<()> {
-    let before = fs::symlink_metadata(path)
+    let before = sys_fs::lstat(path)
         .map_err(|error| io_error("inspect router trace", path, error))?;
     if before.file_type().is_symlink() || !before.is_file() || before.len() > MAX_TRACE_BYTES {
         return Err(DeltafinError::new(format!(
@@ -162,13 +161,12 @@ fn parse_trace(
             path.display()
         )));
     }
-    let file = OpenOptions::new()
+    let file = Open::new()
         .read(true)
-        .custom_flags(open_nofollow_cloexec())
+        .no_follow()
         .open(path)
         .map_err(|error| io_error("open router trace without following links", path, error))?;
-    let opened = file
-        .metadata()
+    let opened = sys_fs::fstat(&file)
         .map_err(|error| io_error("stat opened router trace", path, error))?;
     if !same_file(&before, &opened) {
         return Err(DeltafinError::new(format!(
@@ -191,9 +189,7 @@ fn parse_trace(
         })?;
         count_trace_row(path, line_number, &value, counts, observed_routes)?;
     }
-    let after = reader
-        .get_ref()
-        .metadata()
+    let after = sys_fs::fstat(reader.get_ref())
         .map_err(|error| io_error("restat router trace", path, error))?;
     if !same_file(&opened, &after) {
         return Err(DeltafinError::new(format!(
@@ -275,19 +271,18 @@ fn read_bounded_line(reader: &mut impl BufRead, output: &mut Vec<u8>) -> Result<
 
 fn exact_cached_expert(cache: &Path, key: ObservedExpert) -> Result<bool> {
     let path = cache.join(format!("L{}-E{}.bin", key.layer, key.expert));
-    match fs::symlink_metadata(&path) {
+    match sys_fs::lstat(&path) {
         Ok(metadata)
             if metadata.is_file()
                 && !metadata.file_type().is_symlink()
                 && metadata.len() == K3_EXPERT_SOURCE_BYTES as u64 =>
         {
-            let file = OpenOptions::new()
+            let file = Open::new()
                 .read(true)
-                .custom_flags(open_nofollow_cloexec())
+                .no_follow()
                 .open(&path)
                 .map_err(|error| io_error("open cached expert", &path, error))?;
-            let opened = file
-                .metadata()
+            let opened = sys_fs::fstat(&file)
                 .map_err(|error| io_error("stat cached expert", &path, error))?;
             if !same_file(&metadata, &opened) {
                 return Err(DeltafinError::new(format!(
@@ -307,7 +302,7 @@ fn exact_cached_expert(cache: &Path, key: ObservedExpert) -> Result<bool> {
 }
 
 fn inspect_optional_directory(path: &Path, label: &str) -> Result<()> {
-    match fs::symlink_metadata(path) {
+    match sys_fs::lstat(path) {
         Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => Ok(()),
         Ok(_) => Err(DeltafinError::new(format!(
             "{label} is not a real directory: {}",
@@ -318,7 +313,7 @@ fn inspect_optional_directory(path: &Path, label: &str) -> Result<()> {
     }
 }
 
-fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+fn same_file(left: &sys_fs::Stat, right: &sys_fs::Stat) -> bool {
     left.is_file()
         && right.is_file()
         && left.dev() == right.dev()
@@ -328,16 +323,6 @@ fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
         && left.mtime_nsec() == right.mtime_nsec()
 }
 
-#[cfg(target_os = "macos")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x0100_0100
-}
-
-#[cfg(target_os = "linux")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x000a_0000
-}
-
 fn io_error(operation: &str, path: &Path, error: std::io::Error) -> DeltafinError {
     DeltafinError::new(format!("{operation} {}: {error}", path.display()))
 }
@@ -345,6 +330,7 @@ fn io_error(operation: &str, path: &Path, error: std::io::Error) -> DeltafinErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::fs::File;
     use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -426,7 +412,7 @@ mod tests {
 
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink("missing", cache.join("L1-E1.bin")).unwrap();
+            crate::sys::fs::symlink("missing", cache.join("L1-E1.bin")).unwrap();
             let trace = root.0.join("unsafe.jsonl");
             fs::write(&trace, b"{\"layer\":1,\"ids\":[1]}\n").unwrap();
             assert!(plan(&cache, &[trace]).is_err());

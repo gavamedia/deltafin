@@ -9,7 +9,6 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
-use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -36,6 +35,7 @@ const WORKSPACE_INPUTS: &[&str] = &[
     "native/deltafin-curl-sys-direct/build_support.rs",
     "native/deltafin-curl-sys-direct/lib.rs",
     "native/deltafin-native-build/Cargo.toml",
+    "native/deltafin-sys/Cargo.toml",
     "native/deltafin-xtask/Cargo.toml",
     "native/provider_gate/deny_python.c.in",
     "native/provider_gate/README.md",
@@ -49,6 +49,7 @@ const RUST_SOURCE_ROOTS: &[&str] = &[
     "native/deltafin-bootstrap/src",
     "native/deltafin-curl-sys-direct/tests",
     "native/deltafin-native-build/src",
+    "native/deltafin-sys/src",
     "native/deltafin-xtask/src",
 ];
 
@@ -75,7 +76,12 @@ fn tracked_files(root: &Path) -> BTreeSet<PathBuf> {
         .stdout
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
-        .map(|path| PathBuf::from(OsString::from_vec(path.to_vec())))
+        .map(|path| {
+            // SAFETY: git emits these bytes as UTF-8 paths, which are valid
+            // in this platform's OS-string encoding (bytes on Unix, WTF-8,
+            // a superset of UTF-8, on Windows).
+            PathBuf::from(unsafe { OsString::from_encoded_bytes_unchecked(path.to_vec()) })
+        })
         .collect()
 }
 

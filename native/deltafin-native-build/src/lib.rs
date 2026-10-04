@@ -6,7 +6,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Read;
-use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
@@ -17,9 +17,17 @@ use deltafin_bootstrap::{InstallOptions, PlatformTarget};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+mod msvc;
+
+use msvc::CompilerFlavor;
+
 const TORCH_CPP_API_HEADER: &str = "include/torch/csrc/api/include/torch/torch.h";
 const TORCH_VERSION_HEADER: &str = "include/torch/headeronly/version.h";
 const PYTHON_DENY_EXIT: i32 = 86;
+/// The stack an isolated native test (and the product) runs on. Linux and
+/// macOS give the main thread 8 MiB; a Windows executable defaults to 1 MiB,
+/// which the provider's decode path is not written against.
+const NATIVE_TEST_STACK_BYTES: u64 = 8 << 20;
 /* No fast-math/TF32 contract for authoritative FP32 CUDA accumulation. */
 const CUDA_IEEE_MATH_FLAGS: &[&str] = &[
     "--ftz=false",
@@ -45,6 +53,7 @@ const PROVIDER_CPP_SOURCES: &[&str] = &[
     "provider_bf16_device.cpp",
     "provider_dspark.cpp",
     "provider_dspark_model.cpp",
+    "provider_eagle3.cpp",
     "provider_kda.cpp",
     "provider_kda_batch.cpp",
     "provider_mla.cpp",
@@ -75,6 +84,8 @@ pub const PRODUCTION_PROVIDER_SOURCES: &[&str] = &[
     "native/provider_gate/provider_dspark.cpp",
     "native/provider_gate/provider_dspark_model.h",
     "native/provider_gate/provider_dspark_model.cpp",
+    "native/provider_gate/provider_eagle3.h",
+    "native/provider_gate/provider_eagle3.cpp",
     "native/provider_gate/provider_kda.h",
     "native/provider_gate/provider_kda.cpp",
     "native/provider_gate/provider_kda_batch.h",
@@ -113,6 +124,7 @@ pub const PRODUCTION_PROVIDER_SOURCES: &[&str] = &[
     "tools/fused_gemv.c",
     "tools/fused_gemv_batch.c",
     "tools/neon_compat_x86.h",
+    "tools/win_compat.h",
     "tools/gpu_runtime_compat.h",
     "tools/metal_moe_abi.h",
     "tools/metal_moe.mm",
@@ -125,6 +137,7 @@ pub enum NativeTestPlatform {
     Any,
     Macos,
     Linux,
+    Windows,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -343,6 +356,16 @@ pub const NATIVE_TEST_SPECS: &[NativeTestSpec] = &[
         provider: ProviderFlavor::Production,
         cases: DEFAULT_CASES,
         pass_marker: "provider_dspark_model.synthetic=PASS",
+        timeout_seconds: 300,
+    },
+    NativeTestSpec {
+        name: "eagle3",
+        platform: NativeTestPlatform::Any,
+        main_source: "native/provider_gate/provider_eagle3_test.cpp",
+        extra_sources: &[],
+        provider: ProviderFlavor::Production,
+        cases: DEFAULT_CASES,
+        pass_marker: "provider_eagle3.synthetic=PASS",
         timeout_seconds: 300,
     },
     NativeTestSpec {
@@ -596,6 +619,18 @@ pub fn run_production_build() {
         // compiler, or emit provider link directives for this feature set.
         return;
     }
+    println!("cargo:rerun-if-env-changed=DELTAFIN_NATIVE_BUILD_CHECK_ONLY");
+    if env::var_os("DELTAFIN_NATIVE_BUILD_CHECK_ONLY").is_some_and(|value| value == "1") {
+        // Developer-only, for `cargo check` against a target this host cannot
+        // build natively (the Windows target from macOS, say): type-check the
+        // Rust without configuring LibTorch or compiling the provider. No
+        // provider archive or link directive is produced, so nothing built
+        // this way can link, let alone run.
+        println!(
+            "cargo:warning=DELTAFIN_NATIVE_BUILD_CHECK_ONLY=1 skipped the native provider build; this configuration can only be type-checked"
+        );
+        return;
+    }
 
     let manifest_dir = PathBuf::from(required_env("CARGO_MANIFEST_DIR"));
     let repository = manifest_dir
@@ -749,12 +784,140 @@ pub fn run_production_build() {
             println!("cargo:rustc-link-lib=framework=Foundation");
         }
         "linux" => println!("cargo:rustc-link-lib=dylib=stdc++"),
+        // The MSVC C++ runtime comes in through the /MD objects' default-library
+        // directives; there is no `stdc++` to name. A Windows executable's
+        // main thread gets 1 MiB unless asked for more.
+        "windows" => println!("cargo:rustc-link-arg=/STACK:{NATIVE_TEST_STACK_BYTES}"),
         target => panic!("native provider ABI does not support target OS {target}"),
     }
-    println!(
-        "cargo:rustc-link-arg=-Wl,-rpath,{}",
-        artifacts.torch_lib.display()
-    );
+    if target_os() == "windows" {
+        // Windows has no RPATH: the loader finds LibTorch's DLLs beside the
+        // executable, so the authenticated ones are placed there.
+        deploy_runtime_libraries(
+            &artifacts.torch_lib,
+            &PathBuf::from(required_env("OUT_DIR")),
+        );
+    } else {
+        println!(
+            "cargo:rustc-link-arg=-Wl,-rpath,{}",
+            artifacts.torch_lib.display()
+        );
+    }
+}
+
+/// Place LibTorch's DLLs where a Windows process will find them: beside the
+/// executable Cargo produces and beside the test executables in `deps/`. The
+/// files come from the authenticated toolchain (or the operator's root) and
+/// are linked rather than copied where the volume allows, so a 300 MB library
+/// is not duplicated per profile.
+fn deploy_runtime_libraries(torch_lib: &Path, out_dir: &Path) {
+    // OUT_DIR is <target>/<profile>/build/<package>-<hash>/out.
+    let layout_ok = out_dir
+        .ancestors()
+        .nth(2)
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "build");
+    let Some(profile_directory) = out_dir.ancestors().nth(3).filter(|_| layout_ok) else {
+        panic!(
+            "cannot locate the Cargo profile directory from OUT_DIR {}",
+            out_dir.display()
+        );
+    };
+    let mut libraries: Vec<PathBuf> = fs::read_dir(torch_lib)
+        .unwrap_or_else(|error| {
+            panic!("list LibTorch libraries in {}: {error}", torch_lib.display())
+        })
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|error| {
+                    panic!("read LibTorch directory {}: {error}", torch_lib.display())
+                })
+                .path()
+        })
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("dll"))
+        })
+        .collect();
+    libraries.sort();
+    for directory in [
+        profile_directory.to_path_buf(),
+        profile_directory.join("deps"),
+    ] {
+        fs::create_dir_all(&directory)
+            .unwrap_or_else(|error| panic!("create {}: {error}", directory.display()));
+        for library in &libraries {
+            reject_python_dependency(library).unwrap_or_else(|error| panic!("{error}"));
+            let name = library.file_name().expect("a listed file has a name");
+            deploy_one_library(library, &directory.join(name));
+        }
+    }
+    // A deleted copy must bring this script back.
+    for library in &libraries {
+        let name = library.file_name().expect("a listed file has a name");
+        println!(
+            "cargo:rerun-if-changed={}",
+            profile_directory.join(name).display()
+        );
+    }
+}
+
+fn deploy_one_library(source: &Path, destination: &Path) {
+    let source_metadata = fs::symlink_metadata(source)
+        .unwrap_or_else(|error| panic!("inspect {}: {error}", source.display()));
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+        panic!(
+            "LibTorch library must be a non-symlink regular file: {}",
+            source.display()
+        );
+    }
+    if let Ok(existing) = fs::symlink_metadata(destination) {
+        if existing.file_type().is_symlink() || !existing.is_file() {
+            panic!(
+                "refusing to replace a non-regular deployed library: {}",
+                destination.display()
+            );
+        }
+        if existing.len() == source_metadata.len() && files_identical(source, destination) {
+            return;
+        }
+        // A library the running product still has mapped cannot be replaced;
+        // that error names the file rather than half-updating a deployment.
+        fs::remove_file(destination).unwrap_or_else(|error| {
+            panic!(
+                "replace deployed library {} (is a Deltafin process still running?): {error}",
+                destination.display()
+            )
+        });
+    }
+    if fs::hard_link(source, destination).is_err() {
+        fs::copy(source, destination).unwrap_or_else(|error| {
+            panic!(
+                "deploy {} to {}: {error}",
+                source.display(),
+                destination.display()
+            )
+        });
+    }
+}
+
+fn files_identical(left: &Path, right: &Path) -> bool {
+    fn digest(path: &Path) -> Option<[u8; 32]> {
+        let mut file = fs::File::open(path).ok()?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 1 << 20];
+        loop {
+            let count = file.read(&mut buffer).ok()?;
+            if count == 0 {
+                return Some(hasher.finalize().into());
+            }
+            hasher.update(&buffer[..count]);
+        }
+    }
+    match (digest(left), digest(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
 }
 
 /// Build and execute one or every isolated native provider test through the
@@ -766,7 +929,7 @@ pub fn run_native_tests(
     output_root: &Path,
     requested: &str,
 ) -> NativeBuildResult<Vec<NativeTestReport>> {
-    let repository = fs::canonicalize(repository).map_err(|error| {
+    let repository = deltafin_sys::fs::canonicalize(repository).map_err(|error| {
         NativeBuildError::new(format!(
             "resolve native-test repository {}: {error}",
             repository.display()
@@ -806,7 +969,7 @@ pub fn run_native_tests(
             target_root.display()
         ))
     })?;
-    let target_root = fs::canonicalize(&target_root).map_err(|error| {
+    let target_root = deltafin_sys::fs::canonicalize(&target_root).map_err(|error| {
         NativeBuildError::new(format!(
             "resolve Cargo target directory {}: {error}",
             target_root.display()
@@ -823,7 +986,7 @@ pub fn run_native_tests(
             requested_root.display()
         ))
     })?;
-    let output_root = fs::canonicalize(&requested_root).map_err(|error| {
+    let output_root = deltafin_sys::fs::canonicalize(&requested_root).map_err(|error| {
         NativeBuildError::new(format!(
             "resolve native-test output directory {}: {error}",
             requested_root.display()
@@ -850,14 +1013,34 @@ pub fn run_native_tests(
     } else {
         None
     };
+    // Every selected spec runs before a failure is reported: a matrix that
+    // stops at its first red spec costs one full run per spec to learn what
+    // one run could have said, which on a slow or metered host is the
+    // difference between a day and an hour of porting.
     let mut reports = Vec::with_capacity(selected.len());
+    let mut failures: Vec<String> = Vec::new();
     for spec in selected {
-        reports.push(build_and_run_native_test(
-            &repository,
-            &output_root,
-            spec,
-            provider.as_ref(),
-        )?);
+        match build_and_run_native_test(&repository, &output_root, spec, provider.as_ref()) {
+            Ok(report) => reports.push(report),
+            Err(error) => {
+                eprintln!("[xtask] {}: FAIL", spec.name);
+                failures.push(format!("native test {} failed: {error}", spec.name));
+            }
+        }
+    }
+    if !failures.is_empty() {
+        return Err(NativeBuildError::new(format!(
+            "{} of {} native test(s) failed ({} passed: {}):\n\n{}",
+            failures.len(),
+            failures.len() + reports.len(),
+            reports.len(),
+            reports
+                .iter()
+                .map(|report| report.name)
+                .collect::<Vec<_>>()
+                .join(", "),
+            failures.join("\n\n")
+        )));
     }
     Ok(reports)
 }
@@ -880,7 +1063,9 @@ fn platform_matches(platform: NativeTestPlatform, host_os: &str) -> bool {
     matches!(platform, NativeTestPlatform::Any)
         || matches!(
             (platform, host_os),
-            (NativeTestPlatform::Macos, "macos") | (NativeTestPlatform::Linux, "linux")
+            (NativeTestPlatform::Macos, "macos")
+                | (NativeTestPlatform::Linux, "linux")
+                | (NativeTestPlatform::Windows, "windows")
         )
 }
 
@@ -892,7 +1077,7 @@ fn canonical_child_output(parent: &Path, child: &str) -> NativeBuildResult<PathB
             requested.display()
         ))
     })?;
-    let resolved = fs::canonicalize(&requested).map_err(|error| {
+    let resolved = deltafin_sys::fs::canonicalize(&requested).map_err(|error| {
         NativeBuildError::new(format!(
             "resolve native output directory {}: {error}",
             requested.display()
@@ -908,6 +1093,71 @@ fn canonical_child_output(parent: &Path, child: &str) -> NativeBuildResult<PathB
     Ok(resolved)
 }
 
+/// One translation unit of the provider archive.
+struct CompileJob<'a> {
+    kind: CompileKind<'a>,
+    source: PathBuf,
+    object: PathBuf,
+}
+
+enum CompileKind<'a> {
+    Cpp {
+        generated_include: Option<&'a Path>,
+        cuda_include: Option<&'a Path>,
+        objective_cpp: bool,
+    },
+    Kernel,
+}
+
+/// Run every job, a few at a time, and return the objects in job order, or
+/// the message of every job that failed.
+fn run_compile_jobs<'a>(
+    jobs: &[CompileJob<'a>],
+    compile: impl Fn(&CompileJob<'a>) -> Result<(), String> + Sync,
+) -> Result<Vec<PathBuf>, Vec<String>> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let workers = thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .clamp(1, 8)
+        .min(jobs.len().max(1));
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<Option<Result<(), String>>>> =
+        Mutex::new((0..jobs.len()).map(|_| None).collect());
+    thread::scope(|scope| {
+        for worker in 0..workers {
+            thread::Builder::new()
+                .name(format!("native-compile-{worker}"))
+                .spawn_scoped(scope, || {
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(job) = jobs.get(index) else {
+                            return;
+                        };
+                        let result = compile(job);
+                        results.lock().expect("compile results lock")[index] = Some(result);
+                    }
+                })
+                .expect("start a native compile worker thread");
+        }
+    });
+    let results = results.into_inner().expect("compile results lock");
+    let mut objects = Vec::with_capacity(jobs.len());
+    let mut failures = Vec::new();
+    for (job, result) in jobs.iter().zip(results) {
+        match result.expect("every job ran") {
+            Ok(()) => objects.push(job.object.clone()),
+            Err(message) => failures.push(message),
+        }
+    }
+    if failures.is_empty() {
+        Ok(objects)
+    } else {
+        Err(failures)
+    }
+}
+
 fn build_provider_artifacts(
     repository: &Path,
     native_build: &Path,
@@ -918,6 +1168,15 @@ fn build_provider_artifacts(
     validate_torch_version(&torch_root, emit_cargo_metadata);
     let torch_lib = torch_root.join("lib");
     let libtorch_cxx11_abi = detect_libtorch_cxx11_abi(&torch_lib);
+    if target_os() == "windows"
+        && (library_file(&torch_lib, "torch_cuda").is_some()
+            || library_file(&torch_lib, "c10_cuda").is_some())
+    {
+        panic!(
+            "{} holds a CUDA-enabled LibTorch; the Windows native build graph supports the CPU runtime today",
+            torch_lib.display()
+        );
+    }
     let gpu_runtime = detect_gpu_runtime(&torch_lib);
     // Only NVIDIA needs the separate cudart toolkit discovery; a ROCm tree
     // resolves HIP through its own runtime and has no cudart to find.
@@ -930,7 +1189,7 @@ fn build_provider_artifacts(
             native_build.display()
         )
     });
-    let native_build = fs::canonicalize(native_build).unwrap_or_else(|error| {
+    let native_build = deltafin_sys::fs::canonicalize(native_build).unwrap_or_else(|error| {
         panic!(
             "resolve Rust-owned provider build directory {}: {error}",
             native_build.display()
@@ -954,9 +1213,15 @@ fn build_provider_artifacts(
     }
 
     let toolchain = NativeToolchain::discover();
-    let guard = PythonGuard::build(&native_build, &toolchain.cc, &provider_source);
-    validate_compiler(&toolchain.cc, "C", &guard);
-    validate_compiler(&toolchain.cxx, "C++", &guard);
+    let mut guard = PythonGuard::build(&native_build, &toolchain, &provider_source);
+    guard.loader_directories.push(torch_lib.clone());
+    if let Some(provider) = &cuda_provider {
+        guard
+            .loader_directories
+            .push(provider.runtime_directory.clone());
+    }
+    validate_compiler(&toolchain, &toolchain.cc, "C", &guard);
+    validate_compiler(&toolchain, &toolchain.cxx, "C++", &guard);
 
     let generated_include = native_build.join("generated");
     let host_os = target_os();
@@ -969,7 +1234,7 @@ fn build_provider_artifacts(
             &guard,
             emit_cargo_metadata,
         ),
-        "linux" => {}
+        "linux" | "windows" => {}
         target => panic!("native provider ABI does not support target OS {target}"),
     }
 
@@ -999,7 +1264,7 @@ fn build_provider_artifacts(
             "DELTAFIN_HAVE_SPINE_INT8_METAL_V1=1",
             "DELTAFIN_HAVE_PRECOMPILED_METAL_LIBRARIES_V1=1",
         ]);
-    } else {
+    } else if host_os == "linux" {
         definitions.push(match libtorch_cxx11_abi {
             Some(0) => "_GLIBCXX_USE_CXX11_ABI=0",
             Some(1) => "_GLIBCXX_USE_CXX11_ABI=1",
@@ -1013,36 +1278,32 @@ fn build_provider_artifacts(
         "USE_TENSORPIPE",
     ]);
 
-    let mut objects = Vec::with_capacity(PROVIDER_CPP_SOURCES.len() + 4);
+    // Every translation unit is compiled before a failure is reported, so one
+    // run shows all of what is wrong rather than the first of it (a port to a
+    // new compiler would otherwise cost one full build per diagnostic), and
+    // the independent units are compiled concurrently. Objects keep the order
+    // of this list, so the archive is the same whatever the schedule.
+    let mut jobs: Vec<CompileJob> = Vec::new();
     for source in PROVIDER_CPP_SOURCES {
-        let source_path = provider_source.join(source);
-        let object = native_build.join(format!(
-            "{}.o",
-            source.strip_suffix(".cpp").expect("provider C++ suffix")
-        ));
-        compile_cpp(
-            &toolchain.cxx,
-            &source_path,
-            &object,
-            &torch_root,
-            (host_os == "macos").then_some(generated_include.as_path()),
-            cuda_provider
-                .as_ref()
-                .map(|provider| provider.include_directory.as_path()),
-            &definitions,
-            false,
-            &guard,
-        );
-        objects.push(object);
+        jobs.push(CompileJob {
+            kind: CompileKind::Cpp {
+                generated_include: (host_os == "macos").then_some(generated_include.as_path()),
+                cuda_include: cuda_provider
+                    .as_ref()
+                    .map(|provider| provider.include_directory.as_path()),
+                objective_cpp: false,
+            },
+            source: provider_source.join(source),
+            object: native_build.join(object_file_name(
+                source.strip_suffix(".cpp").expect("provider C++ suffix"),
+            )),
+        });
     }
-    let gemv_object = native_build.join("fused_gemv_batch.o");
-    compile_gemv(
-        &toolchain.cc,
-        &repository.join("tools/fused_gemv_batch.c"),
-        &gemv_object,
-        &guard,
-    );
-    objects.push(gemv_object);
+    jobs.push(CompileJob {
+        kind: CompileKind::Kernel,
+        source: repository.join("tools/fused_gemv_batch.c"),
+        object: native_build.join(object_file_name("fused_gemv_batch")),
+    });
     if host_os == "macos" {
         for (source, object) in [
             (
@@ -1062,26 +1323,48 @@ fn build_provider_artifacts(
                 native_build.join("metal_moe.o"),
             ),
         ] {
-            compile_cpp(
-                &toolchain.cxx,
-                &source,
-                &object,
-                &torch_root,
-                Some(&generated_include),
-                None,
-                &definitions,
-                true,
-                &guard,
-            );
-            objects.push(object);
+            jobs.push(CompileJob {
+                kind: CompileKind::Cpp {
+                    generated_include: Some(generated_include.as_path()),
+                    cuda_include: None,
+                    objective_cpp: true,
+                },
+                source,
+                object,
+            });
         }
     }
+    let mut objects = run_compile_jobs(&jobs, |job| match job.kind {
+        CompileKind::Cpp {
+            generated_include,
+            cuda_include,
+            objective_cpp,
+        } => compile_cpp(
+            &toolchain,
+            &job.source,
+            &job.object,
+            &torch_root,
+            generated_include,
+            cuda_include,
+            &definitions,
+            objective_cpp,
+            &guard,
+        ),
+        CompileKind::Kernel => compile_gemv(&toolchain, &job.source, &job.object, &guard),
+    })
+    .unwrap_or_else(|failures| {
+        panic!(
+            "{} native translation unit(s) failed to compile:\n\n{}",
+            failures.len(),
+            failures.join("\n\n")
+        )
+    });
     if let Some(cuda) = &cuda {
         objects.push(cuda.object.clone());
         objects.push(cuda.spine_object.clone());
     }
-    let archive = native_build.join("libdeltafin_provider_abi.a");
-    archive_objects(&toolchain.ar, &archive, &objects, &guard);
+    let archive = native_build.join(provider_archive_name());
+    archive_objects(&toolchain, &archive, &objects, &guard);
 
     if let Some(cuda) = &cuda {
         if cuda.runtime == KernelRuntime::Cuda
@@ -1153,14 +1436,16 @@ fn build_and_run_native_test(
 
     let mut objects = Vec::new();
     let main = repository.join(spec.main_source);
-    let main_object = build.join("test-main.o");
-    compile_test_source(&main, &main_object, &definitions, &include, provider);
+    let main_object = build.join(object_file_name("test-main"));
+    compile_test_source(&main, &main_object, &definitions, &include, provider)
+        .map_err(NativeBuildError::new)?;
     objects.push(main_object);
 
     for (index, relative) in spec.extra_sources.iter().enumerate() {
         let source = repository.join(relative);
-        let object = build.join(format!("test-extra-{index}.o"));
-        compile_test_source(&source, &object, &definitions, &include, provider);
+        let object = build.join(object_file_name(&format!("test-extra-{index}")));
+        compile_test_source(&source, &object, &definitions, &include, provider)
+            .map_err(NativeBuildError::new)?;
         objects.push(object);
     }
 
@@ -1168,43 +1453,46 @@ fn build_and_run_native_test(
         ProviderFlavor::SyntheticMoe => {
             let mut synthetic = definitions.clone();
             synthetic.push("DELTAFIN_PROVIDER_MOE_TESTING=1");
-            let object = build.join("provider_moe_test_flavor.o");
+            let object = build.join(object_file_name("provider_moe_test_flavor"));
             compile_test_source(
                 &repository.join("native/provider_gate/provider_moe.cpp"),
                 &object,
                 &synthetic,
                 &include,
                 provider,
-            );
+            )
+            .map_err(NativeBuildError::new)?;
             objects.push(object);
         }
         ProviderFlavor::CudaResidency => {
-            let object = build.join("provider_cuda_moe_residency_test_flavor.o");
+            let object = build.join(object_file_name("provider_cuda_moe_residency_test_flavor"));
             compile_test_source(
                 &repository.join("native/provider_gate/provider_cuda_moe.cpp"),
                 &object,
                 &definitions,
                 &include,
                 provider,
-            );
+            )
+            .map_err(NativeBuildError::new)?;
             objects.push(object);
         }
         ProviderFlavor::MetalSourceDevelopment => {
-            let object = build.join("metal_moe_source_development_flavor.o");
+            let object = build.join(object_file_name("metal_moe_source_development_flavor"));
             compile_test_source(
                 &repository.join("tools/metal_moe.mm"),
                 &object,
                 &definitions,
                 &include,
                 provider,
-            );
+            )
+            .map_err(NativeBuildError::new)?;
             objects.push(object);
         }
         ProviderFlavor::Production => {}
         ProviderFlavor::None => unreachable!("CPU-only flavor returned above"),
     }
 
-    let executable = build.join(format!("deltafin-native-test-{}", spec.name));
+    let executable = build.join(native_test_executable_name(spec.name));
     link_provider_test(&objects, &executable, provider, spec)?;
     audit_transitive_dependencies(&executable, provider, &build)?;
     run_native_test_cases(repository, &build, spec, &executable, &provider.guard)
@@ -1217,34 +1505,59 @@ fn build_and_run_cpu_only_test(
 ) -> NativeBuildResult<NativeTestReport> {
     let provider_source = repository.join("native/provider_gate");
     let toolchain = NativeToolchain::discover();
-    let guard = PythonGuard::build(build, &toolchain.cc, &provider_source);
-    validate_compiler(&toolchain.cc, "C", &guard);
+    let guard = PythonGuard::build(build, &toolchain, &provider_source);
+    validate_compiler(&toolchain, &toolchain.cc, "C", &guard);
     let mut objects = Vec::new();
-    let main_object = build.join("test-main.o");
+    let main_object = build.join(object_file_name("test-main"));
     compile_c_test_main(
-        &toolchain.cc,
+        &toolchain,
         &repository.join(spec.main_source),
         &main_object,
         &guard,
-    );
+    )
+    .map_err(NativeBuildError::new)?;
     objects.push(main_object);
     for (index, relative) in spec.extra_sources.iter().enumerate() {
-        let object = build.join(format!("test-extra-{index}.o"));
-        compile_gemv(&toolchain.cc, &repository.join(relative), &object, &guard);
+        let object = build.join(object_file_name(&format!("test-extra-{index}")));
+        compile_gemv(&toolchain, &repository.join(relative), &object, &guard)
+            .map_err(NativeBuildError::new)?;
         objects.push(object);
     }
-    let executable = build.join(format!("deltafin-native-test-{}", spec.name));
+    let executable = build.join(native_test_executable_name(spec.name));
     prepare_generated_output(&executable, "native test executable");
-    let mut link = Command::new(&toolchain.cc);
-    link.args(&objects).arg("-o").arg(&executable);
-    if target_os() == "linux" {
-        link.args(["-pthread", "-lm"]);
+    let linker_program: &Path = match toolchain.flavor {
+        CompilerFlavor::Gnu => &toolchain.cc,
+        CompilerFlavor::Msvc => toolchain
+            .linker
+            .as_deref()
+            .expect("an MSVC toolchain always carries link.exe"),
+    };
+    let mut link = Command::new(linker_program);
+    match toolchain.flavor {
+        CompilerFlavor::Gnu => {
+            link.args(&objects).arg("-o").arg(&executable);
+            if target_os() == "linux" {
+                link.args(["-pthread", "-lm"]);
+            }
+        }
+        CompilerFlavor::Msvc => {
+            // The kernels have no import libraries of their own to name.
+            link.args(msvc::link_args(
+                &objects,
+                None,
+                &executable,
+                &[],
+                &[],
+                NATIVE_TEST_STACK_BYTES,
+            ));
+        }
     }
-    run_guarded_checked(
+    run_guarded_try(
         &mut link,
         &format!("link isolated native test {}", spec.name),
         &guard,
-    );
+    )
+    .map_err(NativeBuildError::new)?;
     validate_native_executable(&executable, "isolated native test");
     audit_standalone_dependencies(&executable, build, &guard)?;
     run_native_test_cases(repository, build, spec, &executable, &guard)
@@ -1256,16 +1569,14 @@ fn compile_test_source(
     definitions: &[&str],
     generated_include: &Path,
     provider: &ProviderBuildArtifacts,
-) {
+) -> Result<(), String> {
     match source.extension().and_then(OsStr::to_str) {
         Some("c") if source.file_name() == Some(OsStr::new("fused_gemv_batch.c")) => {
-            compile_gemv(&provider.toolchain.cc, source, object, &provider.guard);
+            compile_gemv(&provider.toolchain, source, object, &provider.guard)
         }
-        Some("c") => {
-            compile_c_test_main(&provider.toolchain.cc, source, object, &provider.guard);
-        }
+        Some("c") => compile_c_test_main(&provider.toolchain, source, object, &provider.guard),
         Some("cpp" | "mm") => compile_cpp(
-            &provider.toolchain.cxx,
+            &provider.toolchain,
             source,
             object,
             &provider.torch_root,
@@ -1292,6 +1603,9 @@ fn link_provider_test(
     spec: &NativeTestSpec,
 ) -> NativeBuildResult<()> {
     prepare_generated_output(executable, "native test executable");
+    if provider.toolchain.flavor == CompilerFlavor::Msvc {
+        return link_provider_test_msvc(objects, executable, provider, spec);
+    }
     let mut link = Command::new(&provider.toolchain.cxx);
     link.args(objects)
         .arg(&provider.archive)
@@ -1339,11 +1653,57 @@ fn link_provider_test(
     link.arg(format!("-Wl,-rpath,{}", provider.torch_lib.display()))
         .arg("-o")
         .arg(executable);
-    run_guarded_checked(
+    run_guarded_try(
         &mut link,
         &format!("link isolated native test {}", spec.name),
         &provider.guard,
-    );
+    )
+    .map_err(NativeBuildError::new)?;
+    validate_native_executable(executable, "isolated native test");
+    Ok(())
+}
+
+/// Link an isolated provider test with `link.exe`: the test's objects, the
+/// provider archive, then LibTorch's import libraries.
+fn link_provider_test_msvc(
+    objects: &[PathBuf],
+    executable: &Path,
+    provider: &ProviderBuildArtifacts,
+    spec: &NativeTestSpec,
+) -> NativeBuildResult<()> {
+    let linker = provider
+        .toolchain
+        .linker
+        .as_ref()
+        .expect("an MSVC toolchain always carries link.exe");
+    let mut libraries = vec!["torch.lib", "torch_cpu.lib"];
+    if library_file(&provider.torch_lib, "torch_cuda").is_some() {
+        libraries.extend(["torch_cuda.lib", "c10_cuda.lib"]);
+    }
+    if library_file(&provider.torch_lib, "torch_cuda_linalg").is_some() {
+        libraries.push("torch_cuda_linalg.lib");
+    }
+    libraries.push("c10.lib");
+    let mut directories = vec![provider.torch_lib.as_path()];
+    if let Some(cuda) = &provider.cuda_provider {
+        directories.push(cuda.runtime_directory.as_path());
+        libraries.push("cudart.lib");
+    }
+    let mut link = Command::new(linker);
+    link.args(msvc::link_args(
+        objects,
+        Some(&provider.archive),
+        executable,
+        &directories,
+        &libraries,
+        NATIVE_TEST_STACK_BYTES,
+    ));
+    run_guarded_try(
+        &mut link,
+        &format!("link isolated native test {}", spec.name),
+        &provider.guard,
+    )
+    .map_err(NativeBuildError::new)?;
     validate_native_executable(executable, "isolated native test");
     Ok(())
 }
@@ -1433,16 +1793,35 @@ struct BoundedChildOutput {
 
 fn sanitize_test_environment(command: &mut Command, guard: &PythonGuard) -> NativeBuildResult<()> {
     command.env_clear();
-    let path = env::join_paths([
-        guard.directory.as_path(),
-        Path::new("/usr/bin"),
-        Path::new("/bin"),
-        Path::new("/usr/sbin"),
-        Path::new("/sbin"),
-    ])
-    .map_err(|error| NativeBuildError::new(format!("construct native-test PATH: {error}")))?;
+    let mut directories: Vec<PathBuf> = vec![guard.directory.clone()];
+    if target_os() == "windows" {
+        // The loader resolves implicit imports from the executable's own
+        // directory, then the system's, then PATH: so PATH here is the system
+        // directories (asked of the kernel, not read from the environment)
+        // and then the one LibTorch directory this build audited.
+        let system = deltafin_sys::fs::system_directory().map_err(|error| {
+            NativeBuildError::new(format!("locate the Windows system directory: {error}"))
+        })?;
+        if let Some(windows) = system.parent() {
+            directories.push(system.clone());
+            directories.push(windows.to_path_buf());
+        }
+        directories.extend(guard.loader_directories.iter().cloned());
+    } else {
+        directories.extend(
+            ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+                .iter()
+                .map(PathBuf::from),
+        );
+    }
+    let path = env::join_paths(directories)
+        .map_err(|error| NativeBuildError::new(format!("construct native-test PATH: {error}")))?;
     command.env("PATH", path);
     for variable in [
+        // Win32 programs (Winsock, the CRT's locale and time) read these.
+        "SystemRoot",
+        "windir",
+        "SystemDrive",
         "HOME",
         "TMPDIR",
         "TMP",
@@ -1612,7 +1991,7 @@ fn audit_dependency_graph(
     guard: &PythonGuard,
 ) -> NativeBuildResult<()> {
     const DEPENDENCY_LIMIT: usize = 512;
-    let executable = fs::canonicalize(executable).map_err(|error| {
+    let executable = deltafin_sys::fs::canonicalize(executable).map_err(|error| {
         NativeBuildError::new(format!(
             "resolve native-test executable for dependency audit {}: {error}",
             executable.display()
@@ -1620,7 +1999,7 @@ fn audit_dependency_graph(
     })?;
     let mut roots = Vec::new();
     for root in admitted_roots {
-        if let Ok(root) = fs::canonicalize(root) {
+        if let Ok(root) = deltafin_sys::fs::canonicalize(root) {
             if !roots.contains(&root) {
                 roots.push(root);
             }
@@ -1640,7 +2019,7 @@ fn audit_dependency_graph(
     let mut pending = VecDeque::from([executable]);
     let mut visited = BTreeSet::new();
     while let Some(binary) = pending.pop_front() {
-        let binary = fs::canonicalize(&binary).map_err(|error| {
+        let binary = deltafin_sys::fs::canonicalize(&binary).map_err(|error| {
             NativeBuildError::new(format!(
                 "resolve transitive native dependency {}: {error}",
                 binary.display()
@@ -1665,6 +2044,7 @@ fn audit_dependency_graph(
                 guard,
             )?,
             "linux" => audit_elf_dependencies(&binary, &roots, log_root, visited.len(), guard)?,
+            "windows" => audit_pe_dependencies(&binary, &roots)?,
             target => {
                 return Err(NativeBuildError::new(format!(
                     "dependency audit does not support target OS {target}"
@@ -1674,6 +2054,84 @@ fn audit_dependency_graph(
         pending.extend(discovered);
     }
     Ok(())
+}
+
+/// The DLLs a PE image needs, resolved as the loader will for a native test
+/// that runs with the PATH this build gives it: the executable's own
+/// directory, the Windows system directory, then the audited roots. Parsed in
+/// process; nothing is executed and no tool (`dumpbin`, `ldd`) is consulted.
+fn audit_pe_dependencies(binary: &Path, roots: &[PathBuf]) -> NativeBuildResult<Vec<PathBuf>> {
+    let mut file = fs::File::open(binary).map_err(|error| {
+        NativeBuildError::new(format!(
+            "open PE image for dependency audit {}: {error}",
+            binary.display()
+        ))
+    })?;
+    let image = deltafin_sys::pe::parse_image(&mut file).map_err(|error| {
+        NativeBuildError::new(format!(
+            "malformed PE image {}: {error}",
+            binary.display()
+        ))
+    })?;
+    if image.headers.machine != deltafin_sys::pe::MACHINE_AMD64 || !image.headers.pe32_plus {
+        return Err(NativeBuildError::new(format!(
+            "native build produced a PE image for machine {:#06x}; only x86-64 is supported: {}",
+            image.headers.machine,
+            binary.display()
+        )));
+    }
+    let system = deltafin_sys::fs::system_directory().map_err(|error| {
+        NativeBuildError::new(format!("locate the Windows system directory: {error}"))
+    })?;
+    let own_directory = binary.parent().map(Path::to_path_buf);
+    let mut found = Vec::new();
+    for name in image.imports.all() {
+        if name.contains(['/', '\\', ':']) {
+            return Err(NativeBuildError::new(format!(
+                "PE image {} imports {name:?}, a path rather than a DLL name",
+                binary.display()
+            )));
+        }
+        let lowercase = name.to_ascii_lowercase();
+        // API-set contracts are virtual modules with no file to audit.
+        if lowercase.starts_with("api-ms-win-") || lowercase.starts_with("ext-ms-win-") {
+            continue;
+        }
+        if system.join(name).is_file()
+            && !own_directory
+                .as_ref()
+                .is_some_and(|directory| directory.join(name).is_file())
+        {
+            continue;
+        }
+        let resolved = own_directory
+            .iter()
+            .chain(roots.iter())
+            .map(|directory| directory.join(name))
+            .find(|candidate| candidate.is_file());
+        let Some(resolved) = resolved else {
+            return Err(NativeBuildError::new(format!(
+                "cannot prove the native dependency closure: {} imports {name:?}, found neither beside it, in the Windows system directory, nor in an audited root",
+                binary.display()
+            )));
+        };
+        let canonical = deltafin_sys::fs::canonicalize(&resolved).map_err(|error| {
+            NativeBuildError::new(format!(
+                "resolve native dependency {}: {error}",
+                resolved.display()
+            ))
+        })?;
+        if !roots.iter().chain(own_directory.iter()).any(|root| {
+            deltafin_sys::fs::canonicalize(root).is_ok_and(|root| canonical.starts_with(root))
+        }) {
+            return Err(NativeBuildError::new(format!(
+                "native dependency {} escapes every audited root",
+                canonical.display()
+            )));
+        }
+        found.push(canonical);
+    }
+    Ok(found)
 }
 
 fn reject_python_dependency(path: &Path) -> NativeBuildResult<()> {
@@ -1824,7 +2282,7 @@ fn resolve_macho_dependency(
         )));
     }
     for candidate in candidates {
-        if let Ok(candidate) = fs::canonicalize(&candidate) {
+        if let Ok(candidate) = deltafin_sys::fs::canonicalize(&candidate) {
             if candidate.is_file() {
                 return Ok(candidate);
             }
@@ -1905,7 +2363,7 @@ fn audit_elf_dependencies(
         let resolved = search
             .iter()
             .map(|directory| directory.join(name))
-            .find_map(|candidate| fs::canonicalize(candidate).ok())
+            .find_map(|candidate| deltafin_sys::fs::canonicalize(candidate).ok())
             .filter(|candidate| candidate.is_file())
             .ok_or_else(|| {
                 NativeBuildError::new(format!(
@@ -1998,7 +2456,7 @@ fn linux_loader_cache_directories(
         if !path.is_absolute() {
             continue;
         }
-        if let Some(parent) = path.parent().and_then(|value| fs::canonicalize(value).ok()) {
+        if let Some(parent) = path.parent().and_then(|value| deltafin_sys::fs::canonicalize(value).ok()) {
             directories.insert(parent);
         }
     }
@@ -2007,24 +2465,101 @@ fn linux_loader_cache_directories(
 
 #[derive(Debug)]
 struct NativeToolchain {
+    flavor: CompilerFlavor,
     cc: PathBuf,
     cxx: PathBuf,
+    /// `ar` on Unix, `lib.exe` on Windows.
     ar: PathBuf,
+    /// `link.exe` (Windows only): links the isolated native tests, which on
+    /// Unix go through the C++ driver.
+    linker: Option<PathBuf>,
+    /// What the tools need in their environment to run (`INCLUDE`, `LIB`, and
+    /// a `PATH` that reaches their DLLs): empty for GCC and Clang.
+    environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
 }
 
 impl NativeToolchain {
     fn discover() -> Self {
         let target_os = target_os();
-        let (cc_defaults, cxx_defaults, ar_defaults): (&[&str], &[&str], &[&str]) =
-            match target_os.as_str() {
-                "macos" => (&["/usr/bin/clang"], &["/usr/bin/clang++"], &["/usr/bin/ar"]),
-                "linux" => (&["cc", "clang", "gcc"], &["c++", "clang++", "g++"], &["ar"]),
-                target => panic!("native provider ABI does not support target OS {target}"),
-            };
+        match target_os.as_str() {
+            "macos" => Self::gnu(&["/usr/bin/clang"], &["/usr/bin/clang++"], &["/usr/bin/ar"]),
+            "linux" => Self::gnu(
+                &["cc", "clang", "gcc"],
+                &["c++", "clang++", "g++"],
+                &["ar"],
+            ),
+            "windows" => Self::msvc(),
+            target => panic!("native provider ABI does not support target OS {target}"),
+        }
+    }
+
+    fn gnu(cc_defaults: &[&str], cxx_defaults: &[&str], ar_defaults: &[&str]) -> Self {
         Self {
+            flavor: CompilerFlavor::Gnu,
             cc: resolve_required_native_tool("CC", cc_defaults),
             cxx: resolve_required_native_tool("CXX", cxx_defaults),
             ar: resolve_required_native_tool("AR", ar_defaults),
+            linker: None,
+            environment: Vec::new(),
+        }
+    }
+
+    /// Microsoft's toolchain, found through Visual Studio's own setup
+    /// configuration. An explicit `CC`/`CXX`/`AR` still wins, and its flavor
+    /// follows its file name (`cl.exe` and `clang-cl.exe` speak MSVC options).
+    fn msvc() -> Self {
+        let target = format!("{}-pc-windows-msvc", target_arch());
+        let discovered = msvc::discover(&target).unwrap_or_else(|error| panic!("{error}"));
+        let explicit = |variable: &str, found: &Path| {
+            if env::var_os(variable).is_some() {
+                resolve_required_native_tool(variable, &[])
+            } else {
+                let path = resolve_tool_path(found, variable);
+                validate_native_executable(&path, variable);
+                path
+            }
+        };
+        let cc = explicit("CC", &discovered.cl);
+        let cxx = explicit("CXX", &discovered.cl);
+        let flavor = msvc::flavor_of(&cc);
+        if msvc::flavor_of(&cxx) != flavor {
+            panic!(
+                "CC ({}) and CXX ({}) must speak the same compiler dialect",
+                cc.display(),
+                cxx.display()
+            );
+        }
+        if flavor == CompilerFlavor::Gnu {
+            // A GNU-driver compiler on Windows (clang, gcc) is a different
+            // graph from the one audited here; it is not silently half-supported.
+            panic!(
+                "the Windows native build admits MSVC-style compilers (cl.exe, clang-cl.exe); \
+                 {} speaks GNU options",
+                cc.display()
+            );
+        }
+        Self {
+            flavor,
+            cc,
+            cxx,
+            ar: {
+                let archiver = explicit("AR", &discovered.lib);
+                let stem = archiver
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().to_ascii_lowercase())
+                    .unwrap_or_default();
+                if stem != "lib" && stem != "llvm-lib" {
+                    panic!(
+                        "the Windows native build archives with lib.exe or llvm-lib.exe, not {}",
+                        archiver.display()
+                    );
+                }
+                archiver
+            },
+            // `LINK` itself is link.exe's options variable, so the override
+            // for the program is named for this project.
+            linker: Some(explicit("DELTAFIN_LINK", &discovered.link)),
+            environment: discovered.environment,
         }
     }
 }
@@ -2033,10 +2568,17 @@ impl NativeToolchain {
 struct PythonGuard {
     directory: PathBuf,
     marker: PathBuf,
+    /// The selected toolchain's own environment, applied to every guarded
+    /// command (`INCLUDE`, `LIB`, and the `PATH` that reaches its DLLs).
+    tool_environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    /// Directories a native test's loader may read DLLs from, in addition to
+    /// the system's (Windows resolves implicit imports through `PATH`).
+    loader_directories: Vec<PathBuf>,
 }
 
 impl PythonGuard {
-    fn build(build: &Path, cc: &Path, provider_source: &Path) -> Self {
+    fn build(build: &Path, toolchain: &NativeToolchain, provider_source: &Path) -> Self {
+        let cc = &toolchain.cc;
         let directory = build.join("python-deny");
         fs::create_dir_all(&directory).unwrap_or_else(|error| {
             panic!(
@@ -2068,7 +2610,7 @@ impl PythonGuard {
         }
         let source = template.replace(
             "@DELTAFIN_PYTHON_DENY_MARKER_C@",
-            &c_string_literal_bytes(marker.as_os_str().as_bytes()),
+            &c_string_literal_bytes(marker.as_os_str().as_encoded_bytes()),
         );
         let source_path = directory.join("deny_python.c");
         fs::write(&source_path, source).unwrap_or_else(|error| {
@@ -2080,12 +2622,24 @@ impl PythonGuard {
         let executable =
             directory.join(format!("deltafin-python-denied{}", env::consts::EXE_SUFFIX));
         let mut compile = Command::new(cc);
-        compile
-            .args(["-std=gnu11", "-O2", "-Wall", "-Wextra", "-Werror"])
-            .arg(&source_path)
-            .arg("-o")
-            .arg(&executable);
+        match toolchain.flavor {
+            CompilerFlavor::Gnu => {
+                compile
+                    .args(["-std=gnu11", "-O2", "-Wall", "-Wextra", "-Werror"])
+                    .arg(&source_path)
+                    .arg("-o")
+                    .arg(&executable);
+            }
+            CompilerFlavor::Msvc => {
+                compile.args(msvc::guard_compile_args(
+                    &source_path,
+                    &directory.join("deny_python.obj"),
+                    &executable,
+                ));
+            }
+        }
         sanitize_native_environment(&mut compile);
+        apply_tool_environment(&mut compile, &toolchain.environment);
         run_checked(&mut compile, "compile native Python-denial guard");
         validate_native_executable(&executable, "Python-denial guard");
 
@@ -2145,7 +2699,12 @@ impl PythonGuard {
                 )
             });
         }
-        Self { directory, marker }
+        Self {
+            directory,
+            marker,
+            tool_environment: toolchain.environment.clone(),
+            loader_directories: Vec::new(),
+        }
     }
 
     fn prepare(&self, command: &mut Command) {
@@ -2155,8 +2714,17 @@ impl PythonGuard {
                 self.marker.display()
             );
         }
+        // The toolchain's environment first, so the PATH built below extends
+        // the one that reaches its DLLs rather than the ambient one.
+        apply_tool_environment(command, &self.tool_environment);
+        let inherited = self
+            .tool_environment
+            .iter()
+            .find(|(name, _)| msvc::same_variable(name, OsStr::new("PATH")))
+            .map(|(_, value)| value.clone())
+            .or_else(|| env::var_os("PATH"));
         let mut paths = vec![self.directory.clone()];
-        if let Some(path) = env::var_os("PATH") {
+        if let Some(path) = inherited {
             paths.extend(env::split_paths(&path));
         }
         command.env(
@@ -2435,7 +3003,7 @@ fn discover_metal_toolchain(guard: &PythonGuard) -> MetalToolchain {
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .unwrap_or_else(|| panic!("Apple MetalToolchain metadata has an invalid search path"));
-    let search_path = fs::canonicalize(&search_path).unwrap_or_else(|error| {
+    let search_path = deltafin_sys::fs::canonicalize(&search_path).unwrap_or_else(|error| {
         panic!(
             "resolve Apple MetalToolchain search path {}: {error}",
             search_path.display()
@@ -2458,7 +3026,7 @@ fn discover_metal_toolchain(guard: &PythonGuard) -> MetalToolchain {
 }
 
 fn metal_toolchain_under(root: &Path, label: &str, guard: &PythonGuard) -> Option<MetalToolchain> {
-    let root = fs::canonicalize(root).ok()?;
+    let root = deltafin_sys::fs::canonicalize(root).ok()?;
     validate_root_owned_nonwritable(&root, &format!("{label} toolchain"), true);
     let bin = root.join("usr/bin");
     let metal = bin.join("metal");
@@ -2521,7 +3089,7 @@ fn parse_bounded_absolute_path(bytes: &[u8], label: &str) -> PathBuf {
     if !path.is_absolute() {
         panic!("{label} is not absolute: {}", path.display());
     }
-    fs::canonicalize(&path)
+    deltafin_sys::fs::canonicalize(&path)
         .unwrap_or_else(|error| panic!("resolve {label} {}: {error}", path.display()))
 }
 
@@ -2530,6 +3098,12 @@ fn validate_apple_native_tool(path: &Path, label: &str) {
     validate_native_executable(path, label);
 }
 
+#[cfg(not(unix))]
+fn admit_apple_tool_preserving_name(path: &Path, _root: &Path, label: &str) {
+    panic!("{label} admission is macOS-only: {}", path.display());
+}
+
+#[cfg(unix)]
 fn admit_apple_tool_preserving_name(path: &Path, root: &Path, label: &str) {
     let named = fs::symlink_metadata(path)
         .unwrap_or_else(|error| panic!("inspect {label} {}: {error}", path.display()));
@@ -2539,7 +3113,7 @@ fn admit_apple_tool_preserving_name(path: &Path, root: &Path, label: &str) {
     if !named.file_type().is_symlink() && named.mode() & 0o022 != 0 {
         panic!("{label} path is group/world writable: {}", path.display());
     }
-    let target = fs::canonicalize(path)
+    let target = deltafin_sys::fs::canonicalize(path)
         .unwrap_or_else(|error| panic!("resolve {label} {}: {error}", path.display()));
     if !target.starts_with(root) {
         panic!(
@@ -2552,6 +3126,12 @@ fn admit_apple_tool_preserving_name(path: &Path, root: &Path, label: &str) {
     validate_native_executable(&target, label);
 }
 
+#[cfg(not(unix))]
+fn validate_root_owned_nonwritable(path: &Path, label: &str, _directory: bool) {
+    panic!("{label} admission is macOS-only: {}", path.display());
+}
+
+#[cfg(unix)]
 fn validate_root_owned_nonwritable(path: &Path, label: &str, directory: bool) {
     let metadata = fs::metadata(path)
         .unwrap_or_else(|error| panic!("inspect {label} {}: {error}", path.display()));
@@ -2703,8 +3283,9 @@ static_assert(kDeltafinEmbeddedMoeMxfp4MslBytes == kDeltafinEmbeddedMoeMxfp4MslI
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compile_cpp(
-    compiler: &Path,
+    toolchain: &NativeToolchain,
     source: &Path,
     object: &Path,
     torch_root: &Path,
@@ -2713,8 +3294,30 @@ fn compile_cpp(
     definitions: &[&str],
     objective_cpp: bool,
     guard: &PythonGuard,
-) {
-    let mut command = Command::new(compiler);
+) -> Result<(), String> {
+    let mut command = Command::new(&toolchain.cxx);
+    if toolchain.flavor == CompilerFlavor::Msvc {
+        assert!(
+            !objective_cpp,
+            "Objective-C++ source {} cannot be compiled on Windows",
+            source.display()
+        );
+        command.args(msvc::cpp_compile_args(
+            source,
+            object,
+            torch_root,
+            generated_include,
+            cuda_include,
+            definitions,
+        ));
+        run_guarded_try(
+            &mut command,
+            &format!("compile native provider source {}", source.display()),
+            guard,
+        )?;
+        validate_object(object);
+        return Ok(());
+    }
     command.args([
         "-O3",
         "-DNDEBUG",
@@ -2746,16 +3349,36 @@ fn compile_cpp(
         .arg(source)
         .arg("-o")
         .arg(object);
-    run_guarded_checked(
+    run_guarded_try(
         &mut command,
         &format!("compile native provider source {}", source.display()),
         guard,
-    );
+    )?;
     validate_object(object);
+    Ok(())
 }
 
-fn compile_gemv(compiler: &Path, source: &Path, object: &Path, guard: &PythonGuard) {
-    let mut command = Command::new(compiler);
+fn compile_gemv(
+    toolchain: &NativeToolchain,
+    source: &Path,
+    object: &Path,
+    guard: &PythonGuard,
+) -> Result<(), String> {
+    let mut command = Command::new(&toolchain.cc);
+    if toolchain.flavor == CompilerFlavor::Msvc {
+        command.args(msvc::c_kernel_compile_args(
+            source,
+            object,
+            target_arch() == "x86_64",
+        ));
+        run_guarded_try(
+            &mut command,
+            &format!("compile exact MXFP4 CPU kernel {}", source.display()),
+            guard,
+        )?;
+        validate_object(object);
+        return Ok(());
+    }
     command.args([
         "-O3",
         "-DNDEBUG",
@@ -2777,16 +3400,32 @@ fn compile_gemv(compiler: &Path, source: &Path, object: &Path, guard: &PythonGua
         ]);
     }
     command.arg("-c").arg(source).arg("-o").arg(object);
-    run_guarded_checked(
+    run_guarded_try(
         &mut command,
         &format!("compile exact MXFP4 CPU kernel {}", source.display()),
         guard,
-    );
+    )?;
     validate_object(object);
+    Ok(())
 }
 
-fn compile_c_test_main(compiler: &Path, source: &Path, object: &Path, guard: &PythonGuard) {
-    let mut command = Command::new(compiler);
+fn compile_c_test_main(
+    toolchain: &NativeToolchain,
+    source: &Path,
+    object: &Path,
+    guard: &PythonGuard,
+) -> Result<(), String> {
+    let mut command = Command::new(&toolchain.cc);
+    if toolchain.flavor == CompilerFlavor::Msvc {
+        command.args(msvc::c_test_compile_args(source, object));
+        run_guarded_try(
+            &mut command,
+            &format!("compile isolated native test main {}", source.display()),
+            guard,
+        )?;
+        validate_object(object);
+        return Ok(());
+    }
     command.args([
         "-O3",
         "-DNDEBUG",
@@ -2798,15 +3437,21 @@ fn compile_c_test_main(compiler: &Path, source: &Path, object: &Path, guard: &Py
         "-Werror",
     ]);
     command.arg("-c").arg(source).arg("-o").arg(object);
-    run_guarded_checked(
+    run_guarded_try(
         &mut command,
         &format!("compile isolated native test main {}", source.display()),
         guard,
-    );
+    )?;
     validate_object(object);
+    Ok(())
 }
 
-fn archive_objects(archiver: &Path, archive: &Path, objects: &[PathBuf], guard: &PythonGuard) {
+fn archive_objects(
+    toolchain: &NativeToolchain,
+    archive: &Path,
+    objects: &[PathBuf],
+    guard: &PythonGuard,
+) {
     if objects.is_empty() {
         panic!("native provider archive has no objects");
     }
@@ -2827,8 +3472,15 @@ fn archive_objects(archiver: &Path, archive: &Path, objects: &[PathBuf], guard: 
     for object in objects {
         validate_object(object);
     }
-    let mut command = Command::new(archiver);
-    command.arg("rcs").arg(archive).args(objects);
+    let mut command = Command::new(&toolchain.ar);
+    match toolchain.flavor {
+        CompilerFlavor::Gnu => {
+            command.arg("rcs").arg(archive).args(objects);
+        }
+        CompilerFlavor::Msvc => {
+            command.args(msvc::archive_args(archive, objects));
+        }
+    }
     run_guarded_checked(&mut command, "archive native provider ABI", guard);
     validate_object(archive);
 }
@@ -2863,7 +3515,7 @@ fn find_cuda_provider(torch_root: &Path) -> CudaProviderBuild {
     ];
     for variable in ["CUDAToolkit_ROOT", "CUDA_HOME", "CUDA_PATH"] {
         if let Some(value) = env::var_os(variable) {
-            let root = fs::canonicalize(&value).unwrap_or_else(|error| {
+            let root = deltafin_sys::fs::canonicalize(&value).unwrap_or_else(|error| {
                 panic!(
                     "resolve explicit CUDA toolkit {variable}={}: {error}",
                     PathBuf::from(&value).display()
@@ -2888,7 +3540,7 @@ fn find_cuda_provider(torch_root: &Path) -> CudaProviderBuild {
                 continue;
             }
             if let Some(runtime_directory) = cuda_runtime_directory_optional(&root) {
-                let include_directory = fs::canonicalize(&include).unwrap_or_else(|error| {
+                let include_directory = deltafin_sys::fs::canonicalize(&include).unwrap_or_else(|error| {
                     panic!(
                         "resolve CUDA provider include directory {}: {error}",
                         include.display()
@@ -3139,7 +3791,7 @@ fn discover_nvcc() -> Option<PathBuf> {
     }
     for variable in ["CUDAToolkit_ROOT", "CUDA_HOME", "CUDA_PATH"] {
         if let Some(value) = env::var_os(variable) {
-            let root = fs::canonicalize(&value).unwrap_or_else(|error| {
+            let root = deltafin_sys::fs::canonicalize(&value).unwrap_or_else(|error| {
                 panic!(
                     "resolve explicit CUDA toolkit {variable}={}: {error}",
                     PathBuf::from(&value).display()
@@ -3166,7 +3818,7 @@ fn discover_hipcc() -> Option<PathBuf> {
     }
     for variable in ["HIP_PATH", "ROCM_PATH", "ROCM_HOME"] {
         if let Some(value) = env::var_os(variable) {
-            let root = fs::canonicalize(&value).unwrap_or_else(|error| {
+            let root = deltafin_sys::fs::canonicalize(&value).unwrap_or_else(|error| {
                 panic!(
                     "resolve explicit ROCm root {variable}={}: {error}",
                     PathBuf::from(&value).display()
@@ -3187,13 +3839,13 @@ fn hip_toolkit_root(compiler: &Path) -> PathBuf {
         .parent()
         .and_then(Path::parent)
         .unwrap_or_else(|| panic!("HIPCC path has no ROCm root: {}", compiler.display()));
-    let inferred = fs::canonicalize(inferred).unwrap_or_else(|error| {
+    let inferred = deltafin_sys::fs::canonicalize(inferred).unwrap_or_else(|error| {
         panic!("resolve inferred ROCm root {}: {error}", inferred.display())
     });
     let mut explicit_root: Option<PathBuf> = None;
     for variable in ["HIP_PATH", "ROCM_PATH", "ROCM_HOME"] {
         if let Some(value) = env::var_os(variable) {
-            let root = fs::canonicalize(&value).unwrap_or_else(|error| {
+            let root = deltafin_sys::fs::canonicalize(&value).unwrap_or_else(|error| {
                 panic!(
                     "resolve explicit ROCm root {variable}={}: {error}",
                     PathBuf::from(&value).display()
@@ -3215,7 +3867,7 @@ fn hip_toolkit_root(compiler: &Path) -> PathBuf {
     // a mixed toolchain the same way a mismatched CUDA_HOME would, so the two
     // must agree before either is trusted.
     let root = explicit_root.unwrap_or(inferred);
-    let root_hipcc = fs::canonicalize(root.join("bin/hipcc")).unwrap_or_else(|error| {
+    let root_hipcc = deltafin_sys::fs::canonicalize(root.join("bin/hipcc")).unwrap_or_else(|error| {
         panic!(
             "selected ROCm root {} has no resolvable bin/hipcc: {error}",
             root.display()
@@ -3235,7 +3887,7 @@ fn hip_runtime_directory(root: &Path) -> PathBuf {
     for relative in ["lib", "lib64"] {
         let candidate = root.join(relative);
         if library_file(&candidate, "amdhip64").is_some() {
-            return fs::canonicalize(&candidate).unwrap_or_else(|error| {
+            return deltafin_sys::fs::canonicalize(&candidate).unwrap_or_else(|error| {
                 panic!(
                     "resolve ROCm runtime directory {}: {error}",
                     candidate.display()
@@ -3299,7 +3951,7 @@ fn cuda_toolkit_root(compiler: &Path) -> PathBuf {
         .parent()
         .and_then(Path::parent)
         .unwrap_or_else(|| panic!("NVCC path has no toolkit root: {}", compiler.display()));
-    let inferred = fs::canonicalize(inferred).unwrap_or_else(|error| {
+    let inferred = deltafin_sys::fs::canonicalize(inferred).unwrap_or_else(|error| {
         panic!(
             "resolve inferred CUDA toolkit root {}: {error}",
             inferred.display()
@@ -3308,7 +3960,7 @@ fn cuda_toolkit_root(compiler: &Path) -> PathBuf {
     let mut explicit_root: Option<PathBuf> = None;
     for variable in ["CUDAToolkit_ROOT", "CUDA_HOME", "CUDA_PATH"] {
         if let Some(value) = env::var_os(variable) {
-            let root = fs::canonicalize(&value).unwrap_or_else(|error| {
+            let root = deltafin_sys::fs::canonicalize(&value).unwrap_or_else(|error| {
                 panic!(
                     "resolve explicit CUDA toolkit {variable}={}: {error}",
                     PathBuf::from(&value).display()
@@ -3327,7 +3979,7 @@ fn cuda_toolkit_root(compiler: &Path) -> PathBuf {
         }
     }
     let root = explicit_root.unwrap_or(inferred);
-    let root_nvcc = fs::canonicalize(root.join("bin/nvcc")).unwrap_or_else(|error| {
+    let root_nvcc = deltafin_sys::fs::canonicalize(root.join("bin/nvcc")).unwrap_or_else(|error| {
         panic!(
             "selected CUDA toolkit {} has no resolvable bin/nvcc: {error}",
             root.display()
@@ -3369,10 +4021,10 @@ fn cuda_runtime_directory_optional(root: &Path) -> Option<PathBuf> {
             continue;
         };
         let found = entries.filter_map(Result::ok).any(|entry| {
-            entry.file_name().as_bytes().starts_with(b"libcudart.so") && entry.path().is_file()
+            entry.file_name().as_encoded_bytes().starts_with(b"libcudart.so") && entry.path().is_file()
         });
         if found {
-            return Some(fs::canonicalize(&candidate).unwrap_or_else(|error| {
+            return Some(deltafin_sys::fs::canonicalize(&candidate).unwrap_or_else(|error| {
                 panic!(
                     "resolve CUDA runtime directory {}: {error}",
                     candidate.display()
@@ -3455,9 +4107,19 @@ fn validate_cuda_driver(path: &Path) {
     validate_native_executable(path, "NVCC");
 }
 
-fn validate_compiler(path: &Path, language: &str, guard: &PythonGuard) {
+fn validate_compiler(
+    toolchain: &NativeToolchain,
+    path: &Path,
+    language: &str,
+    guard: &PythonGuard,
+) {
     let mut command = Command::new(path);
-    command.arg("--version");
+    command.arg(match toolchain.flavor {
+        CompilerFlavor::Gnu => "--version",
+        // `cl.exe` has no `--version`; its help is introduced by a banner
+        // that names the compiler.
+        CompilerFlavor::Msvc => "/?",
+    });
     let output = run_guarded_output(
         &mut command,
         &format!("query selected {language} compiler"),
@@ -3468,6 +4130,16 @@ fn validate_compiler(path: &Path, language: &str, guard: &PythonGuard) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    if toolchain.flavor == CompilerFlavor::Msvc {
+        if !msvc::is_msvc_banner(&identity) {
+            panic!(
+                "Deltafin's Windows native provider requires Microsoft's compiler (or clang-cl) for {language}; selected {} reported {}",
+                path.display(),
+                one_line(identity.as_bytes())
+            );
+        }
+        return;
+    }
     let lower = identity.to_ascii_lowercase();
     if !(lower.contains("clang")
         || lower.contains("gcc")
@@ -3527,7 +4199,7 @@ fn resolve_tool_value(variable: &str, value: &OsStr) -> PathBuf {
 }
 
 fn resolve_tool_path(path: &Path, label: &str) -> PathBuf {
-    let path = fs::canonicalize(path).unwrap_or_else(|error| {
+    let path = deltafin_sys::fs::canonicalize(path).unwrap_or_else(|error| {
         panic!(
             "resolve native build tool {label}={}: {error}",
             path.display()
@@ -3535,7 +4207,16 @@ fn resolve_tool_path(path: &Path, label: &str) -> PathBuf {
     });
     let metadata = fs::metadata(&path)
         .unwrap_or_else(|error| panic!("inspect native build tool {}: {error}", path.display()));
-    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+    #[cfg(unix)]
+    let executable = metadata.is_file() && metadata.permissions().mode() & 0o111 != 0;
+    // Windows has no exec bit: a program is a `.exe` file, and the format
+    // check that follows rejects scripts and shims renamed to one.
+    #[cfg(windows)]
+    let executable = metadata.is_file()
+        && path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"));
+    if !executable {
         panic!(
             "native build tool must be an executable regular file: {}",
             path.display()
@@ -3557,6 +4238,16 @@ fn find_on_path(name: &OsStr) -> Option<PathBuf> {
     })
 }
 
+/// Enough of a Windows program's headers to follow `e_lfanew` to its PE
+/// signature and read the COFF header.
+const PE_HEADER_BYTES: u64 = 4096;
+
+fn read_pe_header(file: &mut fs::File) -> std::io::Result<Vec<u8>> {
+    let mut header = Vec::new();
+    file.take(PE_HEADER_BYTES).read_to_end(&mut header)?;
+    Ok(header)
+}
+
 fn validate_native_executable(path: &Path, label: &str) {
     let mut file = fs::File::open(path).unwrap_or_else(|error| {
         panic!(
@@ -3564,6 +4255,21 @@ fn validate_native_executable(path: &Path, label: &str) {
             path.display()
         )
     });
+    if cfg!(windows) {
+        let header = read_pe_header(&mut file).unwrap_or_else(|error| {
+            panic!(
+                "inspect native build tool {label} {}: {error}",
+                path.display()
+            )
+        });
+        if !deltafin_sys::pe::is_native_executable(&header) {
+            panic!(
+                "native build tool {label} is interpreted or is not a PE program: {}",
+                path.display()
+            );
+        }
+        return;
+    }
     let mut magic = [0_u8; 4];
     file.read_exact(&mut magic).unwrap_or_else(|error| {
         panic!(
@@ -3587,6 +4293,10 @@ fn is_native_executable(path: &Path) -> bool {
     let Ok(mut file) = fs::File::open(path) else {
         return false;
     };
+    if cfg!(windows) {
+        return read_pe_header(&mut file)
+            .is_ok_and(|header| deltafin_sys::pe::is_native_executable(&header));
+    }
     let mut magic = [0_u8; 4];
     if file.read_exact(&mut magic).is_err() {
         return false;
@@ -3622,6 +4332,15 @@ fn c_string_literal_bytes(bytes: &[u8]) -> String {
     escaped
 }
 
+fn apply_tool_environment(
+    command: &mut Command,
+    environment: &[(std::ffi::OsString, std::ffi::OsString)],
+) {
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+}
+
 fn sanitize_native_environment(command: &mut Command) {
     for variable in [
         "PYTHONHOME",
@@ -3653,6 +4372,11 @@ fn sanitize_native_environment(command: &mut Command) {
     ] {
         command.env_remove(variable);
     }
+    // Microsoft's tools read extra options from these; the audited command
+    // line is the only source of options.
+    for variable in msvc::INJECTION_VARIABLES {
+        command.env_remove(variable);
+    }
 }
 
 fn run_guarded_raw_output(command: &mut Command, operation: &str, guard: &PythonGuard) -> Output {
@@ -3679,17 +4403,84 @@ fn run_guarded_output(command: &mut Command, operation: &str, guard: &PythonGuar
 }
 
 fn run_guarded_checked(command: &mut Command, operation: &str, guard: &PythonGuard) {
-    let output = run_guarded_output(command, operation, guard);
-    if !output.stdout.is_empty() {
-        println!("cargo:warning={operation}: {}", one_line(&output.stdout));
+    run_guarded_try(command, operation, guard).unwrap_or_else(|message| panic!("{message}"));
+}
+
+/// Like `run_guarded_checked`, but a failing command is a value rather than a
+/// panic, so a caller compiling many translation units can report every
+/// failure from one run instead of the first.
+fn run_guarded_try(
+    command: &mut Command,
+    operation: &str,
+    guard: &PythonGuard,
+) -> Result<(), String> {
+    let rendered = format!("{command:?}");
+    let output = run_guarded_raw_output(command, operation, guard);
+    if !output.status.success() {
+        return Err(format!(
+            "failed to {operation} with {rendered}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let stdout = without_compiler_echo(&output.stdout);
+    if !stdout.is_empty() {
+        println!("cargo:warning={operation}: {}", one_line(&stdout));
     }
     if !output.stderr.is_empty() {
         println!("cargo:warning={operation}: {}", one_line(&output.stderr));
     }
+    Ok(())
+}
+
+/// `cl.exe` prints the name of every source file it compiles, banner or no
+/// banner. That is not a diagnostic, and as a Cargo warning it would make every
+/// translation unit of every Windows build look like a problem.
+fn without_compiler_echo(stdout: &[u8]) -> Vec<u8> {
+    if target_os() != "windows" {
+        return stdout.to_vec();
+    }
+    let mut kept = Vec::with_capacity(stdout.len());
+    for line in String::from_utf8_lossy(stdout).lines() {
+        let name = line.trim();
+        let is_echo = !name.is_empty()
+            && !name.contains([' ', '(', ':'])
+            && [".c", ".cpp", ".cc", ".cxx"]
+                .iter()
+                .any(|extension| name.to_ascii_lowercase().ends_with(extension));
+        if !is_echo {
+            kept.extend_from_slice(line.as_bytes());
+            kept.push(b'\n');
+        }
+    }
+    kept
 }
 
 fn required_env(name: &str) -> String {
     env::var(name).unwrap_or_else(|_| panic!("Cargo did not set {name}"))
+}
+
+/// An object file's name on this target: `.obj` for MSVC, `.o` elsewhere.
+fn object_file_name(stem: &str) -> String {
+    if target_os() == "windows" {
+        format!("{stem}.obj")
+    } else {
+        format!("{stem}.o")
+    }
+}
+
+/// The provider archive's name: what rustc's `static=deltafin_provider_abi`
+/// resolves to on this target.
+fn provider_archive_name() -> String {
+    if target_os() == "windows" {
+        msvc::static_library_name("deltafin_provider_abi")
+    } else {
+        "libdeltafin_provider_abi.a".to_owned()
+    }
+}
+
+fn native_test_executable_name(test: &str) -> String {
+    format!("deltafin-native-test-{test}{}", env::consts::EXE_SUFFIX)
 }
 
 fn target_os() -> String {
@@ -3788,7 +4579,7 @@ fn emit_upgrade_build_profile(
     println!(
         "cargo:rustc-env=DELTAFIN_BUILD_TORCH_ROOT={}",
         if explicit_torch_root {
-            encode_profile_bytes(torch_root.as_os_str().as_bytes())
+            encode_profile_bytes(torch_root.as_os_str().as_encoded_bytes())
         } else {
             "-".to_owned()
         }
@@ -3821,17 +4612,17 @@ fn emit_upgrade_build_profile(
                 Some(encode_profile_bytes(architectures.as_bytes()))
             }
             ("CUDACXX" | "CMAKE_CUDA_COMPILER", Some((_, compiler))) => {
-                Some(encode_profile_bytes(compiler.as_os_str().as_bytes()))
+                Some(encode_profile_bytes(compiler.as_os_str().as_encoded_bytes()))
             }
             ("CUDAToolkit_ROOT" | "CUDA_HOME" | "CUDA_PATH", _) if cuda_provider_enabled => {
                 env::var_os(variable).map(|value| {
-                    let canonical = fs::canonicalize(&value).unwrap_or_else(|error| {
+                    let canonical = deltafin_sys::fs::canonicalize(&value).unwrap_or_else(|error| {
                         panic!(
                             "resolve CUDA build-profile path {variable}={}: {error}",
                             PathBuf::from(&value).display()
                         )
                     });
-                    encode_profile_bytes(canonical.as_os_str().as_bytes())
+                    encode_profile_bytes(canonical.as_os_str().as_encoded_bytes())
                 })
             }
             _ => None,
@@ -3869,6 +4660,7 @@ fn bootstrap_target() -> PlatformTarget {
         ("macos", "aarch64") => PlatformTarget::MacosArm64,
         ("linux", "x86_64") => PlatformTarget::LinuxX86_64,
         ("linux", "aarch64") => PlatformTarget::LinuxAarch64,
+        ("windows", "x86_64") => PlatformTarget::WindowsX86_64,
         (os, arch) => panic!(
             "native Deltafin has no pinned PyTorch {0} toolchain for {os}/{arch}",
             "2.13.0"
@@ -3886,7 +4678,7 @@ fn register_toolchain_inputs(paths: &[PathBuf], emit_cargo_metadata: bool) {
 }
 
 fn validate_explicit_torch_root(variable: &str, path: &Path, emit_cargo_metadata: bool) -> PathBuf {
-    let path = fs::canonicalize(path)
+    let path = deltafin_sys::fs::canonicalize(path)
         .unwrap_or_else(|error| panic!("resolve explicit {variable}={}: {error}", path.display()));
     if !is_torch_root(&path) {
         panic!(
@@ -3894,34 +4686,18 @@ fn validate_explicit_torch_root(variable: &str, path: &Path, emit_cargo_metadata
             path.display()
         );
     }
-    for required in [
+    let mut required_files = vec![
         path.join(TORCH_CPP_API_HEADER),
         path.join(TORCH_VERSION_HEADER),
-        path.join(format!(
-            "lib/libtorch.{}",
-            if target_os() == "macos" {
-                "dylib"
-            } else {
-                "so"
-            }
-        )),
-        path.join(format!(
-            "lib/libtorch_cpu.{}",
-            if target_os() == "macos" {
-                "dylib"
-            } else {
-                "so"
-            }
-        )),
-        path.join(format!(
-            "lib/libc10.{}",
-            if target_os() == "macos" {
-                "dylib"
-            } else {
-                "so"
-            }
-        )),
-    ] {
+    ];
+    for component in ["torch", "torch_cpu", "c10"] {
+        required_files.push(path.join("lib").join(shared_library_name(component)));
+        if target_os() == "windows" {
+            // A DLL alone cannot be linked against.
+            required_files.push(path.join("lib").join(format!("{component}.lib")));
+        }
+    }
+    for required in required_files {
         let metadata = fs::symlink_metadata(&required).unwrap_or_else(|error| {
             panic!(
                 "inspect explicit native PyTorch file {}: {error}",
@@ -3988,11 +4764,34 @@ fn is_torch_root(path: &Path) -> bool {
         && path.join(TORCH_VERSION_HEADER).is_file()
 }
 
+/// The file a linker names for LibTorch component `name` in `directory`: the
+/// shared object on Unix, the import library on Windows (the DLL itself is
+/// what the loader needs at run time, and is checked beside it).
 fn library_file(directory: &Path, name: &str) -> Option<PathBuf> {
-    let target_os = target_os();
-    let suffix = if target_os == "macos" { "dylib" } else { "so" };
-    let candidate = directory.join(format!("lib{name}.{suffix}"));
+    let candidate = match target_os().as_str() {
+        "macos" => directory.join(format!("lib{name}.dylib")),
+        "windows" => {
+            let import_library = directory.join(format!("{name}.lib"));
+            if import_library.is_file() && !directory.join(format!("{name}.dll")).is_file() {
+                panic!(
+                    "LibTorch import library {} has no DLL beside it",
+                    import_library.display()
+                );
+            }
+            import_library
+        }
+        _ => directory.join(format!("lib{name}.so")),
+    };
     candidate.is_file().then_some(candidate)
+}
+
+/// The shared library's own file name for `name` on this target.
+fn shared_library_name(name: &str) -> String {
+    match target_os().as_str() {
+        "macos" => format!("lib{name}.dylib"),
+        "windows" => format!("{name}.dll"),
+        _ => format!("lib{name}.so"),
+    }
 }
 
 /// Which GPU runtime backs a LibTorch tree's `torch_cuda`/`c10_cuda` pair.
@@ -4120,7 +4919,8 @@ fn file_contains(path: &Path, needle: &[u8]) -> bool {
 fn link_required(directory: &Path, name: &str) {
     if library_file(directory, name).is_none() {
         panic!(
-            "required native provider library lib{name} is absent from {}",
+            "required native provider library {} is absent from {}",
+            shared_library_name(name),
             directory.display()
         );
     }
@@ -4165,7 +4965,9 @@ fn one_line(bytes: &[u8]) -> String {
         .join(" | ")
 }
 
-#[cfg(test)]
+// These fixtures are fake ELF binaries and `#!/bin/sh` scripts; the Windows
+// toolchain code has its own tests.
+#[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4270,5 +5072,207 @@ mod tests {
             !CUDA_IEEE_MATH_FLAGS.contains(&"--use_fast_math"),
             "authoritative CUDA kernels must not enable fast math"
         );
+    }
+}
+
+/// Tests of the Windows deployment and PE-audit logic. They exercise plain
+/// file-system and byte-parsing code, so they run on every host.
+#[cfg(test)]
+mod windows_graph_tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(label: &str) -> Self {
+            let root = env::temp_dir().join(format!(
+                "deltafin-native-build-{label}-{}-{}",
+                std::process::id(),
+                SERIAL.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&root).unwrap();
+            Self(deltafin_sys::fs::canonicalize(root).unwrap())
+        }
+
+        fn write(&self, relative: &str, bytes: &[u8]) -> PathBuf {
+            let path = self.0.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, bytes).unwrap();
+            path
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `<root>/target/release/build/<package>-<hash>/out`, as Cargo lays it out.
+    fn out_dir(scratch: &Scratch) -> PathBuf {
+        let out = scratch.0.join("target/release/build/deltafin-0123456789abcdef/out");
+        fs::create_dir_all(&out).unwrap();
+        out
+    }
+
+    #[test]
+    fn one_library_is_deployed_and_an_identical_one_is_left_alone() {
+        let scratch = Scratch::new("deploy-one");
+        let source = scratch.write("torch/lib/c10.dll", b"library bytes");
+        let destination = scratch.0.join("bin/c10.dll");
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+
+        deploy_one_library(&source, &destination);
+        assert_eq!(fs::read(&destination).unwrap(), b"library bytes");
+
+        // Identical content: no replacement, so a running process that has the
+        // file mapped does not make a no-op deployment fail.
+        let before = fs::metadata(&destination).unwrap().modified().unwrap();
+        deploy_one_library(&source, &destination);
+        assert_eq!(fs::metadata(&destination).unwrap().modified().unwrap(), before);
+    }
+
+    #[test]
+    fn a_changed_library_replaces_its_deployed_copy() {
+        let scratch = Scratch::new("deploy-change");
+        let source = scratch.write("torch/lib/torch_cpu.dll", b"version one");
+        let destination = scratch.0.join("bin/torch_cpu.dll");
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        deploy_one_library(&source, &destination);
+
+        // A new toolchain installs a new file (never an edit in place).
+        fs::remove_file(&source).unwrap();
+        fs::write(&source, b"version two!").unwrap();
+        deploy_one_library(&source, &destination);
+
+        assert_eq!(fs::read(&destination).unwrap(), b"version two!");
+    }
+
+    #[test]
+    fn a_deployed_name_that_is_not_a_plain_file_is_refused() {
+        let scratch = Scratch::new("deploy-refuse");
+        let source = scratch.write("torch/lib/c10.dll", b"library bytes");
+        let directory = scratch.0.join("bin/c10.dll");
+        fs::create_dir_all(&directory).unwrap();
+        let outcome = std::panic::catch_unwind(|| deploy_one_library(&source, &directory));
+        assert!(outcome.is_err(), "a directory was replaced by a library");
+        assert!(directory.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_source_or_destination_is_refused() {
+        let scratch = Scratch::new("deploy-symlink");
+        let real = scratch.write("elsewhere/real.dll", b"payload");
+        let link = scratch.0.join("torch/lib/c10.dll");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        deltafin_sys::fs::symlink(&real, &link).unwrap();
+        let destination = scratch.0.join("bin/c10.dll");
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        assert!(std::panic::catch_unwind(|| deploy_one_library(&link, &destination)).is_err());
+        assert!(!destination.exists());
+
+        let source = scratch.write("torch/lib/torch.dll", b"payload");
+        let planted = scratch.0.join("bin/torch.dll");
+        deltafin_sys::fs::symlink(&real, &planted).unwrap();
+        assert!(std::panic::catch_unwind(|| deploy_one_library(&source, &planted)).is_err());
+    }
+
+    #[test]
+    fn deployment_reaches_the_profile_directory_and_deps_and_only_takes_dlls() {
+        let scratch = Scratch::new("deploy-all");
+        let torch_lib = scratch.0.join("torch/lib");
+        for name in ["c10.dll", "torch.dll", "torch_cpu.dll", "libiomp5md.dll"] {
+            scratch.write(&format!("torch/lib/{name}"), name.as_bytes());
+        }
+        for name in ["c10.lib", "torch.lib", "readme.txt"] {
+            scratch.write(&format!("torch/lib/{name}"), b"not a runtime library");
+        }
+        let out = out_dir(&scratch);
+
+        deploy_runtime_libraries(&torch_lib, &out);
+
+        let profile = scratch.0.join("target/release");
+        for directory in [profile.clone(), profile.join("deps")] {
+            for name in ["c10.dll", "torch.dll", "torch_cpu.dll", "libiomp5md.dll"] {
+                assert_eq!(
+                    fs::read(directory.join(name)).unwrap(),
+                    name.as_bytes(),
+                    "{name} in {}",
+                    directory.display()
+                );
+            }
+            for name in ["c10.lib", "torch.lib", "readme.txt"] {
+                assert!(!directory.join(name).exists(), "{name} was deployed");
+            }
+        }
+    }
+
+    #[test]
+    fn deployment_refuses_an_unexpected_cargo_layout_and_python_libraries() {
+        let scratch = Scratch::new("deploy-layout");
+        let torch_lib = scratch.0.join("torch/lib");
+        scratch.write("torch/lib/c10.dll", b"c10");
+        // Not <profile>/build/<package>/out.
+        let odd = scratch.0.join("somewhere/else/out");
+        fs::create_dir_all(&odd).unwrap();
+        assert!(std::panic::catch_unwind(|| deploy_runtime_libraries(&torch_lib, &odd)).is_err());
+
+        // A Python binding library is refused by name, wherever it came from.
+        scratch.write("torch/lib/torch_python.dll", b"never");
+        let out = out_dir(&scratch);
+        assert!(std::panic::catch_unwind(|| deploy_runtime_libraries(&torch_lib, &out)).is_err());
+    }
+
+    #[test]
+    fn the_compilers_filename_echo_is_not_a_warning_but_diagnostics_are() {
+        let echoed = b"provider_abi.cpp\r\n";
+        let diagnostic = b"provider_abi.cpp\r\nD:\\src\\a.cpp(12): warning C4100: unused\r\n";
+        if target_os() == "windows" {
+            assert!(without_compiler_echo(echoed).is_empty());
+            let kept = String::from_utf8(without_compiler_echo(diagnostic)).unwrap();
+            assert!(kept.contains("warning C4100") && !kept.starts_with("provider_abi.cpp"));
+        } else {
+            // Other compilers print nothing of the kind; nothing is dropped.
+            assert_eq!(without_compiler_echo(echoed), echoed);
+        }
+    }
+
+    #[test]
+    fn the_pe_audit_resolves_system_dlls_and_names_what_it_cannot() {
+        use deltafin_sys::pe::testing::SyntheticImage;
+
+        let scratch = Scratch::new("pe-audit");
+        let torch_lib = scratch.0.join("torch/lib");
+        scratch.write(
+            "torch/lib/c10.dll",
+            &SyntheticImage::dll().importing(&["api-ms-win-core-synch-l1-2-0.dll"]).build(),
+        );
+        let test_dir = scratch.0.join("test");
+        let executable = scratch.write(
+            "test/test.exe",
+            &SyntheticImage::executable()
+                .importing(&["api-ms-win-crt-runtime-l1-1-0.dll", "c10.dll", "no-such-library.dll"])
+                .build(),
+        );
+        let _ = &test_dir;
+
+        // Without a Windows system directory (any non-Windows host) the
+        // verdict is the same as on Windows for what is not a system DLL.
+        if deltafin_sys::fs::system_directory().is_err() {
+            let error = audit_pe_dependencies(&executable, std::slice::from_ref(&torch_lib))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("locate the Windows system directory"), "{error}");
+            return;
+        }
+        let error = audit_pe_dependencies(&executable, std::slice::from_ref(&torch_lib))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no-such-library.dll"), "{error}");
     }
 }

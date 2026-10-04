@@ -18,17 +18,19 @@ use serde_json::{Map, Value};
 
 use crate::chat::{ChatOptions, encode_chat};
 use crate::config::{
-    DSparkRequest, ExpertBackendRequest, ExpertScale4Request, QwenRequest, RuntimeConfig,
-    RuntimeSurface, SpineRequest,
+    DSparkRequest, Eagle3Request, ExpertBackendRequest, ExpertScale4Request, QwenRequest,
+    RuntimeConfig, RuntimeSurface, SpineRequest,
 };
 use crate::decode::{DecodeArena, StopReason};
 use crate::draft::{DraftSource, NgramDraftSource};
 use crate::dspark_checkpoint::{DSparkCheckpoint, DSparkConfig, OFFICIAL_PARAMETER_COUNT};
+use crate::draft_backend::NativeDraftBackend;
 use crate::dspark_provider::NativeDSparkBackend;
 use crate::dspark_runtime::{
     BoundaryId, BoundaryStageToken, DSparkRuntime, DraftLease,
     RuntimeConfig as DSparkRuntimeConfig, TargetCache,
 };
+use crate::eagle3_provider::{self, Eagle3Checkpoint, NativeEagle3Backend};
 use crate::embedding::{
     BF16_BYTES, EmbeddingArena, EmbeddingSpec, EmbeddingTable, k3_embedding_path,
 };
@@ -47,6 +49,7 @@ use crate::openai::{
 use crate::output::IncrementalUtf8Decoder;
 use crate::expert_heat::{
     EXPERT_HEAT_HOST_RESERVE_BYTES, ExpertHeat, ExpertPinTier, PageAlignedSpan,
+    resolve_auto_pin_budget,
 };
 use crate::pilot_gate::{ExpertPrefetchPlan, PilotGate, PilotGateReport};
 use crate::platform::{
@@ -79,6 +82,7 @@ use crate::router_trace::{ROUTER_TRACE_HOST_RESERVE_BYTES, RouterTrace, RouterTr
 use crate::run_events::RunEventLog;
 use crate::run_interrupt::InterruptSource;
 use crate::spine_runtime::SpinePipeline;
+use crate::storage_homes::StorageHomes;
 use crate::storage::{
     BufferLengths, BufferRetireHook, CachePolicy, LOOSE_SPINE_DESCRIPTOR_RESERVE, Reader,
     prepare_persistent_descriptor_capacity,
@@ -109,6 +113,12 @@ const FULL_COMMIT_EXPERT_UNION_MAX: usize = (MAX_EXACT_DRAFTS + 1) * K3_EXPERT_T
 // synchronous kernel. `ReadPriority::Prefetch` may never consume a Reader's
 // final slot, so the extra slot preserves the Reader's demand-first invariant.
 // The complete 64-live-slot cost is charged by `native_fixed_costs` below.
+// How many freshly arrived experts an early drain waits for before handing a
+// wave to the provider. Each offer costs one provider call and one GPU
+// submission, so a per-expert offer spends more on submission than it saves in
+// overlap. Sized to the demand reader's worker count: experts land in
+// roughly that many at a time.
+const EXPERT_EARLY_DRAIN_WAVE: usize = EXPERT_READER_LIMIT;
 const EXPERT_PREFETCH_MAX_EXPERTS: usize = 2 * K3_EXPERT_TOP_K;
 const EXPERT_PREFETCH_GENERATIONS: usize = 2;
 const EXPERT_PREFETCH_LIVE_SLOTS: usize = EXPERT_PREFETCH_GENERATIONS * EXPERT_PREFETCH_MAX_EXPERTS;
@@ -119,6 +129,9 @@ const EXPERT_PREFETCH_ARENA_SLOTS: usize = EXPERT_PREFETCH_LIVE_SLOTS + 1;
 const EMBEDDING_ARENA_ROWS: usize = 64;
 const K3_KDA_CONV_ELEMENTS_PER_LAYER: u64 = 147_456;
 const K3_KDA_RECURRENT_ELEMENTS_PER_LAYER: u64 = 1_572_864;
+const K3_KDA_PROJECTION: u64 = 12_288;
+const K3_KDA_HEADS: u64 = 96;
+const K3_KDA_CONVOLUTION_WIDTH: u64 = 4;
 const K3_MLA_INITIAL_CAPACITY: u64 = 16;
 const K3_MLA_STORAGE_BUDGET_PER_LAYER_BYTES: u64 = 512 * 1024 * 1024;
 // Do not let retained spine layers consume every byte that the live cache
@@ -390,6 +403,9 @@ impl Display for SpinePlanSource {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum QwenRuntimeState {
     Off,
+    /// No request this run can serve is routed to Qwen (see
+    /// [`qwen_usable_by_run`]), so it is neither loaded nor reserved.
+    UnusedByRun,
     IneligibleDevice,
     NotInstalled,
     MemoryRejected,
@@ -402,6 +418,7 @@ impl Display for QwenRuntimeState {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Off => "off",
+            Self::UnusedByRun => "unused-by-run",
             Self::IneligibleDevice => "ineligible-device",
             Self::NotInstalled => "not-installed",
             Self::MemoryRejected => "memory-rejected",
@@ -465,7 +482,7 @@ impl CompiledSpine {
 
 type NativeQwenDraft = FailSoftQwenDraft<NativeQwen, K3Tokenizer, QwenTokenizer>;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct QwenPlan {
     state: QwenRuntimeState,
     initial: Option<QwenVariant>,
@@ -1002,6 +1019,11 @@ impl ContextGrowthBudget {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct VerifySnapshotBudget {
     pub bytes_per_kda_generation: u64,
+    /// What a multi-row verify keeps per row so a commit can replay any
+    /// accepted prefix's KDA state: the recurrence inputs, not the states.
+    pub replay_bytes_per_position: u64,
+    /// The record's fixed part: each convolution source's history window.
+    pub replay_fixed_bytes: u64,
     pub max_positions: u64,
 }
 
@@ -1024,10 +1046,22 @@ impl VerifySnapshotBudget {
             )));
         }
         let committed_provider_bytes = self.bytes_per_kda_generation;
-        let staged_boundary_provider_bytes =
-            self.bytes_per_kda_generation
+        // Every verify stages the state after all of its rows. More than one
+        // row also keeps a prefix record (provider_target_sequence.h); the
+        // replayed state of a shorter commit replaces the full one layer by
+        // layer, so no second generation is ever live.
+        let record_bytes = if positions > 1 {
+            self.replay_bytes_per_position
                 .checked_mul(positions)
-                .ok_or_else(|| DeltafinError::new("verify KDA snapshots overflow u64"))?;
+                .and_then(|bytes| bytes.checked_add(self.replay_fixed_bytes))
+                .ok_or_else(|| DeltafinError::new("verify KDA record overflows u64"))?
+        } else {
+            0
+        };
+        let staged_boundary_provider_bytes = self
+            .bytes_per_kda_generation
+            .checked_add(record_bytes)
+            .ok_or_else(|| DeltafinError::new("verify KDA snapshots overflow u64"))?;
         let transaction_peak_provider_bytes = committed_provider_bytes
             .checked_add(staged_boundary_provider_bytes)
             .ok_or_else(|| DeltafinError::new("verify transaction peak overflows u64"))?;
@@ -1063,17 +1097,24 @@ pub struct NativeTargetEngine {
     expert_backend: ResolvedExpertBackend,
     expert_cpu_threads: usize,
     ngram_drafter: NgramDraftSource,
-    dspark: DSparkRuntime<NativeDSparkBackend>,
+    /// The optional proposal slot: EAGLE-3.1 when installed, else DSpark.
+    dspark: DSparkRuntime<NativeDraftBackend>,
     qwen: QwenRuntime,
     speculative_max_drafts: usize,
     complete_expert_union: bool,
     complete_expert_union_reserved_capacity: Option<usize>,
     metal_expert_wrapper_retention: bool,
+    /// Whether a decode layer starts each missing expert's matmul as its own
+    /// bytes land instead of after the layer's whole miss set. Scheduling
+    /// only; the reduction stays in route order either way.
+    expert_early_drain: bool,
     tokenizer: Arc<K3Tokenizer>,
     output_decoder: IncrementalUtf8Decoder,
     embedding: EmbeddingTable,
     embedding_arena: EmbeddingArena,
     experts: RawExpertCorpus,
+    /// Drives holding copies of model files; shared by every model reader.
+    storage_homes: Option<Arc<StorageHomes>>,
     expert_reader: Reader,
     expert_prefetch_reader: Option<Reader>,
     pilot_gate: Option<PilotGate>,
@@ -1089,7 +1130,14 @@ pub struct NativeTargetEngine {
     context_growth: ContextGrowthBudget,
     committed_context_tokens: u64,
     mla_capacity_tokens: u64,
+    /// A bounded request's whole-context ceiling, staged at request start and
+    /// consumed by its first chunk's admission; see
+    /// [`context_pre_admission_envelope`]. Advisory: a declined envelope
+    /// falls back to ordinary incremental growth.
+    pending_context_envelope: Option<u64>,
     verify_snapshots: VerifySnapshotBudget,
+    /// Verify bytes the startup plan withheld for the slot drafter.
+    slot_verify_reserved_bytes: u64,
     metal_source_selector: Option<String>,
     /// Configured chat thinking depth; `None` defers to the template's `max`.
     reasoning_effort: Option<String>,
@@ -1197,7 +1245,7 @@ impl NativeTargetEngine {
 
         // Resolve the root once. All subordinate paths derive from this stable
         // absolute spelling instead of repeating current-directory lookups.
-        let model_root = std::fs::canonicalize(&config.model_root).map_err(|error| {
+        let model_root = crate::sys::fs::canonicalize(&config.model_root).map_err(|error| {
             DeltafinError::new(format!(
                 "resolve model root {}: {error}",
                 config.model_root.display()
@@ -1262,10 +1310,30 @@ impl NativeTargetEngine {
         let pack_directory = model_root.join(program.representation().pack_directory_name());
         let loose_spine =
             spine_source_intent(&pack_directory)? == SpinePlanSource::LooseDeferredFiles;
+        // Extra drives holding copies of the experts and/or the int8 spine.
+        // Every model reader shares one set so all storage traffic counts
+        // against the same physical devices.
+        let storage_homes = StorageHomes::open(&model_root, &config.storage_homes)?;
+        if let Some(homes) = &storage_homes {
+            for (index, drive) in homes.stats().iter().enumerate() {
+                eprintln!(
+                    "[native] storage drive {index}: {}{}",
+                    drive.root.display(),
+                    if index == 0 {
+                        " (model root)".to_string()
+                    } else {
+                        format!(" ({} copies)", drive.mirrored_files)
+                    },
+                );
+            }
+        }
+        let storage_drives = storage_homes.as_ref().map_or(1, |homes| homes.device_count());
         let request_fd_cache = resolve_loose_spine_fd_cache(
             config.spine_fd_cache,
             loose_spine,
-            automatic_streaming,
+            // A persistent descriptor pins each spine file to whichever drive
+            // opened it first; with storage homes every read chooses afresh.
+            automatic_streaming && storage_homes.is_none(),
             qualified_spine_resource_tuple(
                 cfg!(target_os = "macos"),
                 cache_host.physical_bytes,
@@ -1333,12 +1401,26 @@ impl NativeTargetEngine {
             expert_stream_cache_policy(config.expert_stream_nocache, cfg!(target_os = "macos")),
         )?;
         // Cross-run learned expert residency. The heat histogram observes the
-        // authoritative routes of every backend; an explicit byte budget
-        // freezes a candidate roster whose spans promote lazily on their
-        // first authoritative read. CUDA keeps its provider-owned device
-        // cache, so the host tier is limited to the scattered-span backends.
+        // authoritative routes of every backend; a byte budget freezes a
+        // candidate roster whose spans promote lazily on their first
+        // authoritative read. The automatic default sizes the budget to
+        // exactly the qualifying roster, capped by live free memory minus a
+        // reserved headroom — thin history or a tight host resolves to off.
+        // CUDA keeps its provider-owned device cache, so the host tier is
+        // limited to the scattered-span backends.
         let expert_heat = ExpertHeat::open(&model_root, config.expert_heat);
-        let expert_pin_tier = (config.expert_pin_bytes > 0
+        let expert_pin_budget_bytes = match config.expert_pin_bytes {
+            Some(bytes) => bytes,
+            None => resolve_auto_pin_budget(
+                expert_heat.snapshot(),
+                experts.layout().expert_span_bytes(),
+                probe_host_memory().available_bytes,
+            ),
+        };
+        // The tier is sized and charged only after residency and the Qwen
+        // drafter are chosen (see the admission below), so a pin budget can
+        // never silently push out a drafter or a spine that fits completely.
+        let requested_pin_tier = (expert_pin_budget_bytes > 0
             && matches!(
                 expert_backend,
                 ResolvedExpertBackend::Cpu | ResolvedExpertBackend::Metal
@@ -1347,22 +1429,24 @@ impl NativeTargetEngine {
             ExpertPinTier::plan(
                 expert_heat.snapshot(),
                 experts.layout().expert_span_bytes(),
-                config.expert_pin_bytes,
+                expert_pin_budget_bytes,
             )
         })
         .flatten();
-        let expert_reader_workers = configured_expert_reader_workers(config.expert_read_threads);
+        let expert_reader_workers =
+            configured_expert_reader_workers(config.expert_read_threads, storage_drives);
         let metal_expert_retire_hook: Option<BufferRetireHook> =
             (expert_backend == ResolvedExpertBackend::Metal).then(|| {
                 let session = provider.lease();
                 Arc::new(move || session.flush_metal_expert_cache()) as BufferRetireHook
             });
         let metal_expert_wrapper_retention = metal_expert_retire_hook.is_some();
-        let expert_reader = Reader::with_arena_capacity_and_retire_hook(
+        let mut expert_reader = Reader::with_arena_capacity_and_retire_hook(
             expert_reader_workers,
             EXPERT_ARENA_SLOTS,
             metal_expert_retire_hook.clone(),
         )?;
+        expert_reader.set_storage_homes(storage_homes.clone());
         // The nine-row verifier's compact expert slab is a startup resource,
         // not a decode-time arena growth. Reserve it while the demand Reader
         // is still empty: no Metal wrapper can alias the slot, so admission
@@ -1393,6 +1477,10 @@ impl NativeTargetEngine {
                     EXPERT_PREFETCH_ARENA_SLOTS,
                     metal_expert_retire_hook.clone(),
                 )
+                .map(|mut reader| {
+                    reader.set_storage_homes(storage_homes.clone());
+                    reader
+                })
             })
             .transpose()?;
         // The gate governs only speculative reads, so it exists exactly when
@@ -1427,7 +1515,21 @@ impl NativeTargetEngine {
         // current layer into one serially reused FP32 matrix arena. Automatic
         // server reuse retains one complete KDA parent, and optional DSpark /
         // PILOT storage is likewise fixed before any retained layer is chosen.
-        let dspark_reserve = dspark_provider_reserve(config, &model_root, device)?;
+        let eagle3_context = eagle3_context(context_growth);
+        let slot_model_reserve =
+            draft_slot_provider_reserve(config, &model_root, device, eagle3_context)?;
+        // A slot drafter verifies through ordinary prefix commits. Withhold
+        // the widest verify's prefix record now, as Qwen withholds its
+        // verifier: a plan that spends every spare byte on pins and spine
+        // otherwise refuses even that ~200 MiB at run time.
+        let slot_verify_reserved_bytes = if slot_model_reserve == 0 {
+            0
+        } else {
+            slot_verify_reserve(verify_snapshots, speculative_max_drafts)?
+        };
+        let dspark_reserve = slot_model_reserve
+            .checked_add(slot_verify_reserved_bytes)
+            .ok_or_else(|| DeltafinError::new("draft slot reserve overflows u64"))?;
         let fixed_provider_addition = execution_arena_reserve
             .checked_add(verify_snapshots.bytes_per_kda_generation)
             .and_then(|bytes| bytes.checked_add(dspark_reserve))
@@ -1444,25 +1546,14 @@ impl NativeTargetEngine {
         } else {
             0
         };
-        // The pin tier fills lazily, but its exact ceiling is reserved up
-        // front so residency selection can never double-book those bytes
-        // against the resident spine prefix. A cold histogram charges only
-        // the recorder arrays.
         let fixed_host_addition = fixed_host_addition
-            .checked_add(
-                expert_pin_tier
-                    .as_ref()
-                    .map_or(0, ExpertPinTier::charged_host_bytes),
-            )
-            .and_then(|bytes| {
-                bytes.checked_add(if expert_heat.recording() {
-                    EXPERT_HEAT_HOST_RESERVE_BYTES
-                } else {
-                    0
-                })
+            .checked_add(if expert_heat.recording() {
+                EXPERT_HEAT_HOST_RESERVE_BYTES
+            } else {
+                0
             })
             .ok_or_else(|| {
-                DeltafinError::new("expert-pin host reserve overflows fixed host costs")
+                DeltafinError::new("expert-heat host reserve overflows fixed host costs")
             })?;
         let fixed = fixed_costs(
             &program,
@@ -1512,55 +1603,98 @@ impl NativeTargetEngine {
             None => fixed,
         };
         let qwen_context_capacity = qwen_context_capacity(context_growth)?;
-        let discovered_qwen = discover_qwen_plan(
-            config.qwen,
-            &model_root,
-            device,
-            qwen_context_capacity,
-            verify_snapshots,
-            speculative_max_drafts,
-        );
+        let discovered_qwen = if qwen_usable_by_run(config) {
+            discover_qwen_plan(
+                config.qwen,
+                &model_root,
+                device,
+                qwen_context_capacity,
+                verify_snapshots,
+                speculative_max_drafts,
+            )
+        } else {
+            QwenPlan::inactive(QwenRuntimeState::UnusedByRun)
+        };
         let residency_override = ResidencyOverride {
             requested_layers: config.provider_resident_layers,
             requested_provider_bytes: None,
         };
-        let (baseline_residency, baseline_transient) = select_residency_with_transient(
+        let plan_selector = PlanSelector {
             host_memory,
             provider_memory,
-            &provider_layer_bytes,
-            fixed,
+            provider_layer_bytes: &provider_layer_bytes,
             residency_override,
-        )?;
-        let admit_qwen = |plan: QwenPlan| {
-            let qwen_fixed = qwen_fixed_costs(fixed, plan)?;
-            let (residency, transient_layer_bytes) = select_residency_with_transient(
-                host_memory,
-                provider_memory,
-                &provider_layer_bytes,
-                qwen_fixed,
-                residency_override,
-            )
-            .ok()?;
-            qwen_residency_admitted(&residency).then_some((plan, residency, transient_layer_bytes))
+            discovered_qwen,
+            device,
         };
-        let (qwen_plan, residency, transient_layer_bytes) =
-            if discovered_qwen.reserved_provider_bytes != 0 {
-                if let Some(admitted) = admit_qwen(discovered_qwen) {
-                    admitted
-                } else if let Some(admitted) =
-                    qwen_probe_only_fallback(discovered_qwen, device).and_then(admit_qwen)
-                {
-                    admitted
-                } else {
-                    (
-                        QwenPlan::inactive(QwenRuntimeState::MemoryRejected),
-                        baseline_residency,
-                        baseline_transient,
-                    )
+        let select_plan = |fixed: FixedCosts| plan_selector.select(fixed);
+        let (qwen_plan, residency, transient_layer_bytes) = select_plan(fixed)?;
+        // Learned-pin admission, by measured marginal value:
+        // - the Qwen drafter outranks pins (up to 2x on draftable text versus
+        //   +15-19% for pins, which are near-neutral once drafting runs);
+        // - a spine that fits completely outranks pins: streaming it back in
+        //   costs every pass (-23% on a 128 GB host when pins displaced 60
+        //   layers), and so does a prefix the operator explicitly requested;
+        // - pins outrank a spine that only fits partly (64 GB M1 Max: +15-19%
+        //   for a ~1.9 GB roster against +0.23% for 1.7 GB more spine).
+        // The tier gets the largest whole-expert roster whose charge keeps
+        // the protected parts of the pin-free plan intact.
+        let (expert_pin_tier, qwen_plan, residency, transient_layer_bytes) = match requested_pin_tier {
+            None => (None, qwen_plan, residency, transient_layer_bytes),
+            Some(requested) => {
+                let span_bytes = experts.layout().expert_span_bytes() as u64;
+                let keep_spine = pin_tier_keeps_resident_prefix(residency.stop);
+                let admitted = admit_pin_count(
+                    requested.candidate_count(),
+                    span_bytes,
+                    fixed,
+                    &select_plan,
+                    qwen_plan,
+                    &residency,
+                    keep_spine,
+                );
+                if admitted < requested.candidate_count() {
+                    let protected = match (keep_spine, qwen_plan.initial.is_some()) {
+                        (true, true) => "the resident spine prefix and the Qwen plan keep priority",
+                        (true, false) => "the resident spine prefix keeps priority",
+                        (false, true) => "the Qwen plan keeps priority",
+                        (false, false) => "the live memory proof still holds",
+                    };
+                    eprintln!(
+                        "[native] expert pin tier: memory admission kept {} of {} candidate experts ({:.2} of {:.2} GiB) so that {protected}",
+                        admitted,
+                        requested.candidate_count(),
+                        (admitted as u64 * span_bytes) as f64 / f64::from(1_u32 << 30),
+                        requested.charged_host_bytes() as f64 / f64::from(1_u32 << 30),
+                    );
                 }
-            } else {
-                (discovered_qwen, baseline_residency, baseline_transient)
-            };
+                let tier = (admitted != 0)
+                    .then(|| {
+                        ExpertPinTier::plan(
+                            expert_heat.snapshot(),
+                            span_bytes as usize,
+                            admitted as u64 * span_bytes,
+                        )
+                    })
+                    .flatten();
+                match tier {
+                    Some(tier) => {
+                        let host_bytes = fixed
+                            .host_bytes
+                            .checked_add(tier.charged_host_bytes())
+                            .ok_or_else(|| {
+                                DeltafinError::new("expert-pin host reserve overflows fixed host costs")
+                            })?;
+                        let (qwen_plan, residency, transient_layer_bytes) = select_plan(FixedCosts {
+                            host_bytes,
+                            provider_bytes: fixed.provider_bytes,
+                        })?;
+                        (Some(tier), qwen_plan, residency, transient_layer_bytes)
+                    }
+                    None => (None, qwen_plan, residency, transient_layer_bytes),
+                }
+            }
+        };
         let spine_reader_workers = configured_spine_reader_workers(
             config.spine_read_threads,
             // The measured six-reader tuple belongs to automatic streaming.
@@ -1571,13 +1705,21 @@ impl NativeTargetEngine {
             provider_memory_snapshot,
             max_buffer_length,
         );
-        let spine_pipeline = SpinePipeline::with_resident_prefix(
+        // Each extra drive needs its own queue depth to stream its share.
+        let spine_reader_workers = if config.spine_read_threads.is_none() && storage_drives > 1 {
+            (spine_reader_workers + 2 * (storage_drives - 1))
+                .min(crate::config::MAX_SPINE_READ_THREADS)
+        } else {
+            spine_reader_workers
+        };
+        let mut spine_pipeline = SpinePipeline::with_resident_prefix(
             spine_reader_workers,
             SPINE_ARENA_SLOTS,
             u32::try_from(residency.resident_layers).map_err(|_| {
                 DeltafinError::new("resident layer prefix does not fit the spine ABI")
             })?,
         )?;
+        spine_pipeline.set_storage_homes(storage_homes.clone());
 
         // Freeze the session's expert-cache budget before anything can run a
         // target sequence or availability probe (both freeze the policy). An
@@ -1613,7 +1755,8 @@ impl NativeTargetEngine {
         // provider storage, while this short-lived reader never overlaps the
         // persistent layer/expert arena high-water phase.
         bind_target_globals_once(&provider, &global_plans)?;
-        let dspark = build_native_dspark(config, &provider, &model_root, device)?;
+        let dspark =
+            build_native_draft_slot(config, &provider, &model_root, device, eagle3_context)?;
         let qwen =
             QwenRuntime::from_plan(qwen_plan, &provider, &model_root, Arc::clone(&tokenizer));
         let target_reuse_identity = TargetReuseIdentity {
@@ -1649,6 +1792,7 @@ impl NativeTargetEngine {
             complete_expert_union,
             complete_expert_union_reserved_capacity,
             metal_expert_wrapper_retention,
+            expert_early_drain: config.expert_early_drain,
             tokenizer,
             output_decoder,
             embedding,
@@ -1656,6 +1800,7 @@ impl NativeTargetEngine {
             experts,
             expert_reader,
             expert_prefetch_reader,
+            storage_homes,
             pilot_gate,
             expert_heat,
             expert_pin_tier,
@@ -1669,7 +1814,9 @@ impl NativeTargetEngine {
             context_growth,
             committed_context_tokens: 0,
             mla_capacity_tokens: 0,
+            pending_context_envelope: None,
             verify_snapshots,
+            slot_verify_reserved_bytes,
             metal_source_selector,
             reasoning_effort: config.reasoning_effort.clone(),
             readiness,
@@ -2170,7 +2317,42 @@ impl NativeTargetEngine {
             .committed_context_tokens
             .checked_add(token_ids.len() as u64)
             .ok_or_else(|| DeltafinError::new("native committed context length overflows u64"))?;
-        let next_mla_capacity = self.admit_context_chunk(staged_session_positions)?;
+        // The first chunk of a bounded request proves the whole request's
+        // context envelope instead of just its own rows: every later growth
+        // boundary then passes on the committed-capacity fast path with no
+        // live memory proof, so pressure arriving mid-run cannot fail a
+        // request that was admissible when it began. Declining is ordinary —
+        // the impatient proof neither trims nor waits — and falls straight
+        // back to the incremental growth this call always performed.
+        let envelope = self
+            .pending_context_envelope
+            .take()
+            .filter(|&tokens| tokens > staged_session_positions);
+        let next_mla_capacity = match envelope {
+            Some(tokens) => {
+                let prior_capacity = self.mla_capacity_tokens;
+                match self.admit_context_growth(tokens, false) {
+                    Ok(capacity) => {
+                        if capacity > prior_capacity {
+                            eprintln!(
+                                "[native] pre-admitted this request's {tokens}-token context envelope (exact MLA capacity {capacity} tokens; later growth in this request needs no mid-run memory proof)"
+                            );
+                        }
+                        capacity
+                    }
+                    Err(declined) => {
+                        eprintln!(
+                            "[native] context envelope pre-admission ({tokens} tokens) declined; keeping incremental growth: {declined}"
+                        );
+                        self.admit_context_chunk(staged_session_positions)?
+                    }
+                }
+            }
+            None => self.admit_context_chunk(staged_session_positions)?,
+        };
+        let capture = capture_dspark
+            .then(|| self.dspark.backend().map(NativeDraftBackend::capture))
+            .flatten();
         let mut sequence = {
             let embedding = self
                 .embedding
@@ -2185,13 +2367,14 @@ impl NativeTargetEngine {
                     .begin_target_sequence_bf16_verify_full_commit_only(
                         embedding.bytes(),
                         token_ids.len(),
-                        capture_dspark,
+                        capture,
                     )?
-            } else if capture_dspark {
-                self.provider.begin_target_sequence_bf16_capturing_dspark(
+            } else if let Some(capture) = capture {
+                self.provider.begin_target_sequence_bf16_capturing(
                     embedding.bytes(),
                     token_ids.len(),
                     mode,
+                    capture,
                 )?
             } else {
                 self.provider.begin_target_sequence_bf16(
@@ -2228,6 +2411,7 @@ impl NativeTargetEngine {
             self.expert_cpu_threads,
             metal_source_selector,
             self.metal_expert_wrapper_retention,
+            self.expert_early_drain,
             complete_expert_union,
             collect_stats,
             verbose_layer_profile,
@@ -2255,7 +2439,8 @@ impl NativeTargetEngine {
                 ),
             ));
         }
-        let dspark_rows = capture_dspark
+        let dspark_rows = capture
+            .is_some()
             .then(|| sequence.dspark_target_rows().ok())
             .flatten();
         Ok(PreparedTargetChunk {
@@ -2317,6 +2502,15 @@ impl NativeTargetEngine {
     }
 
     fn admit_context_chunk(&self, needed_tokens: u64) -> Result<u64> {
+        self.admit_context_growth(needed_tokens, true)
+    }
+
+    /// `patient = false` performs at most two live proofs (one before and one
+    /// after shedding this process's own advisory storage) and never trims,
+    /// sleeps, or waits — for opportunistic envelope pre-admission, where a
+    /// refusal is an ordinary fallback to incremental growth rather than a
+    /// failure worth stalling a request over.
+    fn admit_context_growth(&self, needed_tokens: u64, patient: bool) -> Result<u64> {
         if needed_tokens <= self.committed_context_tokens
             || self.committed_context_tokens > self.mla_capacity_tokens
             || needed_tokens > self.context_growth.admitted_expanded_context_tokens
@@ -2337,6 +2531,41 @@ impl NativeTargetEngine {
         let Err(mut last_error) = first else {
             return Ok(admission.next_capacity_tokens);
         };
+        // Before treating this as someone else's memory pressure, shed our
+        // own advisory storage: the speculative-prefetch arena retains up to
+        // ~1.1 GiB of lazily grown slabs that exist only to accelerate
+        // optional reads, and measured admission margins here were 0-340 MiB.
+        // Every recorded admission failure was the full-speculation arm; the
+        // suppressed arm, which materializes no slabs, never failed once.
+        // The slabs re-grow lazily on the next speculative read, so exact
+        // context growth must always outrank them.
+        if let Some(reader) = self.expert_prefetch_reader.as_ref() {
+            match reader.release_cached_slabs() {
+                Ok(0) => {}
+                Ok(released) => {
+                    eprintln!(
+                        "[native] released {:.2} MiB of speculative prefetch slabs ahead of exact context growth {}->{} tokens",
+                        released as f64 / (1_u64 << 20) as f64,
+                        admission.committed_capacity_tokens,
+                        admission.next_capacity_tokens,
+                    );
+                    match admit_live_context_growth(
+                        probe_host_memory(),
+                        provider_memory(self.provider.memory_snapshot(false)?),
+                        admission,
+                    ) {
+                        Ok(()) => return Ok(admission.next_capacity_tokens),
+                        Err(still_refused) => last_error = still_refused,
+                    }
+                }
+                Err(error) => eprintln!(
+                    "[native] speculative prefetch slabs stayed resident during context growth: {error}"
+                ),
+            }
+        }
+        if !patient {
+            return Err(last_error);
+        }
         // Live pressure at a growth boundary is often another process's
         // transient spike, not this process's fault. Shed what is optional
         // (unused accelerator cache), then wait bounded intervals for the
@@ -2434,11 +2663,16 @@ impl NativeTargetEngine {
             return Ok(true);
         }
         // Subtract only verifier bytes already withheld by the selected
-        // startup plan. Full-commit Qwen returned above with a zero snapshot
-        // reserve; ordinary n-gram/DSpark verification therefore charges its
-        // complete per-boundary peak against a fresh live snapshot.
-        let unreserved_bytes =
-            verify_live_admission_bytes(admission, self.qwen.reserved_verify_bytes);
+        // startup plan: the slot drafter's prefix record, when one is
+        // loaded. Qwen and the slot never verify at once, so the larger
+        // reserve covers either. Anything beyond it (an n-gram verify with
+        // no slot drafter) is charged against a fresh live snapshot.
+        let unreserved_bytes = verify_live_admission_bytes(
+            admission,
+            self.qwen
+                .reserved_verify_bytes
+                .max(self.slot_verify_reserved_bytes),
+        );
         if unreserved_bytes == 0 {
             return Ok(true);
         }
@@ -2559,18 +2793,112 @@ fn resolve_expert_backend(
     }
 }
 
+/// Context the EAGLE-3.1 drafter tracks: K3's admitted context, bounded.
+fn eagle3_context(context_growth: ContextGrowthBudget) -> usize {
+    usize::try_from(context_growth.admitted_expanded_context_tokens)
+        .unwrap_or(usize::MAX)
+        .min(eagle3_provider::MAXIMUM_CONTEXT)
+}
+
+/// Whether this run can use the proposal slot at all: chat and server
+/// surfaces under automatic mode, any surface when it is forced on.
+fn draft_slot_wanted(config: &RuntimeConfig, device: Device) -> bool {
+    match config.dspark {
+        DSparkRequest::Off => false,
+        // Raw direct completions route automatically to Qwen, never the
+        // slot. Loading a slot drafter there consumed roughly 6.8 GiB of
+        // unified provider memory and displaced exact BF16 spine residency
+        // even though no request could create a lease. Chat and server
+        // surfaces retain the automatic path; explicit `on` remains an
+        // override for raw experimentation.
+        DSparkRequest::Auto => {
+            (config.chat || config.surface == RuntimeSurface::Server)
+                && !matches!(device, Device::Cpu)
+        }
+        DSparkRequest::On => true,
+    }
+}
+
+/// EAGLE-3.1 takes the slot whenever it is installed and not switched off.
+/// When it is selected DSpark is neither reserved nor loaded, so a broken
+/// EAGLE install leaves the slot empty rather than over its reservation.
+fn eagle3_selected(config: &RuntimeConfig, model_root: &Path, device: Device) -> bool {
+    draft_slot_wanted(config, device)
+        && match config.eagle3 {
+            Eagle3Request::Off => false,
+            Eagle3Request::Auto => model_root.join(eagle3_provider::DIRECTORY).is_dir(),
+            Eagle3Request::On => true,
+        }
+}
+
+fn eagle3_runtime_config(config: &RuntimeConfig, context: usize) -> DSparkRuntimeConfig {
+    DSparkRuntimeConfig {
+        vocab_size: 163_840,
+        // Measured on real K3 states: 3.26 tokens per pass at three drafts,
+        // 4.17 at five and 4.77 at seven, first draft right 89% of the time.
+        probe_drafts: 3,
+        max_drafts: eagle3_provider::MAXIMUM_DRAFTS,
+        max_context_tokens: Some(context),
+        min_auto_speedup: config.dspark_min_auto_speedup,
+        disable_on_miss: false,
+        economic_grace_steps: 4,
+        loss_streak_limit: 4,
+    }
+}
+
+fn build_native_draft_slot(
+    config: &RuntimeConfig,
+    provider: &NativeProviderSession,
+    model_root: &Path,
+    device: Device,
+    eagle3_context: usize,
+) -> Result<DSparkRuntime<NativeDraftBackend>> {
+    if eagle3_selected(config, model_root, device) {
+        let started = Instant::now();
+        let loaded = (|| -> Result<NativeEagle3Backend> {
+            let checkpoint =
+                Eagle3Checkpoint::open(&model_root.join(eagle3_provider::DIRECTORY))?;
+            NativeEagle3Backend::bind(provider, &checkpoint, model_root, device, eagle3_context)
+        })();
+        let backend = match (config.eagle3, loaded) {
+            (_, Ok(backend)) => {
+                eprintln!(
+                    "[native] EAGLE-3.1 drafter loaded in {:.1}s ({eagle3_context}-token context)",
+                    started.elapsed().as_secs_f64()
+                );
+                Some(NativeDraftBackend::Eagle3(backend))
+            }
+            (Eagle3Request::On, Err(error)) => return Err(error),
+            (_, Err(error)) => {
+                eprintln!(
+                    "[native] optional EAGLE-3.1 drafter unavailable, drafting without it (K3_EAGLE3=off selects DSpark): {error}"
+                );
+                None
+            }
+        };
+        return DSparkRuntime::new(
+            config.dspark.runtime_mode(),
+            backend,
+            eagle3_runtime_config(config, eagle3_context),
+        )
+        .map_err(|error| DeltafinError::new(format!("configure native EAGLE-3 runtime: {error}")));
+    }
+    build_native_dspark(config, provider, model_root, device)
+}
+
 fn build_native_dspark(
     config: &RuntimeConfig,
     provider: &NativeProviderSession,
     model_root: &Path,
     device: Device,
-) -> Result<DSparkRuntime<NativeDSparkBackend>> {
+) -> Result<DSparkRuntime<NativeDraftBackend>> {
     let runtime_config = DSparkRuntimeConfig {
         vocab_size: 163_840,
         probe_drafts: 2,
         max_drafts: 7,
         max_context_tokens: config.dspark_max_context,
         min_auto_speedup: config.dspark_min_auto_speedup,
+        ..DSparkRuntimeConfig::default()
     };
     let directory = model_root.join("k3-draft-dspark");
     let eligible = dspark_eligible(config, &directory, device);
@@ -2586,7 +2914,7 @@ fn build_native_dspark(
             NativeDSparkBackend::bind(provider, &checkpoint, model_root, device)
         })();
         match (config.dspark, loaded) {
-            (_, Ok(backend)) => Some(backend),
+            (_, Ok(backend)) => Some(NativeDraftBackend::DSpark(backend)),
             (DSparkRequest::On, Err(error)) => return Err(error),
             (DSparkRequest::Auto, Err(error)) => {
                 eprintln!("[native] optional DSpark unavailable: {error}");
@@ -2602,21 +2930,21 @@ fn build_native_dspark(
 }
 
 fn dspark_eligible(config: &RuntimeConfig, directory: &Path, device: Device) -> bool {
-    match config.dspark {
-        DSparkRequest::Off => false,
-        DSparkRequest::Auto => {
-            // Raw direct completions route automatically to Qwen, never
-            // DSpark. Loading DSpark there consumed roughly 6.8 GiB of unified
-            // provider memory and displaced exact BF16 spine residency even
-            // though no request could create a DSpark lease. Chat and server
-            // surfaces retain the existing automatic path; explicit `on`
-            // remains an override for raw experimentation.
-            (config.chat || config.surface == RuntimeSurface::Server)
-                && !matches!(device, Device::Cpu)
-                && directory.is_dir()
-        }
-        DSparkRequest::On => true,
+    draft_slot_wanted(config, device)
+        && (config.dspark == DSparkRequest::On || directory.is_dir())
+}
+
+/// Provider memory the proposal slot holds for whichever model it loads.
+fn draft_slot_provider_reserve(
+    config: &RuntimeConfig,
+    model_root: &Path,
+    device: Device,
+    eagle3_context: usize,
+) -> Result<u64> {
+    if eagle3_selected(config, model_root, device) {
+        return eagle3_provider::provider_reserve(eagle3_context);
     }
+    dspark_provider_reserve(config, model_root, device)
 }
 
 fn dspark_provider_reserve(
@@ -2784,6 +3112,21 @@ fn qwen_verify_reserve(
     Ok((positions, 0))
 }
 
+/// Prefix-record bytes the widest ordinary slot verify (all configured
+/// drafts plus the pending row) needs beyond the decode reserve.
+fn slot_verify_reserve(
+    verify_snapshots: VerifySnapshotBudget,
+    speculative_max_drafts: usize,
+) -> Result<u64> {
+    let positions = u64::try_from(speculative_max_drafts)
+        .ok()
+        .and_then(|drafts| drafts.checked_add(1))
+        .ok_or_else(|| DeltafinError::new("slot verifier width overflows u64"))?;
+    Ok(verify_snapshots
+        .admission(positions)?
+        .additional_over_decode_reserve_bytes)
+}
+
 fn verify_live_admission_bytes(
     admission: VerifySnapshotAdmission,
     startup_reserved_bytes: u64,
@@ -2805,6 +3148,16 @@ fn qwen_fixed_costs(base: FixedCosts, plan: QwenPlan) -> Option<FixedCosts> {
 
 fn qwen_allowed_for_request(allow_dspark: bool) -> bool {
     !allow_dspark
+}
+
+/// Qwen serves raw completions only, and only while the proposal slot is not
+/// forced on (`qwen_allowed_for_request`). A direct run has one request
+/// shape, so a chat run, or any run with the slot forced on, can never route
+/// a request to Qwen; reserving it there cost 1.7 GiB of residency for
+/// nothing. A server takes both shapes over its lifetime and keeps it.
+fn qwen_usable_by_run(config: &RuntimeConfig) -> bool {
+    config.dspark != DSparkRequest::On
+        && (config.surface == RuntimeSurface::Server || !config.chat)
 }
 
 fn qwen_provider_reserve(
@@ -2857,6 +3210,155 @@ fn qwen_provider_reserve(
         .ok_or_else(|| DeltafinError::new("Qwen total provider reserve overflows u64"))
 }
 
+/// Everything the startup plan selection reads besides the fixed costs, so the
+/// engine and the tests that probe pin admission run the same chain.
+struct PlanSelector<'a> {
+    host_memory: HostMemory,
+    provider_memory: ProviderMemory,
+    provider_layer_bytes: &'a [u64],
+    residency_override: ResidencyOverride,
+    discovered_qwen: QwenPlan,
+    device: Device,
+}
+
+impl PlanSelector<'_> {
+    /// One complete plan for a set of fixed costs: the resident spine prefix
+    /// plus the Qwen chain (wide, then probe-only, then rejected). The chain
+    /// is deterministic in `fixed`, which pin admission relies on when it
+    /// re-runs it with candidate pin charges.
+    fn select(&self, fixed: FixedCosts) -> Result<(QwenPlan, ResidencySelection, u64)> {
+        let (baseline_residency, baseline_transient) = select_residency_with_transient(
+            self.host_memory,
+            self.provider_memory,
+            self.provider_layer_bytes,
+            fixed,
+            self.residency_override,
+        )?;
+        let admit_qwen = |plan: QwenPlan| {
+            let qwen_fixed = qwen_fixed_costs(fixed, plan)?;
+            let (residency, transient_layer_bytes) = select_residency_with_transient(
+                self.host_memory,
+                self.provider_memory,
+                self.provider_layer_bytes,
+                qwen_fixed,
+                self.residency_override,
+            )
+            .ok()?;
+            qwen_residency_admitted(&residency).then_some((plan, residency, transient_layer_bytes))
+        };
+        let discovered_qwen = self.discovered_qwen;
+        Ok(if discovered_qwen.reserved_provider_bytes != 0 {
+            if let Some(admitted) = admit_qwen(discovered_qwen) {
+                admitted
+            } else if let Some(admitted) =
+                qwen_probe_only_fallback(discovered_qwen, self.device).and_then(admit_qwen)
+            {
+                admitted
+            } else {
+                (
+                    QwenPlan::inactive(QwenRuntimeState::MemoryRejected),
+                    baseline_residency,
+                    baseline_transient,
+                )
+            }
+        } else {
+            (discovered_qwen, baseline_residency, baseline_transient)
+        })
+    }
+}
+
+/// Whether the pin-free resident spine prefix outranks the pin tier.
+///
+/// A spine that fits completely does: streaming it back in costs every pass,
+/// while the tier's gain is bounded by what routes happen to hit it. An
+/// explicit residency request does too, because the operator asked for exactly
+/// that prefix and an automatic tier must not quietly undercut it. Only a
+/// prefix the memory budget itself cut short may give way to pins.
+fn pin_tier_keeps_resident_prefix(stop: ResidencyStop) -> bool {
+    matches!(
+        stop,
+        ResidencyStop::AllLayersFit
+            | ResidencyStop::ExplicitLayerLimit
+            | ResidencyStop::ExplicitByteLimit
+    )
+}
+
+/// Whether a pin roster of `count` whole experts keeps the protected parts of
+/// the pin-free `reference` plan: the same Qwen plan and a valid memory proof
+/// always, and the same resident spine prefix when `keep_spine`.
+fn pin_count_admitted<S>(
+    count: usize,
+    span_bytes: u64,
+    base: FixedCosts,
+    select_plan: &S,
+    reference_qwen: QwenPlan,
+    reference: &ResidencySelection,
+    keep_spine: bool,
+) -> bool
+where
+    S: Fn(FixedCosts) -> Result<(QwenPlan, ResidencySelection, u64)>,
+{
+    if count == 0 {
+        return true;
+    }
+    let Some(host_bytes) = (count as u64)
+        .checked_mul(span_bytes)
+        .and_then(|charge| base.host_bytes.checked_add(charge))
+    else {
+        return false;
+    };
+    match select_plan(FixedCosts {
+        host_bytes,
+        provider_bytes: base.provider_bytes,
+    }) {
+        Ok((qwen, residency, _)) => {
+            qwen == reference_qwen
+                && qwen_residency_admitted(&residency)
+                && (!keep_spine || residency.resident_layers == reference.resident_layers)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Largest whole-expert pin roster that [`pin_count_admitted`] accepts.
+/// Charges grow with the count and a larger fixed cost never grows residency
+/// or upgrades the Qwen chain, so the admitted counts form a prefix and binary
+/// search finds its end (a test checks that claim against the real selector).
+fn admit_pin_count<S>(
+    eligible: usize,
+    span_bytes: u64,
+    base: FixedCosts,
+    select_plan: &S,
+    reference_qwen: QwenPlan,
+    reference: &ResidencySelection,
+    keep_spine: bool,
+) -> usize
+where
+    S: Fn(FixedCosts) -> Result<(QwenPlan, ResidencySelection, u64)>,
+{
+    let admitted = |count: usize| {
+        pin_count_admitted(
+            count,
+            span_bytes,
+            base,
+            select_plan,
+            reference_qwen,
+            reference,
+            keep_spine,
+        )
+    };
+    let (mut low, mut high) = (0_usize, eligible);
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if admitted(middle) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    low
+}
+
 fn qwen_residency_admitted(selection: &ResidencySelection) -> bool {
     // Resident K3 layers are an I/O optimization, not model authority.  The
     // previous policy rejected Qwen whenever its safely reserved provider
@@ -2878,6 +3380,19 @@ fn qwen_residency_admitted(selection: &ResidencySelection) -> bool {
             | ResidencyStop::FixedCostsExceedBudget
             | ResidencyStop::ArithmeticOverflow
     )
+}
+
+impl NativeTargetEngine {
+    fn storage_bytes(&self) -> StorageBytes {
+        StorageBytes {
+            spine: self.spine_pipeline.bytes_read(),
+            expert_demand: self.expert_reader.bytes_read(),
+            expert_prefetch: self
+                .expert_prefetch_reader
+                .as_ref()
+                .map_or(0, Reader::bytes_read),
+        }
+    }
 }
 
 impl NativeTargetEngine {
@@ -2936,6 +3451,16 @@ impl NativeTargetEngine {
                 .transpose()?;
             let eos_token = u32::try_from(self.model.eos_token_id)
                 .map_err(|_| DeltafinError::new("model EOS token does not fit u32"))?;
+            // Stage the request's context ceiling for the first chunk's
+            // admission. Assigned unconditionally (None for unbounded or
+            // oversized requests) so a stale envelope from an earlier
+            // request can never leak into this one.
+            self.pending_context_envelope = context_pre_admission_envelope(
+                prompt.len(),
+                maximum_new,
+                self.speculative_max_drafts,
+                self.context_growth.admitted_expanded_context_tokens,
+            );
             let mut decode = DecodeArena::new(
                 prompt,
                 maximum_context,
@@ -2943,7 +3468,10 @@ impl NativeTargetEngine {
                 eos_token,
                 self.speculative_max_drafts,
             )?;
-            let mut counters = NativeRunCounters::default();
+            let mut counters = NativeRunCounters {
+                storage_at_start: self.storage_bytes(),
+                ..NativeRunCounters::default()
+            };
             if let Some(stop) = decode.stop_reason() {
                 if let Some(events) = events.as_deref_mut() {
                     events.emit_prefill_done_with_profile(
@@ -2953,7 +3481,12 @@ impl NativeTargetEngine {
                     )?;
                 }
                 if stats {
-                    print_run_stats(&counters, started);
+                    print_run_stats(
+                        &counters,
+                        started,
+                        self.storage_homes.as_deref(),
+                        self.storage_bytes(),
+                    );
                 }
                 self.finish_output(output)?;
                 return Ok(NativeGeneration {
@@ -2971,7 +3504,12 @@ impl NativeTargetEngine {
                     )?;
                 }
                 if stats {
-                    print_run_stats(&counters, started);
+                    print_run_stats(
+                        &counters,
+                        started,
+                        self.storage_homes.as_deref(),
+                        self.storage_bytes(),
+                    );
                 }
                 self.finish_output(output)?;
                 return Ok(NativeGeneration {
@@ -3011,7 +3549,12 @@ impl NativeTargetEngine {
                         )?;
                     }
                     if stats {
-                        print_run_stats(&counters, started);
+                        print_run_stats(
+                        &counters,
+                        started,
+                        self.storage_homes.as_deref(),
+                        self.storage_bytes(),
+                    );
                     }
                     self.finish_output(output)?;
                     return Ok(NativeGeneration {
@@ -3089,7 +3632,12 @@ impl NativeTargetEngine {
                 wrote_token = true;
             }
             if stats {
-                print_run_stats(&counters, started);
+                print_run_stats(
+                        &counters,
+                        started,
+                        self.storage_homes.as_deref(),
+                        self.storage_bytes(),
+                    );
             }
 
             let mut pending_token = initial_token;
@@ -3180,10 +3728,28 @@ impl NativeTargetEngine {
                 }
 
                 let proposal_candidate_count = drafts.len();
-                let use_verify = !drafts.is_empty()
-                    && self
-                        .admit_verify_width(drafts.len().saturating_add(1), qwen_proposal_used)?;
+                // An ordinary verify keeps one KDA boundary per row (453 MiB
+                // each on K3) so it can commit any prefix. When live memory
+                // cannot hold them, a slot proposal is verified as one
+                // full-commit transaction instead, like Qwen's: a full match
+                // commits every row and a mismatch reruns only the accepted
+                // prefix, still exactly.
+                let (use_verify, full_commit) = if drafts.is_empty() {
+                    (false, false)
+                } else if qwen_proposal_used {
+                    (self.admit_verify_width(drafts.len().saturating_add(1), true)?, true)
+                } else if self.admit_verify_width(drafts.len().saturating_add(1), false)? {
+                    (true, false)
+                } else if dspark_proposal.is_some() {
+                    (self.admit_verify_width(drafts.len().saturating_add(1), true)?, true)
+                } else {
+                    (false, false)
+                };
                 let proposal_memory_rejected = proposal_candidate_count != 0 && !use_verify;
+                if full_commit && !qwen_proposal_used {
+                    counters.full_commit_slot_verifies =
+                        counters.full_commit_slot_verifies.saturating_add(1);
+                }
                 if !use_verify {
                     if let (Some(lease), Some(proposal)) =
                         (dspark_lease.as_ref(), dspark_proposal.as_ref())
@@ -3229,7 +3795,7 @@ impl NativeTargetEngine {
                         inputs.extend_from_slice(&drafts);
                         let capture_dspark = self.dspark_tracks_rows(dspark_lease.as_ref());
                         let verifier_started = Instant::now();
-                        let prepared = if qwen_proposal_used {
+                        let prepared = if full_commit {
                             self.prepare_full_commit_verify_chunk(
                                 &inputs,
                                 stats,
@@ -3265,13 +3831,14 @@ impl NativeTargetEngine {
                             ));
                         }
 
-                        // Qwen is an optimistic full-commit verifier. A full
+                        // A full-commit verify (Qwen, or a slot proposal whose
+                        // per-row boundaries did not fit) is optimistic. A full
                         // match can publish the wide transaction directly. A
                         // mismatch first cancels every staged wide row, then
                         // reruns only old-pending + accepted drafts. The rerun
                         // must reproduce the saved full-K3 authoritative IDs
                         // before its complete sequence is allowed to commit.
-                        let completed = if qwen_proposal_used {
+                        let completed = if full_commit {
                             if interrupt.requested() {
                                 prepared.sequence.cancel()?;
                                 final_stop = Some(StopReason::Interrupted);
@@ -3476,7 +4043,12 @@ impl NativeTargetEngine {
                 final_stop =
                     stop_after_transaction(stop, interrupted_after_target || interrupt.requested());
                 if stats {
-                    print_run_stats(&counters, started);
+                    print_run_stats(
+                        &counters,
+                        started,
+                        self.storage_homes.as_deref(),
+                        self.storage_bytes(),
+                    );
                 }
             }
             self.finish_output(output)?;
@@ -3663,8 +4235,10 @@ impl NativeTargetEngine {
                     },
                     "dspark": {
                         "requested": format!("{:?}", config.dspark),
+                        "eagle3_requested": format!("{:?}", config.eagle3),
                         "mode": format!("{:?}", self.dspark.mode()).to_ascii_lowercase(),
                         "backend_loaded": self.dspark.backend().is_some(),
+                        "backend": self.dspark.backend().map(NativeDraftBackend::name),
                     },
                     "qwen": {
                         "requested": format!("{:?}", config.qwen),
@@ -3795,6 +4369,7 @@ impl NativeTargetEngine {
                     "dspark": {
                         "mode": format!("{:?}", self.dspark.mode()).to_ascii_lowercase(),
                         "backend_loaded": self.dspark.backend().is_some(),
+                        "backend": self.dspark.backend().map(NativeDraftBackend::name),
                         "available": self.dspark.backend().is_some(),
                         "sessions": dspark_metrics.sessions,
                         "enabled_sessions": dspark_metrics.enabled_sessions,
@@ -4719,6 +5294,9 @@ struct TargetLayerPhaseProfile {
     expert_plan_hits: u64,
     /// Routed experts the plan required this pass to read and upload.
     expert_plan_misses: u64,
+    /// Experts whose matmul was started early, while the rest of the layer's
+    /// misses were still being read.
+    expert_early_drained: u64,
 }
 
 impl TargetLayerPhaseProfile {
@@ -4750,6 +5328,9 @@ impl TargetLayerPhaseProfile {
         self.expert_plan_misses = self
             .expert_plan_misses
             .saturating_add(other.expert_plan_misses);
+        self.expert_early_drained = self
+            .expert_early_drained
+            .saturating_add(other.expert_early_drained);
     }
 
     fn attributed_ns(&self) -> u64 {
@@ -4783,6 +5364,7 @@ impl TargetLayerPhaseProfile {
             "other_control_ns": self.other_control_ns(),
             "expert_plan_hits": self.expert_plan_hits,
             "expert_plan_misses": self.expert_plan_misses,
+            "expert_early_drained": self.expert_early_drained,
         })
     }
 }
@@ -4865,8 +5447,29 @@ impl TargetExecutionProfile {
     }
 }
 
+/// Bytes the model readers have physically read from storage.
+#[derive(Debug, Default, Clone, Copy)]
+struct StorageBytes {
+    spine: u64,
+    expert_demand: u64,
+    expert_prefetch: u64,
+}
+
+impl StorageBytes {
+    fn since(self, start: Self) -> Self {
+        Self {
+            spine: self.spine.saturating_sub(start.spine),
+            expert_demand: self.expert_demand.saturating_sub(start.expert_demand),
+            expert_prefetch: self.expert_prefetch.saturating_sub(start.expert_prefetch),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct NativeRunCounters {
+    /// Reader byte counts when this run started; `--stats` reports the
+    /// difference, so a long-lived server reports per request.
+    storage_at_start: StorageBytes,
     target_chunks: u64,
     committed_positions: u64,
     streamed_layer_passes: u64,
@@ -4876,6 +5479,9 @@ struct NativeRunCounters {
     verify_transactions: u64,
     verified_draft_tokens: u64,
     accepted_draft_tokens: u64,
+    /// Slot proposals verified as one full-commit transaction because their
+    /// per-row KDA boundaries did not fit live memory.
+    full_commit_slot_verifies: u64,
     target_profile: TargetExecutionProfile,
 }
 
@@ -5190,6 +5796,7 @@ fn execute_target_sequence(
     cpu_threads: usize,
     metal_source_selector: Option<&str>,
     metal_expert_wrapper_retention: bool,
+    expert_early_drain: bool,
     complete_expert_union: CompleteExpertUnion,
     collect_stats: bool,
     verbose_layer_profile: bool,
@@ -5286,6 +5893,7 @@ fn execute_target_sequence(
                         cpu_threads,
                         metal_source_selector,
                         metal_expert_wrapper_retention,
+                        expert_early_drain,
                         complete_expert_union,
                         collect_profile.then_some(&mut layer_profile),
                     )?;
@@ -5648,6 +6256,215 @@ fn promote_from_batch(
     }
 }
 
+/// Sink for expert spans that have become readable before the rest of the
+/// layer has landed.
+///
+/// This exists purely to pull compute forward into the read window. It is
+/// offered a batch at a time, in whatever order storage happens to deliver,
+/// and is free to ignore any of it: nothing it does is authoritative, and the
+/// layer's reduction still happens once, later, over every expert in the
+/// router's order. `false` from `stage` means "stop offering" — the drain
+/// then simply waits for the remaining reads as it always did.
+trait ExpertDrain {
+    fn stage(&mut self, arrived: &[(u16, &[u8])]) -> bool;
+}
+
+/// Makes one refusal terminal for the whole tile, so every offer site can
+/// ignore the return value and still honor it.
+struct LatchingDrain<'a> {
+    inner: &'a mut dyn ExpertDrain,
+    offering: bool,
+}
+
+impl<'a> LatchingDrain<'a> {
+    fn new(inner: &'a mut dyn ExpertDrain) -> Self {
+        Self {
+            inner,
+            offering: true,
+        }
+    }
+}
+
+impl ExpertDrain for LatchingDrain<'_> {
+    fn stage(&mut self, arrived: &[(u16, &[u8])]) -> bool {
+        if !self.offering {
+            return false;
+        }
+        self.offering = self.inner.stage(arrived);
+        self.offering
+    }
+}
+
+/// The established batch-then-compute behavior: nothing is offered early, so
+/// every expert's work waits for the layer's whole miss set.
+#[cfg_attr(not(test), allow(dead_code))]
+struct NoExpertDrain;
+
+impl ExpertDrain for NoExpertDrain {
+    fn stage(&mut self, _arrived: &[(u16, &[u8])]) -> bool {
+        false
+    }
+}
+
+/// Hands arrived expert spans to the provider's staging entry point for one
+/// tile. Everything it does is a head start on the tile's own finish call,
+/// which remains the sole authority for routes, weights, and the ordered
+/// reduction — so a tile that stages nothing produces identical bytes.
+struct TileExpertDrain<'a> {
+    offering: bool,
+    sequence: &'a mut TargetSequence,
+    mailbox: &'a TargetSequenceMailbox,
+    tile: &'a ExpertTilePlan,
+    layout: ExpertStorageLayout,
+    backend: TargetExpertBackend,
+    cpu_threads: usize,
+    metal_source_selector: Option<&'a str>,
+    drained: u64,
+}
+
+impl<'a> TileExpertDrain<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        enabled: bool,
+        sequence: &'a mut TargetSequence,
+        mailbox: &'a TargetSequenceMailbox,
+        tile: &'a ExpertTilePlan,
+        layout: ExpertStorageLayout,
+        backend: TargetExpertBackend,
+        cpu_threads: usize,
+        metal_source_selector: Option<&'a str>,
+    ) -> Self {
+        Self {
+            offering: enabled,
+            sequence,
+            mailbox,
+            tile,
+            layout,
+            backend,
+            cpu_threads,
+            metal_source_selector,
+            drained: 0,
+        }
+    }
+
+    const fn drained(&self) -> u64 {
+        self.drained
+    }
+}
+
+impl ExpertDrain for TileExpertDrain<'_> {
+    fn stage(&mut self, arrived: &[(u16, &[u8])]) -> bool {
+        if !self.offering || arrived.is_empty() {
+            return false;
+        }
+        let staged = self.sequence.stage_expert_spans(
+            self.mailbox,
+            self.tile.first_row,
+            self.tile.row_count,
+            arrived,
+            self.layout,
+            self.backend,
+            self.cpu_threads,
+            self.metal_source_selector,
+        );
+        if staged {
+            self.drained = self.drained.saturating_add(arrived.len() as u64);
+        } else {
+            // The provider declines for structural reasons — backend, tile
+            // shape, an unqualified bridge — none of which change while this
+            // tile is being read. Stop asking rather than pay for a refused
+            // call per arrival.
+            self.offering = false;
+        }
+        staged
+    }
+}
+
+/// Offer tier-resident spans to the drain. They cost no I/O, so this is the
+/// one batch that is always available before any read has finished.
+fn stage_pinned_spans(pinned: &[(u16, Arc<PageAlignedSpan>)], drain: &mut dyn ExpertDrain) {
+    if pinned.is_empty() {
+        return;
+    }
+    let mut arrived: Vec<(u16, &[u8])> = pinned
+        .iter()
+        .map(|(expert, span)| (*expert, &span[..]))
+        .collect();
+    arrived.sort_unstable_by_key(|(expert, _)| *expert);
+    drain.stage(&arrived);
+}
+
+/// Offer the settled speculative hits. Called only once every hit has been
+/// waited on and validated, so a speculative failure can never reach here.
+fn stage_hit_batches(hits: &[ExpertUnionReadBatch], drain: &mut dyn ExpertDrain) {
+    let mut arrived: Vec<(u16, &[u8])> = Vec::with_capacity(hits.len());
+    for batch in hits {
+        let [expert] = batch.expert_ids() else {
+            return;
+        };
+        arrived.push((*expert, batch.buffers().other()));
+    }
+    if arrived.is_empty() {
+        return;
+    }
+    arrived.sort_unstable_by_key(|(expert, _)| *expert);
+    drain.stage(&arrived);
+}
+
+/// Wait for one demand union, handing each expert to the drain as its own
+/// bytes land instead of after the whole batch settles.
+///
+/// The batch this returns is exactly the batch the plain wait would have
+/// returned; the drain only gets a look at parts of it early. When the reader
+/// offers no partial view — an unsupported plan shape, or simply a batch that
+/// finished before the first look — this degrades to the ordinary wait.
+fn drain_expert_union(
+    ticket: ExpertUnionReadTicket,
+    drain: &mut dyn ExpertDrain,
+) -> Result<ExpertUnionReadBatch> {
+    let mut staged = 0_u64;
+    let mut seen_reads = 0_u64;
+    while !ticket.is_ready() {
+        let arrived = ticket.arrived_experts() & !staged;
+        // Hand over a wave at a time, not an expert at a time. Each offer
+        // costs a provider call and a GPU submission, and experts land in
+        // roughly reader-pool-sized groups anyway, so waiting for a group
+        // keeps the fixed cost per staged expert small. The tail below the
+        // threshold is deliberately left to the tile's own finish call: by
+        // then there is no read left to overlap, and finishing it in one
+        // batched dispatch beats staging it in several small ones.
+        if arrived.count_ones() < EXPERT_EARLY_DRAIN_WAVE as u32 {
+            // Park rather than spin: the reader workers own the device, and a
+            // busy caller would only take cycles away from the reads it is
+            // waiting for.
+            seen_reads = ticket.wait_for_read_progress(seen_reads);
+            continue;
+        }
+        let expert_ids = ticket.expert_ids();
+        let mut batch: Vec<(u16, &[u8])> = Vec::with_capacity(expert_ids.len());
+        for (slot, expert) in expert_ids.iter().enumerate() {
+            if arrived & (1_u64 << slot) == 0 {
+                continue;
+            }
+            // SAFETY: `arrived_experts` reported this slot's every read
+            // complete, and the borrow ends before the ticket is waited on.
+            let Some(span) = (unsafe { ticket.arrived_span(slot) }) else {
+                continue;
+            };
+            batch.push((*expert, span));
+        }
+        staged |= arrived;
+        if batch.is_empty() {
+            continue;
+        }
+        if !drain.stage(&batch) {
+            break;
+        }
+    }
+    ticket.wait()
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn read_expert_tile_with_prefetch(
     experts: &RawExpertCorpus,
     expert_reader: &Reader,
@@ -5656,6 +6473,28 @@ fn read_expert_tile_with_prefetch(
     canonical_expert_ids: &[u16],
     prefetch: Option<ExpertPrefetchSet>,
 ) -> Result<ExpertTileLease> {
+    read_expert_tile_draining(
+        experts,
+        expert_reader,
+        expert_pin_tier,
+        layer,
+        canonical_expert_ids,
+        prefetch,
+        &mut NoExpertDrain,
+    )
+}
+
+fn read_expert_tile_draining(
+    experts: &RawExpertCorpus,
+    expert_reader: &Reader,
+    expert_pin_tier: Option<&ExpertPinTier>,
+    layer: u32,
+    canonical_expert_ids: &[u16],
+    prefetch: Option<ExpertPrefetchSet>,
+    offered: &mut dyn ExpertDrain,
+) -> Result<ExpertTileLease> {
+    let mut latched = LatchingDrain::new(offered);
+    let drain: &mut dyn ExpertDrain = &mut latched;
     // Partition against the permanent tier before any submission: a resident
     // span was authenticated when it was promoted and needs no file I/O this
     // pass. `streamed` keeps canonical ascending order for the demand union.
@@ -5674,33 +6513,41 @@ fn read_expert_tile_with_prefetch(
             .collect(),
         None => canonical_expert_ids.to_vec(),
     };
-    let read_streamed_demand =
-        |lease_pinned: Vec<(u16, Arc<PageAlignedSpan>)>| -> Result<ExpertTileLease> {
-            if lease_pinned.is_empty() {
-                let batch = experts.read_union(expert_reader, layer, canonical_expert_ids)?;
-                promote_from_batch(expert_pin_tier, layer, &batch);
-                return Ok(ExpertTileLease::Contiguous(batch));
-            }
-            let demand = if streamed.is_empty() {
-                None
-            } else {
-                let batch = experts.read_union(expert_reader, layer, &streamed)?;
-                promote_from_batch(expert_pin_tier, layer, &batch);
-                Some(batch)
-            };
-            Ok(ExpertTileLease::Scattered {
-                layout: experts.layout(),
-                pinned: lease_pinned,
-                hits: Vec::new(),
-                demand,
-            })
+    let read_streamed_demand = |lease_pinned: Vec<(u16, Arc<PageAlignedSpan>)>,
+                                drain: &mut dyn ExpertDrain|
+     -> Result<ExpertTileLease> {
+        if lease_pinned.is_empty() {
+            let ticket = experts.submit_union(expert_reader, layer, canonical_expert_ids)?;
+            let batch = drain_expert_union(ticket, drain)?;
+            promote_from_batch(expert_pin_tier, layer, &batch);
+            return Ok(ExpertTileLease::Contiguous(batch));
+        }
+        let demand = if streamed.is_empty() {
+            None
+        } else {
+            // Start the disk before anything else. Tier-resident spans need no
+            // I/O at all, so their compute is the cheapest thing to put into
+            // the window these reads are about to occupy — but only once the
+            // reads are actually in flight.
+            let ticket = experts.submit_union(expert_reader, layer, &streamed)?;
+            stage_pinned_spans(&lease_pinned, drain);
+            let batch = drain_expert_union(ticket, drain)?;
+            promote_from_batch(expert_pin_tier, layer, &batch);
+            Some(batch)
         };
+        Ok(ExpertTileLease::Scattered {
+            layout: experts.layout(),
+            pinned: lease_pinned,
+            hits: Vec::new(),
+            demand,
+        })
+    };
     let Some(prefetch) = prefetch else {
-        return read_streamed_demand(pinned);
+        return read_streamed_demand(pinned, drain);
     };
     if prefetch.target_layer != layer {
         prefetch.cancel_and_drain();
-        return read_streamed_demand(pinned);
+        return read_streamed_demand(pinned, drain);
     }
 
     // A speculative ticket for a tier-resident expert is a loser: cancelling
@@ -5754,6 +6601,11 @@ fn read_expert_tile_with_prefetch(
         }
     };
 
+    // Tier-resident spans are already authenticated and need no read at all,
+    // so their compute is the first thing worth pulling into the window the
+    // demand reads are about to occupy.
+    stage_pinned_spans(&pinned, drain);
+
     // A speculative read error is not an authoritative failure. Treat it as
     // a miss and retry the complete canonical union through the ordinary
     // checked demand path. Drain the already-submitted known-miss batch first
@@ -5779,16 +6631,21 @@ fn read_expert_tile_with_prefetch(
         }
         // The retry reads the complete canonical union — including any
         // tier-resident experts — so this fallback stays byte-identical to
-        // the established path.
+        // the established path. Anything already staged came from a
+        // tier-resident span, which the retry re-reads to the same bytes, so
+        // reusing or recomputing it is indistinguishable.
         let batch = experts.read_union(expert_reader, layer, canonical_expert_ids)?;
         promote_from_batch(expert_pin_tier, layer, &batch);
         return Ok(ExpertTileLease::Contiguous(batch));
     }
 
     hits.sort_unstable_by_key(|batch| batch.expert_ids()[0]);
+    // Every speculative hit is now authenticated and settled, so these spans
+    // can join the drain before the demand reads finish.
+    stage_hit_batches(&hits, drain);
     let demand = match demand_ticket {
         Some(ticket) => {
-            let batch = ticket.wait()?;
+            let batch = drain_expert_union(ticket, drain)?;
             if batch.layer() != layer
                 || batch.expert_ids() != provisional_misses
                 || batch.layout() != experts.layout()
@@ -5835,6 +6692,7 @@ fn finish_expert_mailbox(
     cpu_threads: usize,
     metal_source_selector: Option<&str>,
     metal_expert_wrapper_retention: bool,
+    early_drain_enabled: bool,
     complete_expert_union: CompleteExpertUnion,
     mut profile: Option<&mut TargetLayerPhaseProfile>,
 ) -> Result<()> {
@@ -5982,17 +6840,37 @@ fn finish_expert_mailbox(
         // layer mismatch.  Consume only a generation that is due now (or an
         // impossible stale generation, so the existing fail-safe drains it).
         let due_prefetch = take_due_expert_prefetch(pending_expert_prefetch, mailbox.layer_index());
-        let lease = read_expert_tile_with_prefetch(
+        // Early drain: each expert's own matmul starts as its bytes land
+        // rather than after the layer's whole miss set has been read. Purely a
+        // head start — `lease.finish` below still runs the authoritative tile,
+        // including the one reduction over every expert in route order.
+        let mut early_drain = TileExpertDrain::new(
+            early_drain_enabled,
+            sequence,
+            mailbox,
+            &tile,
+            experts.layout(),
+            backend,
+            cpu_threads,
+            metal_source_selector,
+        );
+        let lease = read_expert_tile_draining(
             experts,
             expert_reader,
             expert_pin_tier,
             mailbox.layer_index(),
             tile.expert_ids(),
             due_prefetch,
+            &mut early_drain,
         )?;
+        let drained_experts = early_drain.drained();
         add_profile_elapsed(profile.as_deref_mut(), read_started, |profile| {
             &mut profile.authoritative_expert_read_prefetch_ns
         });
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.expert_early_drained =
+                profile.expert_early_drained.saturating_add(drained_experts);
+        }
         // The provider materializes the optional scheduling hint only after
         // Rust has the real current-layer route and its authoritative bytes.
         // An ABI error is terminal because the sequence cancels itself; a
@@ -6360,6 +7238,42 @@ fn next_prompt_chunk(total: usize, first: usize) -> Result<Option<Range<usize>>>
     Ok(Some(first..end))
 }
 
+/// The whole-request context ceiling worth proving once at request start, or
+/// `None` when the request is unbounded or too large to reserve speculatively.
+///
+/// A bounded request's final context need is known before its first token:
+/// prompt length plus `--max-new`, plus the widest speculative verify chunk
+/// that can be staged beyond the committed prefix. Proving that ceiling while
+/// the request is seconds old moves the memory-admission gate from "35
+/// minutes in, at whatever the host looks like then" to "now, when the
+/// request was admissible enough to start" — every later growth boundary
+/// then takes the committed-capacity fast path with no live re-proof, so
+/// pressure arriving mid-run (another application opening) can no longer
+/// fail a generation that was admissible when it began.
+///
+/// The token bound keeps this a reservation of intent, not a land grab: a
+/// server chat request arrives with the server-wide output ceiling (defaults
+/// to a million tokens) rather than an expected length, and pre-admitting
+/// gigabytes against a ceiling nobody will reach would displace resident
+/// layers for nothing. Requests above the bound simply keep incremental
+/// growth, exactly as before.
+fn context_pre_admission_envelope(
+    prompt_tokens: usize,
+    maximum_new: Option<usize>,
+    speculative_max_drafts: usize,
+    admitted_expanded_context_tokens: u64,
+) -> Option<u64> {
+    const MAX_PRE_ADMISSION_TOKENS: u64 = 512;
+    let maximum_new = u64::try_from(maximum_new?).ok()?;
+    let envelope = u64::try_from(prompt_tokens)
+        .ok()?
+        .checked_add(maximum_new)?
+        .checked_add(u64::try_from(speculative_max_drafts).ok()?)?
+        .checked_add(1)?;
+    (envelope <= MAX_PRE_ADMISSION_TOKENS.min(admitted_expanded_context_tokens))
+        .then_some(envelope)
+}
+
 fn bounded_draft_budget(
     configured: usize,
     remaining_context: usize,
@@ -6399,7 +7313,12 @@ fn cancel_after_error(sequence: TargetSequence, error: DeltafinError) -> Deltafi
     }
 }
 
-fn print_run_stats(counters: &NativeRunCounters, started: Instant) {
+fn print_run_stats(
+    counters: &NativeRunCounters,
+    started: Instant,
+    homes: Option<&StorageHomes>,
+    storage: StorageBytes,
+) {
     let elapsed = started.elapsed().as_secs_f64();
     let tokens_per_second = if elapsed > 0.0 {
         counters.generated_tokens as f64 / elapsed
@@ -6412,17 +7331,53 @@ fn print_run_stats(counters: &NativeRunCounters, started: Instant) {
         elapsed / counters.generated_tokens as f64
     };
     eprintln!(
-        "\n[stats] generated={} elapsed={elapsed:.3}s speed={tokens_per_second:.4} token/s ({seconds_per_token:.3} s/token) chunks={} committed_rows={} verify_tx={} drafts={}/{} layer_passes={} expert_rows={} expert_tiles={}",
+        "\n[stats] generated={} elapsed={elapsed:.3}s speed={tokens_per_second:.4} token/s ({seconds_per_token:.3} s/token) chunks={} committed_rows={} verify_tx={} (full-commit slot {}) drafts={}/{} layer_passes={} expert_rows={} expert_tiles={}",
         counters.generated_tokens,
         counters.target_chunks,
         counters.committed_positions,
         counters.verify_transactions,
+        counters.full_commit_slot_verifies,
         counters.accepted_draft_tokens,
         counters.verified_draft_tokens,
         counters.streamed_layer_passes,
         counters.expert_rows,
         counters.expert_tiles,
     );
+    let read = storage.since(counters.storage_at_start);
+    let total = read.spine + read.expert_demand + read.expert_prefetch;
+    eprintln!(
+        "[stats] disk: spine {:.2} GB + experts {:.2} GB demand + {:.2} GB prefetch = {:.2} GB in {elapsed:.1}s ({:.2} GB/s, {:.2} GB/token)",
+        read.spine as f64 / 1e9,
+        read.expert_demand as f64 / 1e9,
+        read.expert_prefetch as f64 / 1e9,
+        total as f64 / 1e9,
+        if elapsed > 0.0 { total as f64 / 1e9 / elapsed } else { 0.0 },
+        if counters.generated_tokens == 0 {
+            0.0
+        } else {
+            total as f64 / 1e9 / counters.generated_tokens as f64
+        },
+    );
+    if let Some(homes) = homes {
+        let drives = homes.stats();
+        let total: u64 = drives.iter().map(|drive| drive.served_bytes).sum();
+        for (index, drive) in drives.iter().enumerate() {
+            eprintln!(
+                "[stats] drive {index}: {:.2} GB served ({:.1}%) in {} reads, {} {:.2} GB/s, {} failed reads{}, {}",
+                drive.served_bytes as f64 / 1e9,
+                if total == 0 { 0.0 } else { 100.0 * drive.served_bytes as f64 / total as f64 },
+                drive.reads,
+                if drive.measured { "measured" } else { "assumed" },
+                drive.rate_gbps,
+                drive.failures,
+                if drive.quarantined { " (sitting out)" } else { "" },
+                drive.root.display(),
+            );
+        }
+    }
+    if let Some(emulator) = crate::storage_emulation::DeviceEmulator::global() {
+        emulator.print_report();
+    }
     if counters.target_profile.chunks != 0 {
         let totals = counters.target_profile.layer_totals();
         eprintln!(
@@ -6442,6 +7397,12 @@ fn print_run_stats(counters: &NativeRunCounters, started: Instant) {
             eprintln!(
                 "[phases] expert plans: {} cache hits, {} misses read+uploaded",
                 totals.expert_plan_hits, totals.expert_plan_misses,
+            );
+        }
+        if totals.expert_early_drained != 0 {
+            eprintln!(
+                "[phases] expert early drain: {} experts started before their layer's reads finished",
+                totals.expert_early_drained,
             );
         }
     }
@@ -6779,7 +7740,11 @@ fn select_residency_with_transient(
 }
 
 fn verify_snapshot_budget(model: &ModelSpec) -> Result<VerifySnapshotBudget> {
-    let bytes_per_kda_generation = (model.kda_layers() as u64)
+    k3_verify_snapshot_budget(model.kda_layers() as u64)
+}
+
+fn k3_verify_snapshot_budget(kda_layers: u64) -> Result<VerifySnapshotBudget> {
+    let bytes_per_kda_generation = kda_layers
         .checked_mul(
             K3_KDA_CONV_ELEMENTS_PER_LAYER
                 .checked_add(K3_KDA_RECURRENT_ELEMENTS_PER_LAYER)
@@ -6787,8 +7752,20 @@ fn verify_snapshot_budget(model: &ModelSpec) -> Result<VerifySnapshotBudget> {
         )
         .and_then(|elements| elements.checked_mul(4))
         .ok_or_else(|| DeltafinError::new("KDA cache byte budget overflows u64"))?;
+    // Per row and layer: decay, key and value rows, beta, and one column of
+    // each of the three convolution sources, all fp32.
+    let replay_bytes_per_position = kda_layers
+        .checked_mul(6 * K3_KDA_PROJECTION + K3_KDA_HEADS)
+        .and_then(|elements| elements.checked_mul(4))
+        .ok_or_else(|| DeltafinError::new("KDA replay budget overflows u64"))?;
+    let replay_fixed_bytes = kda_layers
+        .checked_mul(3 * K3_KDA_PROJECTION * (K3_KDA_CONVOLUTION_WIDTH - 1))
+        .and_then(|elements| elements.checked_mul(4))
+        .ok_or_else(|| DeltafinError::new("KDA replay budget overflows u64"))?;
     Ok(VerifySnapshotBudget {
         bytes_per_kda_generation,
+        replay_bytes_per_position,
+        replay_fixed_bytes,
         max_positions: TARGET_SEQUENCE_MAX_POSITIONS,
     })
 }
@@ -7031,8 +8008,15 @@ fn bounded_worker_count(limit: usize) -> usize {
         .clamp(1, limit)
 }
 
-fn configured_expert_reader_workers(configured: Option<usize>) -> usize {
-    let automatic = bounded_worker_count(EXPERT_READER_LIMIT);
+fn configured_expert_reader_workers(configured: Option<usize>, homes: usize) -> usize {
+    // Each extra drive brings its own queue depth; give it its own workers
+    // so a batch can keep every home busy at once.
+    let automatic = if homes > 1 {
+        (bounded_worker_count(EXPERT_READER_LIMIT) * homes)
+            .min(crate::config::MAX_EXPERT_READ_THREADS)
+    } else {
+        bounded_worker_count(EXPERT_READER_LIMIT)
+    };
     configured
         .unwrap_or(automatic)
         .clamp(1, crate::config::MAX_EXPERT_READ_THREADS)
@@ -7169,8 +8153,43 @@ mod tests {
     use crate::program::{
         SPINE_BUFFER_NONE, SPINE_BUFFER_OTHER, SPINE_ENCODING_RAW_BF16, SpineTensorDescriptorV1,
     };
-    use crate::residency::HostMemory;
+    use crate::residency::{GIB, HostMemory};
     use crate::storage::{BufferKind, CachePolicy, Extent, ReadPlan};
+
+    #[test]
+    fn context_envelope_covers_bounded_requests_and_declines_the_rest() {
+        // The benchmark shape that failed overnight: ~45-token prompt,
+        // --max-new 150, 8 speculative drafts -> a 204-token ceiling, well
+        // inside both the pre-admission bound and the expanded-context cap.
+        assert_eq!(
+            context_pre_admission_envelope(45, Some(150), 8, 4_369),
+            Some(204)
+        );
+        // Slack covers the widest staged verify chunk beyond the prefix.
+        assert_eq!(context_pre_admission_envelope(1, Some(1), 0, 4_369), Some(3));
+
+        // Unbounded requests keep incremental growth: there is no envelope.
+        assert_eq!(context_pre_admission_envelope(45, None, 8, 4_369), None);
+        // A server-wide output ceiling is not an expected length; oversized
+        // envelopes decline rather than reserving gigabytes nobody will use.
+        assert_eq!(
+            context_pre_admission_envelope(45, Some(1_000_000), 8, 4_369),
+            None
+        );
+        assert_eq!(context_pre_admission_envelope(400, Some(150), 8, 4_369), None);
+        // The expanded-context cap binds when it is smaller than the bound.
+        assert_eq!(context_pre_admission_envelope(45, Some(150), 8, 128), None);
+        // Exactly at the bound is still worth proving once.
+        assert_eq!(
+            context_pre_admission_envelope(303, Some(200), 8, 4_369),
+            Some(512)
+        );
+        // Arithmetic overflow declines instead of wrapping.
+        assert_eq!(
+            context_pre_admission_envelope(usize::MAX, Some(usize::MAX), 8, u64::MAX),
+            None
+        );
+    }
 
     #[test]
     fn target_phase_profile_aggregates_additive_waits_without_double_counting_overlap() {
@@ -7192,6 +8211,7 @@ mod tests {
             layer_total_ns: 800,
             expert_plan_hits: 12,
             expert_plan_misses: 4,
+            expert_early_drained: 3,
         };
         // The 700ns active-read interval overlaps preceding work. Only the
         // 100ns caller wait contributes to the additive layer attribution.
@@ -8217,9 +9237,11 @@ mod tests {
     }
 
     #[test]
-    fn verify_budget_charges_every_staged_boundary_and_preserves_exact_fallback() {
+    fn verify_budget_charges_the_prefix_record_and_preserves_exact_fallback() {
         let budget = VerifySnapshotBudget {
             bytes_per_kda_generation: 100,
+            replay_bytes_per_position: 3,
+            replay_fixed_bytes: 5,
             max_positions: 64,
         };
         let ordinary = budget.admission(1).unwrap();
@@ -8228,12 +9250,37 @@ mod tests {
         assert_eq!(ordinary.transaction_peak_provider_bytes, 200);
         assert_eq!(ordinary.additional_over_decode_reserve_bytes, 0);
 
+        // Seven rows stage one final generation plus a 5 + 7*3 byte record,
+        // never a second generation.
         let wide = budget.admission(7).unwrap();
-        assert_eq!(wide.staged_boundary_provider_bytes, 700);
-        assert_eq!(wide.transaction_peak_provider_bytes, 800);
-        assert_eq!(wide.additional_over_decode_reserve_bytes, 600);
+        assert_eq!(wide.staged_boundary_provider_bytes, 126);
+        assert_eq!(wide.transaction_peak_provider_bytes, 226);
+        assert_eq!(wide.additional_over_decode_reserve_bytes, 26);
         assert!(budget.admission(0).is_err());
         assert!(budget.admission(65).is_err());
+    }
+
+    #[test]
+    fn slot_verify_reserve_covers_the_widest_configured_verify() {
+        let budget = k3_verify_snapshot_budget(69).unwrap();
+        let reserved = slot_verify_reserve(budget, 8).unwrap();
+        for positions in 1..=9 {
+            let admission = budget.admission(positions).unwrap();
+            assert_eq!(verify_live_admission_bytes(admission, reserved), 0);
+        }
+        assert!(verify_live_admission_bytes(budget.admission(10).unwrap(), reserved) > 0);
+        assert!(reserved < 256 << 20);
+    }
+
+    #[test]
+    fn k3_verify_record_is_a_small_fraction_of_a_generation() {
+        let budget = k3_verify_snapshot_budget(69).unwrap();
+        assert_eq!(budget.bytes_per_kda_generation, 69 * 1_720_320 * 4);
+        assert_eq!(budget.replay_bytes_per_position, 69 * 73_824 * 4);
+        // An eight-row verify needs about 185 MiB beyond the decode
+        // reserve, against 3.1 GiB when every row kept its own state.
+        let wide = budget.admission(8).unwrap();
+        assert!(wide.additional_over_decode_reserve_bytes < 200 << 20);
     }
 
     #[test]
@@ -9322,10 +10369,16 @@ mod tests {
 
     #[test]
     fn expert_reader_preserves_portable_default_and_bounded_override() {
-        assert!((1..=EXPERT_READER_LIMIT).contains(&configured_expert_reader_workers(None)));
-        assert_eq!(configured_expert_reader_workers(Some(8)), 8);
+        assert!((1..=EXPERT_READER_LIMIT).contains(&configured_expert_reader_workers(None, 1)));
+        let single = configured_expert_reader_workers(None, 1);
         assert_eq!(
-            configured_expert_reader_workers(Some(usize::MAX)),
+            configured_expert_reader_workers(None, 3),
+            (single * 3).min(crate::config::MAX_EXPERT_READ_THREADS)
+        );
+        assert_eq!(configured_expert_reader_workers(Some(8), 1), 8);
+        assert_eq!(configured_expert_reader_workers(Some(2), 4), 2, "explicit wins");
+        assert_eq!(
+            configured_expert_reader_workers(Some(usize::MAX), 1),
             crate::config::MAX_EXPERT_READ_THREADS
         );
     }
@@ -9363,6 +10416,8 @@ mod tests {
         let missing = Path::new("/definitely/not/a/model/root");
         let verify = VerifySnapshotBudget {
             bytes_per_kda_generation: 100,
+            replay_bytes_per_position: 3,
+            replay_fixed_bytes: 5,
             max_positions: 64,
         };
         assert_eq!(
@@ -9401,6 +10456,78 @@ mod tests {
             Path::new("/definitely/not/a/dspark/checkpoint"),
             Device::Cpu,
         ));
+    }
+
+    #[test]
+    fn eagle3_takes_the_slot_only_where_the_slot_is_wanted() {
+        let root = std::env::temp_dir().join(format!("deltafin-eagle3-slot-{}", std::process::id()));
+        std::fs::create_dir_all(root.join(eagle3_provider::DIRECTORY)).unwrap();
+        let missing = Path::new("/definitely/not/a/model/root");
+        let mut config = RuntimeConfig::resolve(RunArgs::default(), |_| None).unwrap();
+        assert_eq!(config.eagle3, Eagle3Request::Auto);
+        // A raw direct run never uses the slot, so nothing is loaded.
+        assert!(!eagle3_selected(&config, &root, Device::Mps));
+
+        config.chat = true;
+        assert!(eagle3_selected(&config, &root, Device::Mps));
+        assert!(!eagle3_selected(&config, &root, Device::Cpu));
+        assert!(!eagle3_selected(&config, missing, Device::Mps));
+        assert_eq!(
+            draft_slot_provider_reserve(&config, &root, Device::Mps, 8_192).unwrap(),
+            eagle3_provider::provider_reserve(8_192).unwrap()
+        );
+        // Without EAGLE the slot falls back to DSpark's own eligibility.
+        assert_eq!(
+            draft_slot_provider_reserve(&config, missing, Device::Mps, 8_192).unwrap(),
+            0
+        );
+
+        config.eagle3 = Eagle3Request::Off;
+        assert!(!eagle3_selected(&config, &root, Device::Mps));
+        config.eagle3 = Eagle3Request::On;
+        assert!(eagle3_selected(&config, missing, Device::Mps));
+        config.dspark = DSparkRequest::Off;
+        assert!(!eagle3_selected(&config, &root, Device::Mps));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn qwen_is_planned_only_where_a_request_can_reach_it() {
+        let mut config = RuntimeConfig::resolve(RunArgs::default(), |_| None).unwrap();
+        assert!(qwen_usable_by_run(&config));
+        config.chat = true;
+        assert!(!qwen_usable_by_run(&config));
+        config.surface = RuntimeSurface::Server;
+        assert!(qwen_usable_by_run(&config));
+        config.dspark = DSparkRequest::On;
+        assert!(!qwen_usable_by_run(&config));
+        // Every surface that can reach Qwen is one where the per-request
+        // gate can also allow it.
+        config.dspark = DSparkRequest::Auto;
+        config.chat = false;
+        config.surface = RuntimeSurface::DirectRun;
+        assert!(qwen_usable_by_run(&config));
+        assert!(qwen_allowed_for_request(
+            config.chat || config.dspark == DSparkRequest::On
+        ));
+    }
+
+    #[test]
+    fn eagle3_runtime_keeps_drafting_through_misses() {
+        let config = RuntimeConfig::resolve(RunArgs::default(), |_| None).unwrap();
+        let runtime = eagle3_runtime_config(&config, 4_096);
+        assert!(!runtime.disable_on_miss);
+        assert_eq!(runtime.max_drafts, eagle3_provider::MAXIMUM_DRAFTS);
+        assert_eq!(runtime.max_context_tokens, Some(4_096));
+        assert!(runtime.economic_grace_steps > 0);
+        assert!(
+            DSparkRuntime::<NativeDraftBackend>::new(
+                crate::dspark_runtime::Mode::Auto,
+                None,
+                runtime
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -9487,17 +10614,21 @@ mod tests {
     fn qwen_full_commit_validates_width_without_reserving_unallocated_snapshots() {
         let snapshots = VerifySnapshotBudget {
             bytes_per_kda_generation: 100,
+            replay_bytes_per_position: 3,
+            replay_fixed_bytes: 5,
             max_positions: 64,
         };
         assert_eq!(qwen_verify_reserve(snapshots, 2).unwrap(), (3, 0));
         assert_eq!(qwen_verify_reserve(snapshots, 8).unwrap(), (9, 0));
         assert!(qwen_verify_reserve(snapshots, 64).is_err());
 
-        // Ordinary verifiers still use the exact per-boundary live admission
-        // calculation; only the provider-proven full-commit mode bypasses it.
+        // Ordinary verifiers still charge their exact live admission (one
+        // final generation plus a 5 + 9*3 byte prefix record); only the
+        // provider-proven full-commit mode bypasses it.
         let widest = snapshots.admission(9).unwrap();
+        assert_eq!(widest.additional_over_decode_reserve_bytes, 32);
         assert_eq!(verify_live_admission_bytes(widest, 800), 0);
-        assert_eq!(verify_live_admission_bytes(widest, 200), 600);
+        assert_eq!(verify_live_admission_bytes(widest, 20), 12);
         assert_eq!(
             verify_live_admission_bytes(snapshots.admission(3).unwrap(), 800),
             0
@@ -9742,5 +10873,645 @@ mod tests {
         assert_eq!(spans[0], &expected[..span_bytes]);
         assert_eq!(spans[1], &expected[span_bytes..2 * span_bytes]);
         assert_eq!(tier.hits(), 4);
+    }
+
+    /// Records what an early drain was offered, and can refuse.
+    struct RecordingDrain {
+        offers: Vec<Vec<(u16, Vec<u8>)>>,
+        accept: bool,
+    }
+
+    impl RecordingDrain {
+        const fn new(accept: bool) -> Self {
+            Self {
+                offers: Vec::new(),
+                accept,
+            }
+        }
+
+        fn offered_experts(&self) -> Vec<u16> {
+            let mut experts: Vec<u16> = self
+                .offers
+                .iter()
+                .flat_map(|offer| offer.iter().map(|(expert, _)| *expert))
+                .collect();
+            experts.sort_unstable();
+            experts
+        }
+    }
+
+    impl ExpertDrain for RecordingDrain {
+        fn stage(&mut self, arrived: &[(u16, &[u8])]) -> bool {
+            self.offers.push(
+                arrived
+                    .iter()
+                    .map(|(expert, span)| (*expert, span.to_vec()))
+                    .collect(),
+            );
+            self.accept
+        }
+    }
+
+    #[test]
+    fn early_drain_offers_authoritative_bytes_and_stops_when_refused() {
+        use crate::experts::{K3_EXPERT_SOURCE_BYTES, RawExpertCorpus};
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "deltafin-engine-drain-{}-{nonce}",
+            std::process::id()
+        ));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let cache = root.join("k3-experts");
+        std::fs::create_dir_all(&cache).unwrap();
+        let experts: [u16; 4] = [2, 5, 9, 14];
+        for expert in experts {
+            std::fs::write(
+                cache.join(format!("L1-E{expert}.bin")),
+                vec![expert as u8; K3_EXPERT_SOURCE_BYTES],
+            )
+            .unwrap();
+        }
+        let corpus = RawExpertCorpus::open_raw_v1(&root).unwrap();
+        let reader = Reader::with_arena_capacity(2, 2).unwrap();
+        let span_bytes = corpus.layout().expert_span_bytes();
+        let tier = ExpertPinTier::plan(
+            &pin_snapshot_hot_at(&[(1, 2), (1, 5)], 300.0, 512.0),
+            span_bytes,
+            2 * span_bytes as u64,
+        )
+        .unwrap();
+
+        // Promote the two candidates so the next tile has a pinned partition
+        // to offer with no I/O at all.
+        drop(
+            read_expert_tile_draining(
+                &corpus,
+                &reader,
+                Some(&tier),
+                1,
+                &experts,
+                None,
+                &mut NoExpertDrain,
+            )
+            .unwrap(),
+        );
+        assert_eq!(tier.resident_experts(), 2);
+
+        let mut drain = RecordingDrain::new(true);
+        let lease = read_expert_tile_draining(
+            &corpus,
+            &reader,
+            Some(&tier),
+            1,
+            &experts,
+            None,
+            &mut drain,
+        )
+        .unwrap();
+
+        // Whatever was offered must be exactly the bytes the authoritative
+        // tile ends up using for that expert. An early drain that could hand
+        // out different bytes than the finish call is the one way this
+        // optimization could change output.
+        let ExpertTileLease::Scattered {
+            pinned,
+            hits,
+            demand,
+            ..
+        } = &lease
+        else {
+            panic!("tier-resident tile did not use the scattered lease");
+        };
+        let hit_spans: Vec<(u16, &[u8])> = hits
+            .iter()
+            .map(|batch| (batch.expert_ids()[0], batch.buffers().other()))
+            .collect();
+        let spans = assemble_expert_spans(
+            &experts,
+            pinned,
+            &hit_spans,
+            demand
+                .as_ref()
+                .map(|batch| (batch.expert_ids(), batch.buffers().other())),
+            span_bytes,
+        )
+        .unwrap();
+        for offer in &drain.offers {
+            assert!(!offer.is_empty(), "an empty batch was offered");
+            assert!(
+                offer.windows(2).all(|pair| pair[0].0 < pair[1].0),
+                "an offered batch was not canonical ascending"
+            );
+            for (expert, bytes) in offer {
+                let index = experts.iter().position(|id| id == expert).unwrap();
+                assert_eq!(
+                    bytes.as_slice(),
+                    spans[index],
+                    "expert {expert} was offered bytes the tile did not use"
+                );
+            }
+        }
+        // Every expert is offered at most once: a repeat would be staged twice.
+        let offered = drain.offered_experts();
+        assert!(offered.windows(2).all(|pair| pair[0] < pair[1]));
+        // The pinned pair costs no I/O, so it is always available to offer.
+        assert!(offered.contains(&2) && offered.contains(&5));
+        drop(lease);
+
+        // A refusal is terminal for the tile: nothing further is offered.
+        let mut refusing = RecordingDrain::new(false);
+        drop(
+            read_expert_tile_draining(
+                &corpus,
+                &reader,
+                Some(&tier),
+                1,
+                &experts,
+                None,
+                &mut refusing,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            refusing.offers.len(),
+            1,
+            "a refused drain was offered another batch"
+        );
+    }
+
+    fn pin_selection(resident_layers: usize, stop: ResidencyStop) -> ResidencySelection {
+        ResidencySelection {
+            resident_layers,
+            resident_provider_bytes: 0,
+            host_envelope_bytes: None,
+            provider_envelope_bytes: None,
+            stop,
+            override_clamped_by_safety: false,
+        }
+    }
+
+    const PIN_SPAN: u64 = 1 << 20;
+
+    fn pin_base() -> FixedCosts {
+        FixedCosts {
+            host_bytes: 8 * PIN_SPAN,
+            provider_bytes: 0,
+        }
+    }
+
+    fn wide_qwen() -> QwenPlan {
+        QwenPlan {
+            state: QwenRuntimeState::NotInstalled,
+            initial: None,
+            wide_lazy: true,
+            reserved_provider_bytes: 4 * PIN_SPAN,
+            reserved_verify_bytes: 0,
+            reserved_verify_positions: 0,
+            context_capacity: 0,
+        }
+    }
+
+    #[test]
+    fn pins_take_only_headroom_from_a_spine_that_fits_completely() {
+        let reference = pin_selection(93, ResidencyStop::AllLayersFit);
+        let headroom = pin_base().host_bytes + 10 * PIN_SPAN;
+        let select = |fixed: FixedCosts| -> Result<(QwenPlan, ResidencySelection, u64)> {
+            let layers = if fixed.host_bytes <= headroom { 93 } else { 92 };
+            let stop = if layers == 93 {
+                ResidencyStop::AllLayersFit
+            } else {
+                ResidencyStop::NextLayerWouldExceedBudget
+            };
+            Ok((wide_qwen(), pin_selection(layers, stop), 0))
+        };
+        for eligible in [0_usize, 1, 10, 300] {
+            assert_eq!(
+                admit_pin_count(eligible, PIN_SPAN, pin_base(), &select, wide_qwen(), &reference, true),
+                eligible.min(10),
+                "eligible={eligible}"
+            );
+        }
+    }
+
+    #[test]
+    fn pins_displace_a_partial_spine_until_the_memory_proof_fails() {
+        let reference = pin_selection(7, ResidencyStop::NextLayerWouldExceedBudget);
+        let select = |fixed: FixedCosts| -> Result<(QwenPlan, ResidencySelection, u64)> {
+            let charge = (fixed.host_bytes - pin_base().host_bytes) / PIN_SPAN;
+            if charge > 50 {
+                return Ok((wide_qwen(), pin_selection(0, ResidencyStop::FixedCostsExceedBudget), 0));
+            }
+            let layers = 7_usize.saturating_sub(charge as usize / 8);
+            Ok((wide_qwen(), pin_selection(layers, ResidencyStop::NextLayerWouldExceedBudget), 0))
+        };
+        // Partial spine: every pin up to the proof limit beats a resident layer.
+        assert_eq!(
+            admit_pin_count(300, PIN_SPAN, pin_base(), &select, wide_qwen(), &reference, false),
+            50
+        );
+    }
+
+    #[test]
+    fn pins_never_push_out_the_qwen_drafter() {
+        let reference = pin_selection(7, ResidencyStop::NextLayerWouldExceedBudget);
+        let select = |fixed: FixedCosts| -> Result<(QwenPlan, ResidencySelection, u64)> {
+            let charge = (fixed.host_bytes - pin_base().host_bytes) / PIN_SPAN;
+            let qwen = if charge <= 3 {
+                wide_qwen()
+            } else {
+                QwenPlan::inactive(QwenRuntimeState::MemoryRejected)
+            };
+            Ok((qwen, pin_selection(5, ResidencyStop::NextLayerWouldExceedBudget), 0))
+        };
+        assert_eq!(
+            admit_pin_count(64, PIN_SPAN, pin_base(), &select, wide_qwen(), &reference, false),
+            3
+        );
+    }
+
+    #[test]
+    fn pin_admission_fails_closed_on_errors_and_overflow() {
+        let reference = pin_selection(93, ResidencyStop::AllLayersFit);
+        let failing = |_: FixedCosts| -> Result<(QwenPlan, ResidencySelection, u64)> {
+            Err(DeltafinError::new("probe failed"))
+        };
+        assert_eq!(
+            admit_pin_count(16, PIN_SPAN, pin_base(), &failing, wide_qwen(), &reference, true),
+            0
+        );
+        let accepting = |_: FixedCosts| -> Result<(QwenPlan, ResidencySelection, u64)> {
+            Ok((wide_qwen(), pin_selection(93, ResidencyStop::AllLayersFit), 0))
+        };
+        let saturated = FixedCosts {
+            host_bytes: u64::MAX - 1,
+            provider_bytes: 0,
+        };
+        assert_eq!(
+            admit_pin_count(16, PIN_SPAN, saturated, &accepting, wide_qwen(), &reference, true),
+            0
+        );
+    }
+
+    #[test]
+    fn an_explicitly_requested_prefix_outranks_the_pin_tier() {
+        for stop in [
+            ResidencyStop::AllLayersFit,
+            ResidencyStop::ExplicitLayerLimit,
+            ResidencyStop::ExplicitByteLimit,
+        ] {
+            assert!(pin_tier_keeps_resident_prefix(stop), "{stop:?}");
+        }
+        // A prefix the memory budget itself cut short is the only one that
+        // may give way, and an unusable selection protects nothing.
+        for stop in [
+            ResidencyStop::NextLayerWouldExceedBudget,
+            ResidencyStop::FixedCostsExceedBudget,
+            ResidencyStop::LayerCostUnknown,
+            ResidencyStop::HostBudgetUnknown,
+            ResidencyStop::DeviceBudgetUnknown,
+            ResidencyStop::InvalidPolicy,
+            ResidencyStop::ArithmeticOverflow,
+        ] {
+            assert!(!pin_tier_keeps_resident_prefix(stop), "{stop:?}");
+        }
+        // Forty of the ninety-three layers were requested by the operator;
+        // the fortieth is lost to an eleventh expert, so only ten are kept.
+        let reference = pin_selection(40, ResidencyStop::ExplicitLayerLimit);
+        let headroom = pin_base().host_bytes + 10 * PIN_SPAN;
+        let select = |fixed: FixedCosts| -> Result<(QwenPlan, ResidencySelection, u64)> {
+            let (layers, stop) = if fixed.host_bytes <= headroom {
+                (40, ResidencyStop::ExplicitLayerLimit)
+            } else {
+                (39, ResidencyStop::NextLayerWouldExceedBudget)
+            };
+            Ok((wide_qwen(), pin_selection(layers, stop), 0))
+        };
+        assert_eq!(
+            admit_pin_count(
+                300,
+                PIN_SPAN,
+                pin_base(),
+                &select,
+                wide_qwen(),
+                &reference,
+                pin_tier_keeps_resident_prefix(reference.stop),
+            ),
+            10
+        );
+    }
+
+    fn real_host(total_gib: u64, available_gib: u64) -> HostMemory {
+        HostMemory {
+            physical_bytes: Some(total_gib * GIB),
+            available_bytes: Some(available_gib * GIB),
+            cgroup_limit_bytes: None,
+            cgroup_available_bytes: None,
+            constraints_readable: true,
+        }
+    }
+
+    /// One K3 routed expert as the raw layout spans it.
+    const REAL_EXPERT_SPAN: u64 = 17_547_264;
+
+    #[test]
+    fn a_big_pin_budget_cannot_displace_a_spine_that_fits_on_a_large_host() {
+        // The host class of public issue #25 / PR #23: 128 GiB with about
+        // 103 GiB free, an int8-sized spine that fits with some room to spare
+        // and the wide Qwen drafter installed. Charging a 32 GB pin ceiling
+        // before selection collapsed the resident prefix; admitting it after
+        // selection must leave all 93 layers and the drafter alone.
+        let layers = vec![GIB / 2; 93];
+        let discovered = qwen_candidate_plan(Device::Mps, true, true, 8192, 8, 0);
+        assert_ne!(discovered.reserved_provider_bytes, 0);
+        let selector = PlanSelector {
+            host_memory: real_host(128, 103),
+            provider_memory: ProviderMemory::Unified {
+                recommended_working_set_bytes: Some(96 * GIB),
+                available_working_set_bytes: Some(96 * GIB),
+            },
+            provider_layer_bytes: &layers,
+            residency_override: ResidencyOverride::default(),
+            discovered_qwen: discovered,
+            device: Device::Mps,
+        };
+        let fixed = FixedCosts {
+            host_bytes: 20 * GIB,
+            provider_bytes: 2 * GIB,
+        };
+        let (reference_qwen, reference, _) = selector.select(fixed).unwrap();
+        assert_eq!(reference.stop, ResidencyStop::AllLayersFit);
+        assert_eq!(reference.resident_layers, 93);
+        assert_eq!(reference_qwen, discovered);
+        let select = |fixed: FixedCosts| selector.select(fixed);
+        for pin_gb in [8_u64, 16, 24, 32] {
+            let eligible = (pin_gb * 1_000_000_000 / REAL_EXPERT_SPAN) as usize;
+            let up_front = selector
+                .select(FixedCosts {
+                    host_bytes: fixed.host_bytes + eligible as u64 * REAL_EXPERT_SPAN,
+                    ..fixed
+                })
+                .unwrap();
+            if pin_gb >= 24 {
+                assert!(
+                    up_front.1.resident_layers < 93,
+                    "pin {pin_gb} GB charged up front must reproduce the displacement"
+                );
+            }
+            let admitted = admit_pin_count(
+                eligible,
+                REAL_EXPERT_SPAN,
+                fixed,
+                &select,
+                reference_qwen,
+                &reference,
+                pin_tier_keeps_resident_prefix(reference.stop),
+            );
+            let charged = |count: usize| FixedCosts {
+                host_bytes: fixed.host_bytes + count as u64 * REAL_EXPERT_SPAN,
+                ..fixed
+            };
+            let (qwen, residency, _) = selector.select(charged(admitted)).unwrap();
+            assert_eq!(residency.resident_layers, 93, "pin {pin_gb} GB");
+            assert_eq!(qwen, reference_qwen, "pin {pin_gb} GB");
+            if pin_gb >= 24 {
+                assert!(admitted < eligible, "headroom is finite: pin {pin_gb} GB");
+                assert!(admitted > 0, "some headroom remains: pin {pin_gb} GB");
+            }
+            if admitted < eligible {
+                // Maximal: one more expert would cost a layer or the drafter.
+                let (qwen, residency, _) = selector.select(charged(admitted + 1)).unwrap();
+                assert!(
+                    residency.resident_layers < 93 || qwen != reference_qwen,
+                    "pin {pin_gb} GB left admissible headroom unused"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pins_cannot_push_the_qwen_drafter_out_on_a_memory_tight_host() {
+        // The incident behind the ordering: a 64 GiB host whose matured auto
+        // roster (about 1,700 experts, 27 GiB) reserved up front left no room
+        // for the drafter, which was then memory-rejected along with the
+        // whole resident spine.
+        let layers = vec![(GIB * 6) / 10; 93];
+        let discovered = qwen_candidate_plan(Device::Mps, true, true, 8192, 8, 0);
+        let selector = PlanSelector {
+            host_memory: real_host(64, 50),
+            provider_memory: ProviderMemory::Unified {
+                recommended_working_set_bytes: Some(48 * GIB),
+                available_working_set_bytes: Some(48 * GIB),
+            },
+            provider_layer_bytes: &layers,
+            residency_override: ResidencyOverride::default(),
+            discovered_qwen: discovered,
+            device: Device::Mps,
+        };
+        let fixed = FixedCosts {
+            host_bytes: 6 * GIB,
+            provider_bytes: 3 * GIB,
+        };
+        let (reference_qwen, reference, _) = selector.select(fixed).unwrap();
+        assert_eq!(reference_qwen, discovered, "the drafter fits without pins");
+        assert!(
+            (1..93).contains(&reference.resident_layers),
+            "a partly resident spine: {}",
+            reference.resident_layers
+        );
+        assert!(!pin_tier_keeps_resident_prefix(reference.stop));
+        let roster = 1_700_usize;
+        let charged = |count: usize| FixedCosts {
+            host_bytes: fixed.host_bytes + count as u64 * REAL_EXPERT_SPAN,
+            ..fixed
+        };
+        let up_front = selector.select(charged(roster)).unwrap();
+        assert_ne!(
+            up_front.0, reference_qwen,
+            "charging the whole roster first must reproduce the lost drafter"
+        );
+        let admitted = admit_pin_count(
+            roster,
+            REAL_EXPERT_SPAN,
+            fixed,
+            &|fixed| selector.select(fixed),
+            reference_qwen,
+            &reference,
+            false,
+        );
+        assert!(admitted > 0 && admitted < roster, "admitted {admitted}");
+        let (qwen, residency, _) = selector.select(charged(admitted)).unwrap();
+        assert_eq!(qwen, reference_qwen);
+        assert!(qwen_residency_admitted(&residency));
+        // A partly resident spine may give way to pins, never the drafter.
+        assert!(residency.resident_layers <= reference.resident_layers);
+        let (qwen, residency, _) = selector.select(charged(admitted + 1)).unwrap();
+        assert!(
+            qwen != reference_qwen || !qwen_residency_admitted(&residency),
+            "one more expert still left the drafter and the proof intact"
+        );
+    }
+
+    #[test]
+    fn an_explicit_zero_layer_request_is_told_apart_from_an_over_budget_probe() {
+        // Zero resident layers means two different things: the operator asked
+        // for it, or fixed costs exceed the budget. Both report zero layers,
+        // so only the memory proof can bound admission.
+        let layers = vec![GIB; 93];
+        let selector = PlanSelector {
+            host_memory: real_host(64, 48),
+            provider_memory: ProviderMemory::Host,
+            provider_layer_bytes: &layers,
+            residency_override: ResidencyOverride {
+                requested_layers: Some(0),
+                requested_provider_bytes: None,
+            },
+            discovered_qwen: QwenPlan::inactive(QwenRuntimeState::NotInstalled),
+            device: Device::Cpu,
+        };
+        let fixed = FixedCosts {
+            host_bytes: 10 * GIB,
+            provider_bytes: 0,
+        };
+        let (qwen, reference, _) = selector.select(fixed).unwrap();
+        assert_eq!(reference.resident_layers, 0);
+        assert_eq!(reference.stop, ResidencyStop::ExplicitLayerLimit);
+        let charged = |count: usize| FixedCosts {
+            host_bytes: fixed.host_bytes + count as u64 * GIB,
+            ..fixed
+        };
+        let admitted = admit_pin_count(
+            100,
+            GIB,
+            fixed,
+            &|fixed| selector.select(fixed),
+            qwen,
+            &reference,
+            pin_tier_keeps_resident_prefix(reference.stop),
+        );
+        let expected = (0..=100)
+            .rev()
+            .find(|&count| {
+                selector.select(charged(count)).unwrap().1.stop == ResidencyStop::ExplicitLayerLimit
+            })
+            .unwrap();
+        assert!(expected > 0 && expected < 100, "expected {expected}");
+        assert_eq!(admitted, expected);
+        let over = selector.select(charged(expected + 1)).unwrap().1;
+        assert_eq!(over.resident_layers, 0, "the same layer count as the request");
+        assert_eq!(over.stop, ResidencyStop::FixedCostsExceedBudget);
+    }
+
+    #[test]
+    fn admitted_pin_counts_form_a_prefix_under_the_real_planning_chain() {
+        // Binary search is only sound if admission is monotone in the count.
+        // Check that claim exhaustively against the real selector across
+        // randomized hosts, spines, drafters and overrides.
+        const SPAN: u64 = 128 << 20;
+        const ELIGIBLE: usize = 128;
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for scenario in 0..24 {
+            let total = (16 + next() % 177) * GIB;
+            let available = total / 100 * (30 + next() % 70);
+            let layers: Vec<u64> = (0..93).map(|_| (200 + next() % 800) << 20).collect();
+            let provider_memory = match next() % 3 {
+                0 => ProviderMemory::Host,
+                1 => ProviderMemory::Unified {
+                    recommended_working_set_bytes: Some(total / 4 * 3),
+                    available_working_set_bytes: Some(available),
+                },
+                _ => ProviderMemory::Unified {
+                    recommended_working_set_bytes: None,
+                    available_working_set_bytes: None,
+                },
+            };
+            let residency_override = match next() % 4 {
+                0 => ResidencyOverride {
+                    requested_layers: Some(0),
+                    requested_provider_bytes: None,
+                },
+                1 => ResidencyOverride {
+                    requested_layers: Some((next() % 94) as usize),
+                    requested_provider_bytes: None,
+                },
+                _ => ResidencyOverride::default(),
+            };
+            let discovered_qwen = if next() % 2 == 0 {
+                qwen_candidate_plan(Device::Mps, true, true, 4096, 8, 0)
+            } else {
+                QwenPlan::inactive(QwenRuntimeState::NotInstalled)
+            };
+            let fixed = FixedCosts {
+                host_bytes: (1 + next() % 30) * GIB,
+                provider_bytes: (next() % 8) * GIB,
+            };
+            let selector = PlanSelector {
+                host_memory: HostMemory {
+                    physical_bytes: Some(total),
+                    available_bytes: Some(available),
+                    cgroup_limit_bytes: None,
+                    cgroup_available_bytes: None,
+                    constraints_readable: true,
+                },
+                provider_memory,
+                provider_layer_bytes: &layers,
+                residency_override,
+                discovered_qwen,
+                device: Device::Mps,
+            };
+            let select = |fixed: FixedCosts| selector.select(fixed);
+            let Ok((reference_qwen, reference, _)) = select(fixed) else {
+                continue;
+            };
+            for keep_spine in [false, true] {
+                let admitted: Vec<bool> = (0..=ELIGIBLE)
+                    .map(|count| {
+                        pin_count_admitted(
+                            count,
+                            SPAN,
+                            fixed,
+                            &select,
+                            reference_qwen,
+                            &reference,
+                            keep_spine,
+                        )
+                    })
+                    .collect();
+                assert!(admitted[0], "scenario {scenario}: zero pins always admit");
+                let end = admitted.iter().position(|ok| !ok).unwrap_or(admitted.len());
+                assert!(
+                    admitted[end..].iter().all(|ok| !ok),
+                    "scenario {scenario} keep_spine={keep_spine}: admission is not a prefix"
+                );
+                assert_eq!(
+                    admit_pin_count(
+                        ELIGIBLE,
+                        SPAN,
+                        fixed,
+                        &select,
+                        reference_qwen,
+                        &reference,
+                        keep_spine
+                    ),
+                    end - 1,
+                    "scenario {scenario} keep_spine={keep_spine}"
+                );
+            }
+        }
     }
 }

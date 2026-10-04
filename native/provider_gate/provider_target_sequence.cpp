@@ -1,5 +1,7 @@
 #include "provider_target_sequence.h"
 
+#include "provider_eagle3.h"
+
 #include "provider_cuda_moe.h"
 #include "provider_kda_batch.h"
 
@@ -8,10 +10,13 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -79,8 +84,14 @@ struct SequenceCacheStage {
   std::uint32_t layer_index = 0;
   TargetKdaCache* kda_cache = nullptr;
   std::uint64_t expected_kda_version = 0;
+  /* The state after every row. An ordinary multi-row verify keeps it in the
+   * boundary form (convolution windows as views of the sources). */
   KdaState final_kda_state;
-  std::vector<KdaState> kda_boundaries;
+  /* Ordinary multi-row verify only: the recurrence inputs that rebuild the
+   * state after any accepted prefix, instead of one state per row. */
+  KdaRecurrenceRecord kda_record;
+  /* Set by stage_kda_prefix_states for an ordinary verify commit. */
+  KdaState prefix_kda_state;
   std::unique_ptr<MlaCacheTransaction> mla;
 };
 
@@ -105,6 +116,26 @@ struct PendingSequenceLayer {
   std::size_t next_expert_row = 0;
   bool expert_backend_decided = false;
   bool whole_layer_metal_staging = false;
+  /* Expert early drain, single-position layers only. Nonzero while this
+   * layer's experts are being computed as their bytes arrive; consumed or
+   * abandoned by the layer's one finish call, never carried across layers. */
+  std::uint64_t expert_stage_token = 0;
+};
+
+/*
+ * Releases an early-drain staging token exactly once, on every path out of the
+ * finish call. Abandoning an already-consumed token is defined and free, so
+ * this needs no bookkeeping about which way the call went.
+ */
+struct StagedExpertToken {
+  std::uint64_t token = 0;
+
+  explicit StagedExpertToken(const std::uint64_t value) : token(value) {}
+  StagedExpertToken(const StagedExpertToken&) = delete;
+  StagedExpertToken& operator=(const StagedExpertToken&) = delete;
+  StagedExpertToken(StagedExpertToken&&) = delete;
+  StagedExpertToken& operator=(StagedExpertToken&&) = delete;
+  ~StagedExpertToken() { abandon_staged_routed_moe_t1(token); }
 };
 
 std::optional<at::Tensor> recover_contiguous_row_carrier(
@@ -145,10 +176,15 @@ class TargetSequenceTape::Impl {
  public:
   Impl(const TargetPositionBindings& bindings, at::Tensor input_hidden_rows,
        const TargetSequenceMode mode, const bool capture_dspark_rows,
-       const bool full_commit_only)
+       const bool full_commit_only, const bool capture_eagle3_rows)
       : mode_(mode),
         exact_k3_(bindings.contract == TargetTapeContract::ExactK3),
-        capture_dspark_rows_(capture_dspark_rows),
+        capture_dspark_rows_(capture_dspark_rows || capture_eagle3_rows),
+        capture_layers_(capture_eagle3_rows
+                            ? std::span<const std::uint32_t>(
+                                  kEagle3TargetCaptureLayers)
+                            : std::span<const std::uint32_t>(
+                                  kDSparkTargetCaptureLayers)),
         full_commit_only_(full_commit_only),
         tail_(bindings.tail),
         pilot_routers_(bindings.pilot_routers) {
@@ -339,6 +375,72 @@ class TargetSequenceTape::Impl {
         options);
   }
 
+  /*
+   * Start the arrived experts' independent work now. Everything here is
+   * best-effort: a false return leaves the layer exactly as it was, and even
+   * an accepted batch is only a head start -- finish_expert_tile owns the
+   * authoritative route, the weights, and the single ordered reduction.
+   */
+  bool stage_expert_spans(const std::uint16_t first_row,
+                          const std::uint16_t row_count,
+                          const std::uint64_t spine_generation,
+                          const CanonicalExpertPositionTileT1& experts,
+                          const MoeRunOptions& options) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (state_ != TargetSequenceState::WaitingForExperts || pending_ == nullptr ||
+        position_count_ != 1 || first_row != 0 || row_count != 1 ||
+        pending_->next_expert_row != 0 ||
+        spine_generation != pending_->spine.generation ||
+        spine_generation != mailbox_.spine_generation ||
+        experts.expert_span_pointers.empty() ||
+        experts.expert_ids.size() != experts.expert_span_pointers.size() ||
+        !experts.expert_major_bytes.empty() ||
+        !pending_->rows[0].has_value() ||
+        pending_->rows[0]->moe.spine_generation != spine_generation) {
+      ++stats_.expert_stage_declines;
+      return false;
+    }
+    try {
+      PreparedMoeT1& prepared = pending_->rows[0]->moe;
+      if (pending_->expert_stage_token == 0) {
+        // The staged kernels read the routed activation row from host memory,
+        // so materialize it once here and let the finish call reuse the exact
+        // same bytes instead of crossing the boundary a second time.
+        if (!prepared.routed_input_cpu.defined()) {
+          prepared.routed_input_cpu =
+              prepared.routed_input.to(at::kCPU, at::kFloat).contiguous();
+          ++stats_.moe_routed_input_host_transfers;
+        }
+        const std::uint64_t token = begin_staged_routed_moe_t1(
+            prepared, prepared.routed_input_cpu, options);
+        if (token == 0) {
+          ++stats_.expert_stage_declines;
+          return false;
+        }
+        pending_->expert_stage_token = token;
+        ++stats_.expert_stage_layers;
+      }
+      if (!stage_routed_moe_edges_t1(
+              pending_->expert_stage_token, prepared, experts.expert_ids,
+              experts.expert_span_pointers, experts.layout,
+              experts.expert_span_bytes, options)) {
+        ++stats_.expert_stage_declines;
+        return false;
+      }
+      stats_.expert_stage_experts += experts.expert_ids.size();
+      return true;
+    } catch (...) {
+      // Staging must never be able to fail a generation. Drop the token and
+      // let the ordinary finish path compute the whole layer.
+      if (pending_ != nullptr && pending_->expert_stage_token != 0) {
+        abandon_staged_routed_moe_t1(pending_->expert_stage_token);
+        pending_->expert_stage_token = 0;
+      }
+      ++stats_.expert_stage_declines;
+      return false;
+    }
+  }
+
   void finish_expert_tile(
       const std::uint16_t first_row, const std::uint16_t row_count,
       const std::uint64_t spine_generation,
@@ -423,6 +525,13 @@ class TargetSequenceTape::Impl {
             pending_->whole_layer_metal_staging && selects_metal;
       }
 
+      // Hand any early-drain staging to this one call, and take it off the
+      // layer first: whether the call consumes it, ignores it, or throws, the
+      // token is released exactly once below.
+      execution_options.metal_staged_token = pending_->expert_stage_token;
+      const std::uint64_t staged_token = pending_->expert_stage_token;
+      pending_->expert_stage_token = 0;
+      const StagedExpertToken staged_guard{staged_token};
       const at::Tensor routed_outputs = execute_routed_moe_positions_t1(
           std::span<const PreparedMoeT1* const>(prepared.data(), row_count),
           experts, execution_options);
@@ -642,8 +751,7 @@ class TargetSequenceTape::Impl {
     require_state(TargetSequenceState::ReadyToCommit,
                   "read DSpark target auxiliary rows");
     if (!capture_dspark_rows_ || dspark_capture_failed_ ||
-        captured_dspark_layers_ !=
-                                     kDSparkTargetCaptureLayers.size()) {
+        captured_dspark_layers_ != capture_layers_.size()) {
       throw std::logic_error(
           "target sequence did not capture the complete DSpark layer roster");
     }
@@ -653,7 +761,7 @@ class TargetSequenceTape::Impl {
         !dspark_rows_.is_contiguous() || dspark_rows_.dim() != 2 ||
         dspark_rows_.size(0) != static_cast<std::int64_t>(position_count_) ||
         dspark_rows_.size(1) !=
-            static_cast<std::int64_t>(kDSparkTargetCaptureLayers.size()) *
+            static_cast<std::int64_t>(capture_layers_.size()) *
                 hidden) {
       throw std::logic_error(
           "target sequence retained an invalid DSpark target capture");
@@ -674,10 +782,12 @@ class TargetSequenceTape::Impl {
             "prefill and full-commit-only verify require the full sequence; ordinary verify accepts a bounded prefix");
       }
       preflight_commit(positions);
+      stage_kda_prefix_states(positions);
 
       // No operation below this point can throw: every pointer/version/shape
-      // was checked across all 93 caches first, tensor handle moves are
-      // noexcept, and MLA publication has its own no-throw half.
+      // was checked across all 93 caches first, every published KDA state
+      // already exists, tensor handle moves are noexcept, and MLA
+      // publication has its own no-throw half.
       for (auto& stage : stages_) {
         if (stage->kind == SequenceCacheStage::Kind::Mla) {
           stage->mla->publish_prefix_noexcept(positions);
@@ -690,7 +800,7 @@ class TargetSequenceTape::Impl {
         if (mode_ == TargetSequenceMode::Prefill || full_commit_only_) {
           selected = &stage->final_kda_state;
         } else {
-          selected = &stage->kda_boundaries[positions - 1];
+          selected = &stage->prefix_kda_state;
         }
         stage->kda_cache->state = std::move(*selected);
         stage->kda_cache->version =
@@ -805,7 +915,49 @@ class TargetSequenceTape::Impl {
     require_wide_carrier_aliases();
   }
 
+  // Diagnostic only (DELTAFIN_EAGLE3_TAP_DUMP=<directory>): append every
+  // row's completed-layer hidden state at the EAGLE-3 capture layers, as raw
+  // fp32, to <directory>/L<layer>.f32 so an offline reference can measure a
+  // drafter's acceptance against real K3 states. Never affects execution.
+  void dump_eagle3_taps(const std::uint32_t layer_index) noexcept {
+    static const char* const directory = std::getenv("DELTAFIN_EAGLE3_TAP_DUMP");
+    if (directory == nullptr || directory[0] == '\0' ||
+        (layer_index != 1 && layer_index != 45 && layer_index != 89)) {
+      return;
+    }
+    try {
+      const std::string path = std::string(directory) + "/L" +
+                               std::to_string(layer_index) + ".f32";
+      std::FILE* file = std::fopen(path.c_str(), "ab");
+      if (file == nullptr) {
+        return;
+      }
+      for (const SequenceRow& row : rows_) {
+        if (!row.hidden.defined()) {
+          continue;
+        }
+        const at::Tensor host =
+            row.hidden.to(at::kCPU).to(at::kFloat).contiguous();
+        std::fwrite(host.data_ptr<float>(), sizeof(float),
+                    static_cast<std::size_t>(host.numel()), file);
+      }
+      std::fclose(file);
+      if (layer_index == 1) {
+        // One line per target chunk: how many rows it carried. Committed
+        // rows are each chunk's leading rows; the event stream says how many.
+        std::FILE* chunks =
+            std::fopen((std::string(directory) + "/chunks.txt").c_str(), "a");
+        if (chunks != nullptr) {
+          std::fprintf(chunks, "%zu\n", rows_.size());
+          std::fclose(chunks);
+        }
+      }
+    } catch (...) {
+    }
+  }
+
   void capture_completed_layer(const std::uint32_t layer_index) noexcept {
+    dump_eagle3_taps(layer_index);
     if (!capture_dspark_rows_ || dspark_capture_failed_) {
       return;
     }
@@ -813,14 +965,14 @@ class TargetSequenceTape::Impl {
       if (position_count_ > 1) {
         require_wide_carrier_aliases();
       }
-      const auto found = std::find(kDSparkTargetCaptureLayers.begin(),
-                                   kDSparkTargetCaptureLayers.end(),
+      const auto found = std::find(capture_layers_.begin(),
+                                   capture_layers_.end(),
                                    layer_index);
-      if (found == kDSparkTargetCaptureLayers.end()) {
+      if (found == capture_layers_.end()) {
         return;
       }
       const std::size_t capture_index = static_cast<std::size_t>(
-          std::distance(kDSparkTargetCaptureLayers.begin(), found));
+          std::distance(capture_layers_.begin(), found));
       if (capture_index != captured_dspark_layers_) {
         throw std::logic_error(
             "target sequence DSpark capture layers are out of schedule order");
@@ -829,7 +981,7 @@ class TargetSequenceTape::Impl {
       if (!dspark_rows_.defined()) {
         dspark_rows_ = at::empty(
             {static_cast<std::int64_t>(position_count_),
-             static_cast<std::int64_t>(kDSparkTargetCaptureLayers.size()) *
+             static_cast<std::int64_t>(capture_layers_.size()) *
                  hidden},
             at::TensorOptions().dtype(at::kBFloat16).device(
                 rows_.front().hidden.device()));
@@ -981,9 +1133,6 @@ class TargetSequenceTape::Impl {
     stage.kind = SequenceCacheStage::Kind::Kda;
     stage.kda_cache = cache.kda_cache;
     stage.expected_kda_version = cache.kda_cache->version;
-    if (mode_ == TargetSequenceMode::Verify && !full_commit_only_) {
-      stage.kda_boundaries.reserve(position_count_);
-    }
     KdaState working = cache.kda_cache->state;
     if (position_count_ == 1) {
       SequenceRow& row = rows_.front();
@@ -995,21 +1144,16 @@ class TargetSequenceTape::Impl {
       std::vector<TargetMlpInput> mlp_inputs;
       mlp_inputs.push_back(prepare_target_mlp(
           attention, decoded.output, *binding.residual, exact_k3_));
+      working = std::move(decoded.next_state);
+      const std::uint64_t bytes = kda_state_bytes(working);
       if (mode_ == TargetSequenceMode::Verify && !full_commit_only_) {
-        const std::uint64_t bytes = kda_state_bytes(decoded.next_state);
+        // One row: its only boundary is the final state.
         stats_.verify_snapshot_bytes = checked_add(
             stats_.verify_snapshot_bytes, bytes, "verify snapshot");
-        stats_.staged_kda_storage_bytes = checked_add(
-            stats_.staged_kda_storage_bytes, bytes, "staged KDA");
-        stage.kda_boundaries.push_back(decoded.next_state);
       }
-      working = std::move(decoded.next_state);
-      if (mode_ == TargetSequenceMode::Prefill || full_commit_only_) {
-        stats_.staged_kda_storage_bytes = checked_add(
-            stats_.staged_kda_storage_bytes, kda_state_bytes(working),
-            "staged KDA");
-        stage.final_kda_state = working;
-      }
+      stats_.staged_kda_storage_bytes = checked_add(
+          stats_.staged_kda_storage_bytes, bytes, "staged KDA");
+      stage.final_kda_state = working;
       prepare_mlp_rows(binding, std::move(mlp_inputs), routed);
     } else {
       require_wide_carrier_aliases();
@@ -1042,6 +1186,8 @@ class TargetSequenceTape::Impl {
           dependent.dependent_provider_dispatches;
       stats_.kda_dependent_equivalent_rowwise_dispatches +=
           dependent.dependent_equivalent_rowwise_dispatches;
+      const bool ordinary_verify =
+          mode_ == TargetSequenceMode::Verify && !full_commit_only_;
       KdaPositionsRecurrentResult recurrence =
           kda_recur_convolved_positions(
               normalized_hidden, *binding.kda_weights, working, convolved,
@@ -1050,22 +1196,27 @@ class TargetSequenceTape::Impl {
                   .feature_b = dependent.feature_b,
                   .beta = dependent.beta,
               },
-              mode_ == TargetSequenceMode::Verify && !full_commit_only_,
-              exact_k3_);
+              false, exact_k3_,
+              ordinary_verify ? &stage.kda_record : nullptr);
       stats_.kda_recurrent_rows += position_count_;
-      if (mode_ == TargetSequenceMode::Verify && !full_commit_only_) {
-        if (recurrence.boundaries.size() != position_count_) {
+      if (ordinary_verify) {
+        if (stage.kda_record.positions !=
+            static_cast<std::int64_t>(position_count_)) {
           throw std::logic_error(
-              "KDA position recurrence lost a verify boundary");
+              "KDA position recurrence lost its verify record");
         }
-        for (const KdaState& boundary : recurrence.boundaries) {
-          const std::uint64_t bytes = kda_state_bytes(boundary);
-          stats_.verify_snapshot_bytes = checked_add(
-              stats_.verify_snapshot_bytes, bytes, "verify snapshot");
-          stats_.staged_kda_storage_bytes = checked_add(
-              stats_.staged_kda_storage_bytes, bytes, "staged KDA");
-        }
-        stage.kda_boundaries = std::move(recurrence.boundaries);
+        // Publishing every row keeps the boundary form an ordinary verify
+        // has always published: convolution windows as source views.
+        stage.final_kda_state =
+            kda_boundary_view(stage.kda_record, recurrence.final_state);
+        const std::uint64_t record_bytes =
+            kda_recurrence_record_bytes(stage.kda_record);
+        stats_.verify_snapshot_bytes = checked_add(
+            stats_.verify_snapshot_bytes, record_bytes, "verify snapshot");
+        stats_.staged_kda_storage_bytes = checked_add(
+            checked_add(stats_.staged_kda_storage_bytes, record_bytes,
+                        "staged KDA"),
+            kda_state_bytes(stage.final_kda_state), "staged KDA");
       }
       working = std::move(recurrence.final_state);
       KdaBatchOutputProjection outputs = kda_finish_output_batch(
@@ -1354,6 +1505,45 @@ class TargetSequenceTape::Impl {
     stats_.pilot_prediction_rows += position_count_;
   }
 
+  /* The boundary-form state after every row of a recorded recurrence. */
+  static KdaState kda_boundary_view(const KdaRecurrenceRecord& record,
+                                    const KdaState& final_state) {
+    const std::int64_t start = record.positions - 1;
+    return KdaState{
+        record.query_source.narrow(2, start, record.convolution_width),
+        record.key_source.narrow(2, start, record.convolution_width),
+        record.value_source.narrow(2, start, record.convolution_width),
+        final_state.recurrent,
+    };
+  }
+
+  /*
+   * Ordinary verify: materialize the state each KDA cache publishes for a
+   * `positions`-row commit before anything is published. A shorter prefix
+   * replays the accepted rows from the recorded inputs; each layer drops
+   * its full-sequence state as it goes, so the peak stays one generation.
+   * A throw here leaves every cache untouched and the sequence aborts.
+   */
+  void stage_kda_prefix_states(const std::size_t positions) {
+    if (mode_ != TargetSequenceMode::Verify || full_commit_only_ ||
+        positions == 0) {
+      return;
+    }
+    for (auto& stage : stages_) {
+      if (stage->kind != SequenceCacheStage::Kind::Kda) {
+        continue;
+      }
+      if (positions == position_count_) {
+        stage->prefix_kda_state = stage->final_kda_state;
+      } else {
+        stage->prefix_kda_state = kda_replay_recorded_state(
+            stage->kda_record, static_cast<std::int64_t>(positions));
+        stage->final_kda_state = KdaState{};
+      }
+      stage->kda_record = KdaRecurrenceRecord{};
+    }
+  }
+
   void preflight_commit(const std::size_t positions) const {
     std::size_t kda_count = 0;
     std::size_t mla_count = 0;
@@ -1380,13 +1570,14 @@ class TargetSequenceTape::Impl {
         throw std::invalid_argument(
             "target sequence KDA cache became stale before commit");
       }
-      if (mode_ == TargetSequenceMode::Verify && !full_commit_only_) {
-        if (stage->kda_boundaries.size() != position_count_) {
-          throw std::logic_error(
-              "target sequence verify lost a KDA row boundary");
-        }
-      } else if (positions != 0 &&
-                 !stage->final_kda_state.recurrent.defined()) {
+      if (mode_ == TargetSequenceMode::Verify && !full_commit_only_ &&
+          position_count_ > 1 &&
+          stage->kda_record.positions !=
+              static_cast<std::int64_t>(position_count_)) {
+        throw std::logic_error(
+            "target sequence verify lost its KDA prefix record");
+      }
+      if (positions != 0 && !stage->final_kda_state.recurrent.defined()) {
         throw std::logic_error(
             "target sequence full publication lost its final KDA state");
       }
@@ -1411,6 +1602,12 @@ class TargetSequenceTape::Impl {
         state_ == TargetSequenceState::Cancelled) {
       return;
     }
+    // A layer torn down mid-drain still owns staged GPU work reading caller
+    // memory. Abandoning drains it before that memory can be retired.
+    if (pending_ != nullptr && pending_->expert_stage_token != 0) {
+      abandon_staged_routed_moe_t1(pending_->expert_stage_token);
+      pending_->expert_stage_token = 0;
+    }
     pending_.reset();
     stages_.clear();
     rows_.clear();
@@ -1427,6 +1624,9 @@ class TargetSequenceTape::Impl {
   TargetSequenceMode mode_ = TargetSequenceMode::Prefill;
   bool exact_k3_ = true;
   bool capture_dspark_rows_ = false;
+  /* Layers whose completed rows a proposal model consumes: DSpark's five
+   * public boundaries, or EAGLE-3's three. */
+  std::span<const std::uint32_t> capture_layers_;
   bool full_commit_only_ = false;
   bool dspark_capture_failed_ = false;
   const TargetTailWeights* tail_ = nullptr;
@@ -1456,10 +1656,15 @@ class TargetSequenceTape::Impl {
 TargetSequenceTape::TargetSequenceTape(
     const TargetPositionBindings& bindings, at::Tensor input_hidden_rows,
     const TargetSequenceMode mode, const bool capture_dspark_rows,
-    const bool full_commit_only)
+    const bool full_commit_only, const bool capture_eagle3_rows)
     : impl_(std::make_unique<Impl>(bindings, std::move(input_hidden_rows),
                                    mode, capture_dspark_rows,
-                                   full_commit_only)) {}
+                                   full_commit_only, capture_eagle3_rows)) {
+  if (capture_dspark_rows && capture_eagle3_rows) {
+    throw std::invalid_argument(
+        "a target sequence captures rows for one proposal model at most");
+  }
+}
 
 TargetSequenceTape::~TargetSequenceTape() = default;
 
@@ -1481,6 +1686,15 @@ void TargetSequenceTape::finish_expert_row(
     const std::uint16_t row_index, const std::uint64_t spine_generation,
     const CanonicalExpertBatchT1& experts, const MoeRunOptions& options) {
   impl_->finish_expert_row(row_index, spine_generation, experts, options);
+}
+
+bool TargetSequenceTape::stage_expert_spans(
+    const std::uint16_t first_row, const std::uint16_t row_count,
+    const std::uint64_t spine_generation,
+    const CanonicalExpertPositionTileT1& experts,
+    const MoeRunOptions& options) {
+  return impl_->stage_expert_spans(first_row, row_count, spine_generation,
+                                   experts, options);
 }
 
 void TargetSequenceTape::finish_expert_tile(

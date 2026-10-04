@@ -5,9 +5,8 @@
 //! speculative transaction that emits more than one authoritative token.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -15,6 +14,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use crate::error::{DeltafinError, Result};
+use crate::sys::fs::{self as sys_fs, Open};
 
 pub const EVENT_SCHEMA: &str = "deltafin.run_event.v1";
 pub(crate) const MAX_EVENT_STREAM_BYTES: u64 = 128 * 1024 * 1024;
@@ -60,7 +60,7 @@ impl RunEventLog {
         {
             fs::create_dir_all(parent)
                 .map_err(|error| io_error("create event directory", parent, error))?;
-            let metadata = fs::symlink_metadata(parent)
+            let metadata = sys_fs::lstat(parent)
                 .map_err(|error| io_error("inspect event directory", parent, error))?;
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
                 return Err(DeltafinError::new(format!(
@@ -69,11 +69,11 @@ impl RunEventLog {
                 )));
             }
         }
-        let file = OpenOptions::new()
+        let file = Open::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .custom_flags(open_nofollow_cloexec())
+            .no_follow()
             .open(path)
             .map_err(|error| io_error("exclusively create event stream", path, error))?;
         Ok(Self {
@@ -343,16 +343,6 @@ impl Drop for RunEventLog {
             let _ = file.flush();
         }
     }
-}
-
-#[cfg(target_os = "macos")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x0100_0000 | 0x0000_0100
-}
-
-#[cfg(target_os = "linux")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x0008_0000 | 0x0002_0000
 }
 
 fn io_error(operation: &str, path: &Path, error: io::Error) -> DeltafinError {

@@ -240,6 +240,7 @@ dependencies = [
  "base64 0.22.1",
  "curl",
  "deltafin-native-build",
+ "deltafin-sys",
  "half",
  "libc",
  "regex",
@@ -258,6 +259,7 @@ name = "deltafin-bootstrap"
 version = "0.1.0"
 dependencies = [
  "curl",
+ "deltafin-sys",
  "libc",
  "sha2",
  "zip",
@@ -268,8 +270,18 @@ name = "deltafin-native-build"
 version = "0.1.0"
 dependencies = [
  "deltafin-bootstrap",
+ "deltafin-sys",
+ "find-msvc-tools",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "deltafin-sys"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys",
 ]
 
 [[package]]

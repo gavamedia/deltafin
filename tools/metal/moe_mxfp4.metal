@@ -336,6 +336,75 @@ kernel void moe_glu_batch_scale4(
       experts[e].blob, D, x, h + (ulong)e * D.I + o0, o0, lane);
 }
 
+// ---------------------------------------------------------------------------
+// slot-mapped: one dispatch covers an arbitrary SUBSET of a layer's edges.
+// Argument-buffer entry i owns output slice slots[i], so a caller whose expert
+// bytes arrive a few at a time can compute each group in one dispatch without
+// moving anyone's result. Every row still runs the same glu_rows/w2_rows over
+// the same bytes into the same slice as the whole-layer form -- which edges
+// share a dispatch cannot change a value.
+// ---------------------------------------------------------------------------
+kernel void moe_glu_slots(device const ExpertRef *experts [[buffer(0)]],
+                          device const float *x           [[buffer(1)]],
+                          device float *h                 [[buffer(2)]],
+                          constant MoeDims &D             [[buffer(3)]],
+                          device const uint *slots        [[buffer(4)]],
+                          uint tg   [[threadgroup_position_in_grid]],
+                          uint lane [[thread_index_in_simdgroup]],
+                          uint sg   [[simdgroup_index_in_threadgroup]]) {
+  uint r0 = ROW0(tg, sg);
+  if (r0 >= D.nt) return;
+  uint i = r0 / D.I, o0 = r0 % D.I;
+  glu_rows(experts[i].blob, D, x, h + (ulong)slots[i] * D.I + o0, o0, lane);
+}
+
+kernel void moe_glu_slots_scale4(
+                          device const ExpertRef *experts [[buffer(0)]],
+                          device const float *x           [[buffer(1)]],
+                          device float *h                 [[buffer(2)]],
+                          constant MoeDims &D             [[buffer(3)]],
+                          device const uint *slots        [[buffer(4)]],
+                          uint tg   [[threadgroup_position_in_grid]],
+                          uint lane [[thread_index_in_simdgroup]],
+                          uint sg   [[simdgroup_index_in_threadgroup]]) {
+  uint r0 = ROW0(tg, sg);
+  if (r0 >= D.nt) return;
+  uint i = r0 / D.I, o0 = r0 % D.I;
+  glu_rows_scale4(
+      experts[i].blob, D, x, h + (ulong)slots[i] * D.I + o0, o0, lane);
+}
+
+kernel void moe_w2_slots(device const ExpertRef *experts [[buffer(0)]],
+                         device const float *h           [[buffer(1)]],
+                         device float *y                 [[buffer(2)]],
+                         constant MoeDims &D             [[buffer(3)]],
+                         device const uint *slots        [[buffer(4)]],
+                         uint tg   [[threadgroup_position_in_grid]],
+                         uint lane [[thread_index_in_simdgroup]],
+                         uint sg   [[simdgroup_index_in_threadgroup]]) {
+  uint r0 = ROW0(tg, sg);
+  if (r0 >= D.nt) return;
+  uint i = r0 / D.H, o0 = r0 % D.H;
+  w2_rows(experts[i].blob, D, h + (ulong)slots[i] * D.I,
+          y + (ulong)slots[i] * D.H + o0, o0, lane);
+}
+
+kernel void moe_w2_slots_scale4(
+                         device const ExpertRef *experts [[buffer(0)]],
+                         device const float *h           [[buffer(1)]],
+                         device float *y                 [[buffer(2)]],
+                         constant MoeDims &D             [[buffer(3)]],
+                         device const uint *slots        [[buffer(4)]],
+                         uint tg   [[threadgroup_position_in_grid]],
+                         uint lane [[thread_index_in_simdgroup]],
+                         uint sg   [[simdgroup_index_in_threadgroup]]) {
+  uint r0 = ROW0(tg, sg);
+  if (r0 >= D.nt) return;
+  uint i = r0 / D.H, o0 = r0 % D.H;
+  w2_rows_scale4(experts[i].blob, D, h + (ulong)slots[i] * D.I,
+                 y + (ulong)slots[i] * D.H + o0, o0, lane);
+}
+
 // Cross-position form: the flattened expert edge remains the independent work
 // unit, but each edge reads the activation row that owns it.  This lets one
 // dispatch cover every edge from every verifier position without changing a

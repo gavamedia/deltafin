@@ -7,15 +7,15 @@
 //! shapes, byte ranges, shard identities, and per-shard contiguity.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{Read, Write};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{DeltafinError, Result};
 use crate::packfile::{Digest, digest_bytes};
+use crate::sys::fs as sys_fs;
 
 pub const INVENTORY_FILENAME: &str = "tensor_inventory_offsets.json";
 pub const PINNED_INVENTORY_BYTES: u64 = 108_581_016;
@@ -314,7 +314,7 @@ fn parse_shard_name(name: &str) -> Result<usize> {
 }
 
 fn read_authenticated_inventory(path: &Path) -> Result<Vec<u8>> {
-    let before = fs::symlink_metadata(path)
+    let before = sys_fs::lstat(path)
         .map_err(|error| io_error("inspect K3 tensor inventory", path, error))?;
     if before.file_type().is_symlink() || !before.is_file() {
         return Err(DeltafinError::new(format!(
@@ -330,8 +330,7 @@ fn read_authenticated_inventory(path: &Path) -> Result<Vec<u8>> {
     }
     let mut file =
         File::open(path).map_err(|error| io_error("open K3 tensor inventory", path, error))?;
-    let opened = file
-        .metadata()
+    let opened = sys_fs::fstat(&file)
         .map_err(|error| io_error("stat opened K3 tensor inventory", path, error))?;
     if !opened.is_file()
         || opened.dev() != before.dev()
@@ -348,8 +347,7 @@ fn read_authenticated_inventory(path: &Path) -> Result<Vec<u8>> {
     let mut raw = Vec::with_capacity(capacity);
     file.read_to_end(&mut raw)
         .map_err(|error| io_error("read K3 tensor inventory", path, error))?;
-    let after = file
-        .metadata()
+    let after = sys_fs::fstat(&file)
         .map_err(|error| io_error("restat opened K3 tensor inventory", path, error))?;
     if after.dev() != opened.dev()
         || after.ino() != opened.ino()
@@ -377,6 +375,7 @@ fn io_error(operation: &str, path: &Path, error: std::io::Error) -> DeltafinErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn tiny_document() -> InventoryDocument {
         (1..=SHARD_COUNT)

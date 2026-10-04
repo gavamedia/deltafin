@@ -473,9 +473,31 @@ pub fn probe_host_memory() -> HostMemory {
             Path::new("/sys/fs/cgroup"),
         )
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    {
+        probe_windows_memory()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         HostMemory::unknown()
+    }
+}
+
+/// Windows: `GlobalMemoryStatusEx` for physical and available memory, and a
+/// job-object memory limit (how a container caps a process) as the analogue
+/// of a Linux cgroup limit. An unreadable kernel answer stays unknown, which
+/// the planner treats as "no resident layers", never as "all of RAM".
+#[cfg(windows)]
+fn probe_windows_memory() -> HostMemory {
+    let Some(memory) = deltafin_sys::memory::system_memory() else {
+        return HostMemory::unknown();
+    };
+    HostMemory {
+        physical_bytes: Some(memory.physical_bytes),
+        available_bytes: Some(memory.available_bytes),
+        cgroup_limit_bytes: memory.job_limit_bytes,
+        cgroup_available_bytes: None,
+        constraints_readable: true,
     }
 }
 

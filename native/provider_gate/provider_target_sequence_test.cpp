@@ -1411,15 +1411,33 @@ std::uint64_t expected_verify_snapshot_bytes(const std::size_t positions) {
   return one_kda_state * kTargetKdaLayerCount * positions;
 }
 
+/* A multi-row verify keeps, per KDA layer, the recurrence inputs that
+ * rebuild any accepted prefix: decay/key/value rows, beta, and the three
+ * convolution sources. */
+std::uint64_t expected_verify_record_bytes(const std::size_t positions) {
+  const std::uint64_t rows = positions;
+  const std::uint64_t per_layer =
+      (3ULL * rows * kKdaProjection + rows * kKdaHeads +
+       3ULL * kKdaProjection * (kKdaConvolution - 1 + rows)) *
+      sizeof(float);
+  return per_layer * kTargetKdaLayerCount;
+}
+
 void require_exact_verify_snapshot_accounting(
     const TargetSequenceStats& stats, const std::size_t positions) {
-  const std::uint64_t expected =
-      expected_verify_snapshot_bytes(positions);
+  const std::uint64_t one_generation = expected_verify_snapshot_bytes(1);
+  // One row's only boundary is its final state; more rows keep the final
+  // state plus a prefix record instead of one state per row.
+  const std::uint64_t retained =
+      positions == 1 ? one_generation
+                     : expected_verify_record_bytes(positions);
+  const std::uint64_t staged =
+      positions == 1 ? one_generation : retained + one_generation;
   if (stats.positions != positions ||
-      stats.verify_snapshot_bytes != expected ||
-      stats.staged_kda_storage_bytes != expected) {
+      stats.verify_snapshot_bytes != retained ||
+      stats.staged_kda_storage_bytes != staged) {
     throw std::runtime_error(
-        "verify KDA boundary snapshot accounting is not exact");
+        "verify KDA prefix record accounting is not exact");
   }
 }
 
@@ -1571,7 +1589,7 @@ void test_full_commit_only_begin_abi_gate() {
       DELTAFIN_PROVIDER_TARGET_SEQUENCE_PREFILL_V1,
       DELTAFIN_PROVIDER_TARGET_SEQUENCE_FULL_COMMIT_ONLY_V1,
       "full-commit-only requires verify mode");
-  require_rejected(DELTAFIN_PROVIDER_TARGET_SEQUENCE_VERIFY_V1, 1u << 2,
+  require_rejected(DELTAFIN_PROVIDER_TARGET_SEQUENCE_VERIFY_V1, 1u << 3,
                    "invalid rows/flags/reserved fields");
   require_rejected(99, 0, "mode is unknown");
 }

@@ -1,9 +1,8 @@
 //! Resumable native builder for a lossless `K3SC4V2` expert corpus.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,10 +11,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::manifest::{ManifestRow, Scale4Manifest, manifest_bytes};
 use super::{
     FILE_BYTES, HEADER_BYTES, SOURCE_BYTES, SourceIdentity, cache_neutral, drop_completed_cache,
-    encode_raw_expert, open_nofollow_cloexec, parse_header, record_digest, source_identity,
+    encode_raw_expert, parse_header, record_digest, source_identity,
 };
 use crate::error::{DeltafinError, Result};
 use crate::trusted_download::{fsync_directory, publish_hard_link, secure_create_new};
+use crate::sys::fs::{self as sys_fs, Open};
 
 const FIRST_LAYER: u32 = 1;
 const LAST_LAYER: u32 = 92;
@@ -82,7 +82,7 @@ pub fn convert_for_raw_names(
     validate_source_set(&options.source_root, raw_names)?;
     create_real_directory(&options.output_root)?;
     let manifest_path = options.output_root.join(super::MANIFEST_NAME);
-    if fs::symlink_metadata(&manifest_path).is_ok() {
+    if sys_fs::lstat(&manifest_path).is_ok() {
         let manifest = Scale4Manifest::load_for_raw_names(&options.output_root, raw_names)?;
         manifest.verify_all_records()?;
         return Ok(ConvertReport {
@@ -174,7 +174,7 @@ fn convert_layer(
         )));
     }
     let destination = output_root.join(format!("L{layer}.sc4"));
-    match fs::symlink_metadata(&destination) {
+    match sys_fs::lstat(&destination) {
         Ok(_) if !resume => {
             return Err(invalid(format!(
                 "sidecar already exists and resume is disabled: {}",
@@ -250,7 +250,7 @@ fn verify_existing_layer(
     let expected = (experts.len() as u64)
         .checked_mul(FILE_BYTES as u64)
         .ok_or_else(|| invalid("scale4 layer extent overflowed"))?;
-    let metadata = fs::symlink_metadata(destination)
+    let metadata = sys_fs::lstat(destination)
         .map_err(|error| io_error("inspect resumed scale4 layer", destination, error))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != expected {
         return Err(invalid(format!(
@@ -258,9 +258,9 @@ fn verify_existing_layer(
             destination.display()
         )));
     }
-    let mut sidecar = OpenOptions::new()
+    let mut sidecar = Open::new()
         .read(true)
-        .custom_flags(open_nofollow_cloexec())
+        .no_follow()
         .open(destination)
         .map_err(|error| io_error("open resumed scale4 layer", destination, error))?;
     cache_neutral(&sidecar);
@@ -295,9 +295,9 @@ fn verify_existing_layer(
 }
 
 fn verify_layer_records(path: &Path, witnesses: &[SourceWitness]) -> Result<()> {
-    let mut file = OpenOptions::new()
+    let mut file = Open::new()
         .read(true)
-        .custom_flags(open_nofollow_cloexec())
+        .no_follow()
         .open(path)
         .map_err(|error| io_error("reopen durable scale4 layer", path, error))?;
     cache_neutral(&file);
@@ -326,7 +326,7 @@ fn validate_source_set(source_root: &Path, raw_names: &[String]) -> Result<()> {
     for (layer, experts) in jobs {
         for expert in experts {
             let path = source_root.join(format!("L{layer}-E{expert}.bin"));
-            let metadata = fs::symlink_metadata(&path)
+            let metadata = sys_fs::lstat(&path)
                 .map_err(|error| io_error("inspect raw expert", &path, error))?;
             if metadata.file_type().is_symlink()
                 || !metadata.is_file()
@@ -396,7 +396,7 @@ fn parse_raw_name(name: &str) -> Result<(u32, u16)> {
 }
 
 fn validate_witness(witness: &SourceWitness) -> Result<()> {
-    let metadata = fs::symlink_metadata(&witness.path)
+    let metadata = sys_fs::lstat(&witness.path)
         .map_err(|error| io_error("reinspect raw expert", &witness.path, error))?;
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
@@ -440,7 +440,7 @@ fn ensure_directory_without_links(path: &Path) -> Result<()> {
     } else {
         path
     };
-    match fs::symlink_metadata(selected) {
+    match sys_fs::lstat(selected) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => return Ok(()),
         Ok(_) => {
             return Err(invalid(format!(
@@ -475,7 +475,7 @@ fn ensure_spotlight_marker(directory: &Path) -> Result<()> {
         return Ok(());
     }
     let marker = directory.join(SPOTLIGHT_MARKER);
-    match fs::symlink_metadata(&marker) {
+    match sys_fs::lstat(&marker) {
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(()),
         Ok(_) => Err(invalid(format!(
             "unsafe Spotlight marker {}",
@@ -492,7 +492,7 @@ fn ensure_spotlight_marker(directory: &Path) -> Result<()> {
 }
 
 fn validate_real_directory(path: &Path, label: &str) -> Result<()> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| io_error("inspect", path, error))?;
+    let metadata = sys_fs::lstat(path).map_err(|error| io_error("inspect", path, error))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(invalid(format!("{label} is not a real directory")));
     }
@@ -564,6 +564,7 @@ fn io_error(operation: &str, path: &Path, error: io::Error) -> DeltafinError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT_TEST: AtomicUsize = AtomicUsize::new(0);

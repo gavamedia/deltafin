@@ -594,11 +594,17 @@ impl<T: AuthoritativeTarget> OpenAiService<T> {
         )?;
         validate_stream_mode(object, streaming)?;
         validate_single_choice(object)?;
+        // An empty prompt can never be continued; refuse it here as a client
+        // error, like an empty chat `messages` array, rather than letting it
+        // fail inside the engine as a retryable server error.
         let prompt = object
             .get("prompt")
             .and_then(Value::as_str)
+            .filter(|prompt| !prompt.is_empty())
             .ok_or_else(|| {
-                ApiFailure::invalid("`prompt` must be a JSON string for native completions")
+                ApiFailure::invalid(
+                    "`prompt` must be a non-empty JSON string for native completions",
+                )
             })?;
         let max_new_tokens = parse_max_tokens(
             object,
@@ -2501,6 +2507,125 @@ mod tests {
                 reasoning_effort: None,
             }]
         );
+    }
+
+    #[test]
+    fn an_empty_completion_prompt_is_a_client_error_before_the_target() {
+        let target = RecordingTarget::new();
+        let requests = Arc::clone(&target.requests);
+        let service = service(target);
+        let response = service.dispatch(
+            HttpMethod::Post,
+            "/v1/completions",
+            br#"{"prompt":"","max_tokens":4}"#,
+        );
+        assert_eq!(response.status, 400);
+        assert_eq!(body(&response)["error"]["type"], "invalid_request_error");
+        assert!(
+            body(&response)["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("non-empty"))
+        );
+        // The SSE path parses through the same boundary.
+        assert!(
+            service
+                .parse_completion_mode(br#"{"prompt":"","max_tokens":4,"stream":true}"#, true)
+                .is_err()
+        );
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_completion_prompt_boundary_refuses_emptiness_and_nothing_else() {
+        // Refuse exactly what can never be continued; whitespace is text, and
+        // a chat message with empty content is still a rendered chat turn.
+        for (request_body, status) in [
+            (br#"{"prompt":" ","max_tokens":2}"#.as_slice(), 200),
+            (br#"{"prompt":"\n","max_tokens":2}"#.as_slice(), 200),
+            (br#"{"prompt":"","max_tokens":2}"#.as_slice(), 400),
+            (br#"{"max_tokens":2}"#.as_slice(), 400),
+            (br#"{"prompt":null,"max_tokens":2}"#.as_slice(), 400),
+            (br#"{"prompt":["a"],"max_tokens":2}"#.as_slice(), 400),
+            (br#"{"prompt":7,"max_tokens":2}"#.as_slice(), 400),
+        ] {
+            let target = RecordingTarget::new();
+            let requests = Arc::clone(&target.requests);
+            let response =
+                service(target).dispatch(HttpMethod::Post, "/v1/completions", request_body);
+            let shown = String::from_utf8_lossy(request_body);
+            assert_eq!(response.status, status, "{shown}");
+            assert_eq!(
+                requests.lock().unwrap().len(),
+                usize::from(status == 200),
+                "{shown}"
+            );
+            if status == 400 {
+                assert_eq!(
+                    body(&response)["error"]["type"],
+                    "invalid_request_error",
+                    "{shown}"
+                );
+            }
+        }
+        let target = RecordingTarget::new();
+        let requests = Arc::clone(&target.requests);
+        let response = service(target).dispatch(
+            HttpMethod::Post,
+            "/v1/chat/completions",
+            br#"{"messages":[{"role":"user","content":""}],"max_tokens":2}"#,
+        );
+        assert_eq!(response.status, 200);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        // An empty `messages` array stays refused, as before.
+        let target = RecordingTarget::new();
+        let response = service(target).dispatch(
+            HttpMethod::Post,
+            "/v1/chat/completions",
+            br#"{"messages":[],"max_tokens":2}"#,
+        );
+        assert_eq!(response.status, 400);
+    }
+
+    #[test]
+    fn a_streamed_empty_completion_prompt_is_a_400_over_the_wire() {
+        // The SSE handler has its own entry; prove over a real socket that an
+        // empty prompt is refused before any event stream starts and before
+        // the target is entered, with and without `stream`.
+        let target = RecordingTarget::new();
+        let requests = Arc::clone(&target.requests);
+        let server =
+            OpenAiHttpServer::bind("127.0.0.1:0", target, ServerConfig::default()).unwrap();
+        let port = listener_tcp_port(server.listener()).expect("TCP listener has a port");
+        thread::spawn(move || {
+            let _ = server.serve_forever();
+        });
+        for stream in ["false", "true"] {
+            let body = format!(r#"{{"prompt":"","max_tokens":2,"stream":{stream}}}"#);
+            // The server answers, then releases its one generation permit; a
+            // client that is quick enough to send its next request in between
+            // is told to come back (429 with Retry-After), exactly as a real
+            // client would be. Come back, as that response says to.
+            let mut wire = String::new();
+            for _ in 0..200 {
+                let mut socket = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+                write!(
+                    socket,
+                    "POST /v1/completions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len(),
+                )
+                .unwrap();
+                socket.flush().unwrap();
+                wire = read_http_response(socket);
+                if !wire.starts_with("HTTP/1.1 429") {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(wire.starts_with("HTTP/1.1 400"), "stream={stream}: {wire}");
+            assert!(wire.contains("invalid_request_error"), "stream={stream}: {wire}");
+            assert!(!wire.contains("text/event-stream"), "stream={stream}: {wire}");
+        }
+        assert!(requests.lock().unwrap().is_empty());
     }
 
     #[test]

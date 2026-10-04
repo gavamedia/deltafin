@@ -9,6 +9,39 @@ int mxfp4_have_avx2(void);
 void mxfp4_gemv(const uint8_t *packed, const uint8_t *scales,
                  const float *input, float *output, int rows, int columns);
 
+#if defined(_MSC_VER) && defined(_M_X64)
+#include <intrin.h>
+
+// An independent statement of what the CPU and operating system support, in
+// the test rather than borrowed from the code under test: the CPUID bit for
+// each instruction set, plus the operating system's agreement to save the YMM
+// registers AVX instructions use (without which the first AVX instruction
+// faults). GCC and Clang spell the same facts `__builtin_cpu_supports`.
+static int os_saves_ymm(void) {
+    int regs[4];
+    __cpuid(regs, 1);
+    if (!(regs[2] & (1 << 27))) return 0;       // OSXSAVE
+    return (_xgetbv(0) & 0x6u) == 0x6u;         // XMM and YMM state
+}
+
+static int cpu_bit(int leaf, int subleaf, int register_index, int bit) {
+    int regs[4];
+    __cpuid(regs, 0);
+    if (regs[0] < leaf) return 0;
+    __cpuidex(regs, leaf, subleaf);
+    return (regs[register_index] & (1 << bit)) != 0;
+}
+
+static int expected_compatibility(void) {
+    return cpu_bit(1, 0, 2, 9)                  // SSSE3
+        && cpu_bit(1, 0, 2, 28) && os_saves_ymm()   // AVX
+        && cpu_bit(1, 0, 2, 12);                // FMA3
+}
+
+static int expected_avx2(void) {
+    return expected_compatibility() && cpu_bit(7, 0, 1, 5);  // AVX2
+}
+#else
 static int expected_compatibility(void) {
 #if (defined(__x86_64__) || defined(_M_X64)) \
         && (defined(__GNUC__) || defined(__clang__))
@@ -30,6 +63,7 @@ static int expected_avx2(void) {
     return 0;
 #endif
 }
+#endif
 
 int main(void) {
     const int expected = expected_compatibility();

@@ -1,0 +1,30 @@
+[package]
+name = "deltafin-sys"
+version = "0.1.0"
+description = "Operating-system primitives shared by Deltafin's native crates"
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# Synthetic PE images, for the crates whose tests exercise an image audit.
+testing = []
+
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.189"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinHttp",
+    "Win32_System_Console",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }

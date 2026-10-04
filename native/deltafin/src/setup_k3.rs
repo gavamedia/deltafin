@@ -3,7 +3,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Write;
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -20,6 +19,7 @@ use crate::k3_source::{self, NATIVE_METADATA_FILES, PinnedMetadataFile};
 use crate::model::ModelSpec;
 use crate::packfile::digest_bytes;
 use crate::tokenizer::K3Tokenizer;
+use crate::sys::fs::{self as sys_fs, Open};
 use crate::trusted_download::{
     ByteRange, NativeHttpsTransport, Request, ResponseMeta, TimeoutPolicy, Transport,
     fsync_directory, publish_hard_link, rename_noreplace, secure_create_new, verify_regular_digest,
@@ -74,7 +74,7 @@ fn install(destination: &Path, transport: &mut dyn Transport) -> Result<()> {
         .ok_or_else(|| DeltafinError::new("K3 metadata destination has no parent"))?;
     require_real_directory(parent)?;
     let _lock = InstallationLock::acquire(&destination)?;
-    match fs::symlink_metadata(&destination) {
+    match sys_fs::lstat(&destination) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
             ensure_spotlight_marker(&destination)?;
             audit_local(&destination)?;
@@ -101,7 +101,7 @@ fn install(destination: &Path, transport: &mut dyn Transport) -> Result<()> {
     }
 
     let staging = suffix_path(&destination, ".installing")?;
-    match fs::symlink_metadata(&staging) {
+    match sys_fs::lstat(&staging) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
         Ok(_) => {
             return Err(DeltafinError::new(format!(
@@ -112,11 +112,8 @@ fn install(destination: &Path, transport: &mut dyn Transport) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             fs::create_dir(&staging)
                 .map_err(|error| io_error("create K3 metadata staging", &staging, error))?;
-            fs::set_permissions(
-                &staging,
-                std::os::unix::fs::PermissionsExt::from_mode(0o700),
-            )
-            .map_err(|error| io_error("secure K3 metadata staging", &staging, error))?;
+            sys_fs::restrict_to_owner(&staging)
+                .map_err(|error| io_error("secure K3 metadata staging", &staging, error))?;
             fsync_directory(parent)?;
         }
         Err(error) => return Err(io_error("inspect K3 metadata staging", &staging, error)),
@@ -131,7 +128,7 @@ fn install(destination: &Path, transport: &mut dyn Transport) -> Result<()> {
     K3Tokenizer::load_from_root(&staging)?;
 
     let inventory_path = staging.join(INVENTORY_FILENAME);
-    if fs::symlink_metadata(&inventory_path).is_ok() {
+    if sys_fs::lstat(&inventory_path).is_ok() {
         K3Inventory::load(&inventory_path)?;
     } else {
         let (document, order) = build_inventory(transport, &base, PINNED_INVENTORY_TENSORS)?;
@@ -195,7 +192,7 @@ fn fetch_metadata_file(
     transport: &mut dyn Transport,
 ) -> Result<()> {
     let destination = directory.join(spec.name);
-    match fs::symlink_metadata(&destination) {
+    match sys_fs::lstat(&destination) {
         Ok(_) => {
             verify_regular_digest(&destination, spec.size, spec.sha256)?;
             return Ok(());
@@ -511,7 +508,7 @@ fn ensure_spotlight_marker(directory: &Path) -> Result<()> {
         return Ok(());
     }
     let marker = directory.join(SPOTLIGHT_MARKER);
-    match fs::symlink_metadata(&marker) {
+    match sys_fs::lstat(&marker) {
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(()),
         Ok(_) => Err(DeltafinError::new("unsafe K3 Spotlight marker")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -529,7 +526,7 @@ fn validate_spotlight_marker(directory: &Path) -> Result<()> {
         return Ok(());
     }
     let marker = directory.join(SPOTLIGHT_MARKER);
-    let metadata = fs::symlink_metadata(&marker)
+    let metadata = sys_fs::lstat(&marker)
         .map_err(|error| io_error("inspect K3 Spotlight marker", &marker, error))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(DeltafinError::new(format!(
@@ -560,7 +557,7 @@ fn suffix_path(path: &Path, suffix: &str) -> Result<PathBuf> {
 }
 
 fn require_real_directory(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
+    let metadata = sys_fs::lstat(path)
         .map_err(|error| io_error("inspect K3 directory", path, error))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(DeltafinError::new(format!(
@@ -575,25 +572,24 @@ struct InstallationLock(File);
 
 impl InstallationLock {
     fn acquire(destination: &Path) -> Result<Self> {
-        use std::os::unix::fs::OpenOptionsExt;
         let path = suffix_path(destination, ".install.lock")?;
-        let file = fs::OpenOptions::new()
+        let file = Open::new()
             .read(true)
             .write(true)
             .create(true)
             .mode(0o600)
-            .custom_flags(open_nofollow_cloexec())
+            .no_follow()
             .open(&path)
             .map_err(|error| io_error("open K3 metadata lock", &path, error))?;
-        if !file
-            .metadata()
+        if !sys_fs::fstat(&file)
             .map_err(|error| io_error("stat K3 metadata lock", &path, error))?
             .is_file()
         {
             return Err(DeltafinError::new("K3 metadata lock is not regular"));
         }
-        // SAFETY: `file` owns this live descriptor for the lock lifetime.
-        if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+        if !sys_fs::try_lock_exclusive(&file)
+            .map_err(|error| io_error("acquire K3 metadata installation lock", &path, error))?
+        {
             return Err(DeltafinError::new(
                 "another native K3 metadata installer is active",
             ));
@@ -604,24 +600,8 @@ impl InstallationLock {
 
 impl Drop for InstallationLock {
     fn drop(&mut self) {
-        // SAFETY: the descriptor is live until this drop completes.
-        let _ = unsafe { flock(self.0.as_raw_fd(), LOCK_UN) };
+        sys_fs::unlock(&self.0);
     }
-}
-
-unsafe extern "C" {
-    fn flock(fd: i32, operation: i32) -> i32;
-}
-const LOCK_EX: i32 = 2;
-const LOCK_NB: i32 = 4;
-const LOCK_UN: i32 = 8;
-#[cfg(target_os = "macos")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x0100_0100
-}
-#[cfg(target_os = "linux")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x000a_0000
 }
 
 fn io_error(operation: &str, path: &Path, error: std::io::Error) -> DeltafinError {

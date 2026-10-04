@@ -34,6 +34,7 @@ const INTERNAL_PACKAGES: &[&str] = &[
     "native/deltafin-bootstrap",
     "native/deltafin-curl-sys-direct",
     "native/deltafin-native-build",
+    "native/deltafin-sys",
     "native/deltafin-xtask",
 ];
 
@@ -76,6 +77,16 @@ fn read(path: &Path) -> String {
     })
 }
 
+/// A repository-relative path spelled with `/` on every host, so it compares
+/// equal to the inventories and classifications this file keeps as strings.
+fn slash_relative(relative: &Path) -> String {
+    relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn walk_rust(root: &Path, files: &mut Vec<PathBuf>) {
     let mut entries: Vec<_> = fs::read_dir(root)
         .unwrap_or_else(|error| panic!("scan Rust policy root {}: {error}", root.display()))
@@ -105,13 +116,55 @@ fn is_test_only(attributes: &[Attribute]) -> bool {
             return false;
         };
         list.path.is_ident("cfg")
-            && list
-                .tokens
-                .to_string()
-                .split_whitespace()
-                .collect::<String>()
-                == "test"
+            && cfg_predicate_requires_test(
+                &list
+                    .tokens
+                    .to_string()
+                    .split_whitespace()
+                    .collect::<String>(),
+            )
     })
+}
+
+/// Whether a `cfg` predicate can only hold in a test build: `test` itself, or
+/// an `all(...)` conjunction with such a term (`all(test, unix)`). `any`, `not`
+/// and everything else may hold outside tests, so they are production code.
+fn cfg_predicate_requires_test(predicate: &str) -> bool {
+    if predicate == "test" {
+        return true;
+    }
+    let Some(inner) = predicate
+        .strip_prefix("all(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return false;
+    };
+    let mut depth = 0_usize;
+    let mut start = 0;
+    let mut terms = Vec::new();
+    for (index, character) in inner.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                terms.push(&inner[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    terms.push(&inner[start..]);
+    terms.into_iter().any(cfg_predicate_requires_test)
+}
+
+#[test]
+fn test_only_cfgs_are_recognized_through_conjunctions_only() {
+    for predicate in ["test", "all(test,unix)", "all(unix,test)", "all(unix,all(test,windows))"] {
+        assert!(cfg_predicate_requires_test(predicate), "{predicate}");
+    }
+    for predicate in ["unix", "any(test,unix)", "not(test)", "all(unix,windows)", "feature=\"runtime\"", "all(any(test,unix),windows)"] {
+        assert!(!cfg_predicate_requires_test(predicate), "{predicate}");
+    }
 }
 
 fn type_label(ty: &syn::Type) -> String {
@@ -455,6 +508,7 @@ fn audit_rust_processes(root: &Path) -> RustProcessAudit {
         "native/deltafin/src",
         "native/deltafin-bootstrap/src",
         "native/deltafin-native-build/src",
+        "native/deltafin-sys/src",
         "native/deltafin-xtask/src",
     ] {
         walk_rust(&root.join(relative), &mut files);
@@ -474,11 +528,10 @@ fn audit_rust_processes(root: &Path) -> RustProcessAudit {
         let syntax = syn::parse_file(&source).unwrap_or_else(|error| {
             panic!("parse supported Rust source {}: {error}", path.display())
         });
-        audit.file = path
-            .strip_prefix(root)
-            .expect("audited Rust source remains inside repository")
-            .to_string_lossy()
-            .into_owned();
+        audit.file = slash_relative(
+            path.strip_prefix(root)
+                .expect("audited Rust source remains inside repository"),
+        );
         audit.process_scope = source.contains("std::process::{")
             || source.contains("std::process::Command")
             || source.contains("process::Command");
@@ -572,8 +625,11 @@ fn expected_launches() -> BTreeMap<Launch, usize> {
     );
 
     let build = "native/deltafin-native-build/src/lib.rs";
-    add(build, "build_and_run_cpu_only_test", "&toolchain.cc", 1);
+    // The CPU-only link goes through the C driver on Unix and link.exe on
+    // Windows; the provider link likewise through the C++ driver or link.exe.
+    add(build, "build_and_run_cpu_only_test", "linker_program", 1);
     add(build, "link_provider_test", "&provider.toolchain.cxx", 1);
+    add(build, "link_provider_test_msvc", "linker", 1);
     add(build, "run_native_test_cases", "executable", 1);
     add(build, "audit_macho_dependencies", "&tool", 1);
     add(build, "macho_install_name", "tool", 1);
@@ -597,10 +653,10 @@ fn expected_launches() -> BTreeMap<Launch, usize> {
     add(build, "discover_metal_toolchain", "&xcodebuild", 1);
     add(build, "metal_toolchain_under", "&metal", 1);
     add(build, "metal_toolchain_under", "&metallib", 1);
-    add(build, "compile_cpp", "compiler", 1);
-    add(build, "compile_gemv", "compiler", 1);
-    add(build, "compile_c_test_main", "compiler", 1);
-    add(build, "archive_objects", "archiver", 1);
+    add(build, "compile_cpp", "&toolchain.cxx", 1);
+    add(build, "compile_gemv", "&toolchain.cc", 1);
+    add(build, "compile_c_test_main", "&toolchain.cc", 1);
+    add(build, "archive_objects", "&toolchain.ar", 1);
     // The device-kernel compile loop is shared by NVCC and HIPCC; each planner
     // separately launches its own compiler once to read a version banner.
     add(build, "build_cuda_kernel", "&plan.compiler", 1);
@@ -741,13 +797,19 @@ fn owned_process_edges_are_ast_classified_and_guarded() {
         "discover_metal_toolchain",
         &["validate_apple_native_tool", "run_guarded_raw_output"],
     );
+    // The compile functions report a failure as a value (so one run can name
+    // every translation unit that failed) through the same guarded runner the
+    // panicking form wraps.
+    for context in ["compile_cpp", "compile_gemv", "compile_c_test_main"] {
+        require_facts(&audit, build, context, &["run_guarded_try"]);
+    }
+    require_facts(&audit, build, "archive_objects", &["run_guarded_checked"]);
     for context in [
-        "compile_cpp",
-        "compile_gemv",
-        "compile_c_test_main",
-        "archive_objects",
+        "link_provider_test",
+        "link_provider_test_msvc",
+        "build_and_run_cpu_only_test",
     ] {
-        require_facts(&audit, build, context, &["run_guarded_checked"]);
+        require_facts(&audit, build, context, &["run_guarded_try"]);
     }
 }
 
@@ -859,12 +921,12 @@ fn in_process_provider_sources_have_no_process_or_interpreter_api() {
                 && !name.contains("_test.")
                 && name.as_ref() != "provider_gate.cpp");
         if production {
-            let relative = path
-                .strip_prefix(&root)
-                .expect("provider source remains inside repository")
-                .to_string_lossy();
+            let relative = slash_relative(
+                path.strip_prefix(&root)
+                    .expect("provider source remains inside repository"),
+            );
             assert!(
-                inventory.contains(relative.as_ref()),
+                inventory.contains(relative.as_str()),
                 "production provider source is absent from the shared inventory: {relative}"
             );
         }
@@ -890,10 +952,10 @@ fn in_process_provider_sources_have_no_process_or_interpreter_api() {
             "production provider source is missing: {}",
             path.display()
         );
-        let relative = path
-            .strip_prefix(&root)
-            .expect("provider source remains in repository")
-            .to_string_lossy();
+        let relative = slash_relative(
+            path.strip_prefix(&root)
+                .expect("provider source remains in repository"),
+        );
         let identifiers = native_identifiers(&read(&path));
         for name in forbidden.clone() {
             assert!(

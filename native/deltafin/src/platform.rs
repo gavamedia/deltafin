@@ -16,6 +16,7 @@ use crate::error::{DeltafinError, Result};
 /// newer Apple families remain independently eligible for MPS.
 pub(crate) const APPLE_M1_CPU_FAMILY: u64 = 0x1B58_8BB3;
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn decode_native_cpu_family(bytes: &[u8]) -> Option<u64> {
     match bytes {
         [a, b, c, d] => Some(u32::from_ne_bytes([*a, *b, *c, *d]).into()),
@@ -69,6 +70,7 @@ pub(crate) const fn apple_cpu_family() -> Option<u64> {
 pub enum HostOs {
     MacOs,
     Linux,
+    Windows,
     Unsupported,
 }
 
@@ -92,6 +94,8 @@ impl Host {
                 HostOs::MacOs
             } else if cfg!(target_os = "linux") {
                 HostOs::Linux
+            } else if cfg!(windows) {
+                HostOs::Windows
             } else {
                 HostOs::Unsupported
             },
@@ -110,6 +114,7 @@ impl Host {
             (self.os, self.arch),
             (HostOs::MacOs, HostArch::Aarch64)
                 | (HostOs::Linux, HostArch::Aarch64 | HostArch::X86_64)
+                | (HostOs::Windows, HostArch::X86_64)
         );
         if supported {
             Ok(self)
@@ -126,6 +131,7 @@ impl Display for Host {
         let os = match self.os {
             HostOs::MacOs => "macos",
             HostOs::Linux => "linux",
+            HostOs::Windows => "windows",
             HostOs::Unsupported => std::env::consts::OS,
         };
         let arch = match self.arch {
@@ -313,16 +319,37 @@ mod tests {
                 os: HostOs::Linux,
                 arch: HostArch::X86_64,
             },
+            Host {
+                os: HostOs::Windows,
+                arch: HostArch::X86_64,
+            },
         ] {
             assert!(host.validate().is_ok());
         }
-        assert!(
+        // Intel macOS and Windows on ARM have no provider build.
+        for host in [
             Host {
                 os: HostOs::MacOs,
                 arch: HostArch::X86_64,
+            },
+            Host {
+                os: HostOs::Windows,
+                arch: HostArch::Aarch64,
+            },
+            Host {
+                os: HostOs::Unsupported,
+                arch: HostArch::X86_64,
+            },
+        ] {
+            assert!(host.validate().is_err(), "{host}");
+        }
+        assert_eq!(
+            Host {
+                os: HostOs::Windows,
+                arch: HostArch::X86_64,
             }
-            .validate()
-            .is_err()
+            .to_string(),
+            "windows/x86_64"
         );
     }
 
