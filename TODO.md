@@ -216,25 +216,25 @@ Guiding rule: maximize decode tok/s; the only hard boundary is K3 output accurac
     operator-supplied `DELTAFIN_TORCH_ROOT` + matching `cu13x` toolkit, 5 makes
     the bootstrap self-serve.
 
-    - [ ] 1. **PE runtime-ABI detection.** `detect_gpu_runtime`
+    - [x] 1. **PE runtime-ABI detection.** `detect_gpu_runtime`
       (`native/deltafin-native-build/src/lib.rs:4826`) returns `None` off Linux and
       searches ELF strings. On Windows scan `c10_cuda.dll`/`.lib` for
       `cudart64_12.dll` / `cudart64_13.dll` / `amdhip64.dll` with the existing
       `file_contains` (a raw byte search, PE-safe). Without this the
       `run_production_build` "GPU libraries require an identified runtime ABI"
       panic (`lib.rs:689`) fires even after the explicit blocks are removed.
-    - [ ] 2. **Open the four explicit gates.** `build_provider_artifacts`
+    - [x] 2. **Open the four explicit gates.** `build_provider_artifacts`
       (`lib.rs:1171`, Windows + CUDA pair panic), `build_cuda_kernel`
       (`lib.rs:3582`, Linux-only and `ON` panic), `validate_explicit_torch_root`
       (`lib.rs:4762`, `ON` non-Linux panic), and keep HIP Linux-only.
-    - [ ] 3. **Windows-aware NVCC/toolkit discovery.** `discover_nvcc`
+    - [x] 3. **Windows-aware NVCC/toolkit discovery.** `discover_nvcc`
       (`lib.rs:3786`) and `cuda_toolkit_root` (`lib.rs:3949`) look for `bin/nvcc`
       (not `nvcc.exe`); `find_on_path` (`lib.rs:4233`) has no PATHEXT handling.
       `find_cuda_provider` (`lib.rs:3500`) and `cuda_runtime_directory_optional`
       (`lib.rs:4007`) look for `libcudart.so*` under Linux layout; Windows needs
       `lib/x64/cudart.lib` + `cudart64_*.dll`. The exact `12.6`/`13.0` gate
       (`lib.rs:3709`) also rejects a newer `13.x` toolkit.
-    - [ ] 4. **MSVC-shaped nvcc invocation.** `build_cuda_kernel`
+    - [x] 4. **MSVC-shaped nvcc invocation.** `build_cuda_kernel`
       (`lib.rs:3619`) passes `-Xcompiler=-fPIC` (cl.exe warns D9002) and hardcodes
       `.o` outputs (`lib.rs:3600`); add host flags matching the CRT (`/MD`,
       `/EHsc`, `/Zc:__cplusplus`) and use `object_file_name`. The rpath link args
@@ -249,6 +249,10 @@ Guiding rule: maximize decode tok/s; the only hard boundary is K3 output accurac
       (`cuda-moe`, `bf16-cuda`, `provider-precision`), confirm Windows VRAM
       detection (`engine.rs:7917`), and update `PLATFORMS.md` +
       `COMPILED-RUNTIME.md:107`.
+
+    Steps 1–4 landed on `feat/windows-cuda`; the crate's own tests and a
+    Windows CPU `cargo check -p deltafin` pass. Steps 5–6 await a CUDA Windows
+    LibTorch root and a GPU runner.
 30. **Context beyond today's bound.**
     - The expanded fp32 MLA cache is 512 MiB per layer.
     - Exact compact MLA (C30) was rejected because it is not bit-exact.
