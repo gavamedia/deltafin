@@ -1,6 +1,6 @@
 # Deltafin TODO — prioritized
 
-Updated 2026-10-03. Built from a review of the open PRs and issues on
+Updated 2026-10-07. Built from a review of the open PRs and issues on
 `gavamedia/deltafin` plus every planning doc in this repo (PLAN.md,
 SPEED-ROADMAP.md, BRAINSTORM-SPEED.md, docs/*, research/, experiments/),
 cross-checked against git history and the code.
@@ -202,7 +202,53 @@ Guiding rule: maximize decode tok/s; the only hard boundary is K3 output accurac
 ## P4 — Not single-stream speed / platform / later
 
 29. **Windows on the Rust runtime**: a re-port of PR #14.
+    - The Windows CPU target already lives (`.github/workflows/windows-native.yml`,
+      MSVC toolchain, PE dependency audit, `platform.rs` accepts `windows/x86_64`).
+      CUDA on Windows is deliberately hard-blocked in the build graph.
     - Also: HIP CI (the runner runs out of disk) and AMD hardware evidence.
+
+    ### 29a. Windows CUDA enablement (build graph)
+
+    The runtime side is already portable: `provider_device.h:25` handles `_WIN32`,
+    `platform.rs` accepts `cuda:N`, and the `cuda-moe`/`bf16-cuda`/`mla`/`kda`
+    native-test specs are `platform: Any`. What is missing is the build graph,
+    which is Linux-shaped in five places. Order matters; 1–4 unblock an
+    operator-supplied `DELTAFIN_TORCH_ROOT` + matching `cu13x` toolkit, 5 makes
+    the bootstrap self-serve.
+
+    - [ ] 1. **PE runtime-ABI detection.** `detect_gpu_runtime`
+      (`native/deltafin-native-build/src/lib.rs:4826`) returns `None` off Linux and
+      searches ELF strings. On Windows scan `c10_cuda.dll`/`.lib` for
+      `cudart64_12.dll` / `cudart64_13.dll` / `amdhip64.dll` with the existing
+      `file_contains` (a raw byte search, PE-safe). Without this the
+      `run_production_build` "GPU libraries require an identified runtime ABI"
+      panic (`lib.rs:689`) fires even after the explicit blocks are removed.
+    - [ ] 2. **Open the four explicit gates.** `build_provider_artifacts`
+      (`lib.rs:1171`, Windows + CUDA pair panic), `build_cuda_kernel`
+      (`lib.rs:3582`, Linux-only and `ON` panic), `validate_explicit_torch_root`
+      (`lib.rs:4762`, `ON` non-Linux panic), and keep HIP Linux-only.
+    - [ ] 3. **Windows-aware NVCC/toolkit discovery.** `discover_nvcc`
+      (`lib.rs:3786`) and `cuda_toolkit_root` (`lib.rs:3949`) look for `bin/nvcc`
+      (not `nvcc.exe`); `find_on_path` (`lib.rs:4233`) has no PATHEXT handling.
+      `find_cuda_provider` (`lib.rs:3500`) and `cuda_runtime_directory_optional`
+      (`lib.rs:4007`) look for `libcudart.so*` under Linux layout; Windows needs
+      `lib/x64/cudart.lib` + `cudart64_*.dll`. The exact `12.6`/`13.0` gate
+      (`lib.rs:3709`) also rejects a newer `13.x` toolkit.
+    - [ ] 4. **MSVC-shaped nvcc invocation.** `build_cuda_kernel`
+      (`lib.rs:3619`) passes `-Xcompiler=-fPIC` (cl.exe warns D9002) and hardcodes
+      `.o` outputs (`lib.rs:3600`); add host flags matching the CRT (`/MD`,
+      `/EHsc`, `/Zc:__cplusplus`) and use `object_file_name`. The rpath link args
+      (`lib.rs:709`, `739`) are unconditional `-Wl,-rpath,...`; Windows `link.exe`
+      rejects them, so the loader must find `cudart64_*.dll` beside the exe
+      (`deploy_runtime_libraries`, `lib.rs:813`, already copies `torch/lib` DLLs).
+    - [ ] 5. **Bootstrap artifact pin.** `native/deltafin-bootstrap/src/lib.rs`
+      pins only the CPU Windows wheel (`lib.rs:189`); add a `cu13x` Windows wheel
+      pin (sha256 + size + files manifest) and extend `required_libraries`
+      (`lib.rs:111`) with `torch_cuda`/`c10_cuda` and the CUDA runtime DLLs.
+    - [ ] 6. **Evidence.** Extend `windows-native.yml` with a GPU leg
+      (`cuda-moe`, `bf16-cuda`, `provider-precision`), confirm Windows VRAM
+      detection (`engine.rs:7917`), and update `PLATFORMS.md` +
+      `COMPILED-RUNTIME.md:107`.
 30. **Context beyond today's bound.**
     - The expanded fp32 MLA cache is 512 MiB per layer.
     - Exact compact MLA (C30) was rejected because it is not bit-exact.
