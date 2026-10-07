@@ -250,9 +250,13 @@ Guiding rule: maximize decode tok/s; the only hard boundary is K3 output accurac
       detection (`engine.rs:7917`), and update `PLATFORMS.md` +
       `COMPILED-RUNTIME.md:107`.
 
-    Steps 1–4 landed on `feat/windows-cuda`; the crate's own tests and a
-    Windows CPU `cargo check -p deltafin` pass. Steps 5–6 await a CUDA Windows
-    LibTorch root and a GPU runner.
+    Steps 1–4 landed on `feat/windows-cuda` and were verified on real hardware
+    (RTX PRO 4000, Blackwell sm_120, CUDA 13.3): `bf16-cuda` and `cuda-moe`
+    native tests PASS on the GPU, and `deltafin doctor` reports one CUDA device
+    with both exact kernels compiled and every CUDA canary passing. The CUDA
+    LibTorch root is a manually extracted `torch-2.13.0+cu130` wheel supplied
+    through `DELTAFIN_TORCH_ROOT`. Step 5 (bootstrap pin) and the GPU CI leg of
+    step 6 remain.
 30. **Context beyond today's bound.**
     - The expanded fp32 MLA cache is 512 MiB per layer.
     - Exact compact MLA (C30) was rejected because it is not bit-exact.
