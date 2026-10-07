@@ -23,9 +23,13 @@
 #endif
 
 #if defined(DELTAFIN_HAVE_CUDA_PROVIDER_V1)
+#include <ATen/cuda/CUDAContextLight.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/CUDAGuard.h>
+// Force an import of torch_cuda.dll (see the spine source for why).
+decltype(&at::cuda::getCurrentDeviceProperties) k3_torch_cuda_anchor_moe =
+    &at::cuda::getCurrentDeviceProperties;
 #endif
 
 #if defined(DELTAFIN_HAVE_CUDA_MOE_V1)

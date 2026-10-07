@@ -788,10 +788,29 @@ pub fn run_production_build() {
         // Windows has no RPATH: the loader finds LibTorch's DLLs beside the
         // executable, so the authenticated ones are placed there. A CUDA build
         // additionally needs the toolkit's `cudart64_*` runtime beside it.
-        let mut sources = vec![artifacts.torch_lib.clone()];
+        // The toolkit's `cudart64_*` is placed first so it wins the name
+        // collision with any `cudart64_*` a CUDA wheel may bundle: the provider
+        // is linked against the toolkit's import library, and a newer minor is
+        // backward compatible with what LibTorch was built against. The import
+        // library and the DLL may sit in sibling directories (`lib\x64` and
+        // `bin\x64`), so both are offered to the deployer.
+        let mut sources = Vec::new();
         if let Some(provider) = &artifacts.cuda_provider {
             sources.push(provider.runtime_directory.clone());
+            if let Some(root) = provider.runtime_directory.parent().and_then(Path::parent) {
+                for extra in ["bin/x64", "bin"] {
+                    let directory = root.join(extra);
+                    if directory.is_dir() {
+                        sources.push(directory);
+                    }
+                }
+            }
+            // CUDA 13's hybrid runtime comes from the driver, not the toolkit.
+            if let Some(driver) = windows_nvcudart_directory() {
+                sources.push(driver);
+            }
         }
+        sources.push(artifacts.torch_lib.clone());
         deploy_runtime_libraries(&sources, &PathBuf::from(required_env("OUT_DIR")));
     } else {
         println!(
@@ -842,9 +861,17 @@ fn deploy_runtime_libraries(sources: &[PathBuf], out_dir: &Path) {
                     )
                 })
                 .path();
+            // A CUDA wheel ships `torch_python.dll`, which imports a Python
+            // runtime; the CPU wheels omit it. Skip it here, as the bootstrap
+            // does, so the deployed set stays Python-free.
+            let is_python = path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.to_ascii_lowercase().contains("python"));
             if path
                 .extension()
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("dll"))
+                && !is_python
                 && !libraries
                     .iter()
                     .any(|existing| existing.file_name() == path.file_name())
@@ -1224,6 +1251,13 @@ fn build_provider_artifacts(
         guard
             .loader_directories
             .push(provider.runtime_directory.clone());
+        // CUDA 13's runtime is the driver-provided `nvcudart_hybrid64.dll`; no
+        // toolkit ships it, so the test loader path must reach the DriverStore.
+        if target_os() == "windows" {
+            if let Some(driver) = windows_nvcudart_directory() {
+                guard.loader_directories.push(driver);
+            }
+        }
     }
     validate_compiler(&toolchain, &toolchain.cc, "C", &guard);
     validate_compiler(&toolchain, &toolchain.cxx, "C++", &guard);
@@ -4083,28 +4117,15 @@ fn cuda_runtime_directory_optional(root: &Path) -> Option<PathBuf> {
     None
 }
 
-/// The Windows CUDA toolkit names its runtime import library `cudart.lib` and
-/// the DLL `cudart64_<major>.dll` (never `cudart.dll`), so the shared
-/// `library_file` name check does not apply. Prefer a directory that carries
-/// both, since the linker needs the import library and the loader the DLL.
+/// The Windows CUDA toolkit names its runtime import library `cudart.lib` (in
+/// `lib\x64`) and the loadable runtime `cudart64_<major>.dll` (in `bin\x64`), so
+/// the two can live in sibling directories and the shared `library_file` name
+/// check does not apply. Prefer the import-library directory, since the linker
+/// needs it and the wheel usually supplies the DLL beside LibTorch.
 fn windows_cuda_runtime_directory(root: &Path) -> Option<PathBuf> {
-    let has_cudart_dll = |directory: &Path| {
-        fs::read_dir(directory).ok().is_some_and(|entries| {
-            entries.filter_map(Result::ok).any(|entry| {
-                entry
-                    .file_name()
-                    .as_encoded_bytes()
-                    .starts_with(b"cudart64_")
-                    && entry
-                        .path()
-                        .extension()
-                        .is_some_and(|extension| extension.eq_ignore_ascii_case("dll"))
-            })
-        })
-    };
     for relative in ["lib/x64", "lib", "lib/Win32"] {
         let candidate = root.join(relative);
-        if candidate.join("cudart.lib").is_file() && has_cudart_dll(&candidate) {
+        if candidate.join("cudart.lib").is_file() {
             return Some(
                 deltafin_sys::fs::canonicalize(&candidate).unwrap_or_else(|error| {
                     panic!(
@@ -4115,11 +4136,9 @@ fn windows_cuda_runtime_directory(root: &Path) -> Option<PathBuf> {
             );
         }
     }
-    // A DLL-only layout still lets the loader find cudart even when the import
-    // library sits elsewhere; accept it as a last resort.
-    for relative in ["bin", "lib/x64", "lib"] {
+    for relative in ["bin/x64", "bin", "lib/x64", "lib"] {
         let candidate = root.join(relative);
-        if has_cudart_dll(&candidate) {
+        if windows_has_cudart_dll(&candidate) {
             return Some(
                 deltafin_sys::fs::canonicalize(&candidate).unwrap_or_else(|error| {
                     panic!(
@@ -4131,6 +4150,44 @@ fn windows_cuda_runtime_directory(root: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Whether `directory` holds a loadable CUDA runtime: the versioned `cudart64_*`
+/// forwarder or the CUDA 13 driver-provided `nvcudart_hybrid64.dll`.
+fn windows_has_cudart_dll(directory: &Path) -> bool {
+    fs::read_dir(directory).ok().is_some_and(|entries| {
+        entries.filter_map(Result::ok).any(|entry| {
+            let name = entry.file_name();
+            let bytes = name.as_encoded_bytes();
+            (bytes.starts_with(b"cudart64_") || bytes.starts_with(b"nvcudart"))
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("dll"))
+        })
+    })
+}
+
+/// Locate the CUDA 13 driver-provided hybrid runtime (`nvcudart_hybrid64.dll`).
+/// CUDA 13's `cudart64_*` and LibTorch import it, but no toolkit ships it: it
+/// comes with the display driver and lives in the DriverStore. Search the
+/// toolkit `bin`, the system directory, and the DriverStore package folders.
+fn windows_nvcudart_directory() -> Option<PathBuf> {
+    const HYBRID: &str = "nvcudart_hybrid64.dll";
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(cuda_path) = env::var_os("CUDA_PATH") {
+        candidates.push(PathBuf::from(&cuda_path).join("bin/x64"));
+        candidates.push(PathBuf::from(&cuda_path).join("bin"));
+    }
+    if let Ok(system) = deltafin_sys::fs::system_directory() {
+        candidates.push(system.clone());
+        if let Ok(entries) = fs::read_dir(system.join("DriverStore/FileRepository")) {
+            candidates.extend(entries.filter_map(Result::ok).map(|entry| entry.path()));
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|directory| directory.join(HYBRID).is_file())
 }
 
 fn cuda_architectures(major: u8, minor: u8) -> String {
@@ -4989,7 +5046,10 @@ fn detect_gpu_runtime(torch_lib: &Path) -> Option<GpuRuntime> {
         (
             file_contains(&c10_cuda, b"amdhip64.dll\0"),
             file_contains(&c10_cuda, b"cudart64_12.dll\0"),
-            file_contains(&c10_cuda, b"cudart64_13.dll\0"),
+            // CUDA 13 moved the runtime to the driver-provided hybrid library;
+            // some builds still import the versioned forwarder instead.
+            file_contains(&c10_cuda, b"nvcudart_hybrid64.dll\0")
+                || file_contains(&c10_cuda, b"cudart64_13.dll\0"),
         )
     } else {
         (
@@ -5297,10 +5357,10 @@ mod windows_graph_tests {
     }
 
     #[test]
-    fn windows_cudart_discovery_needs_both_the_import_library_and_a_dll() {
+    fn windows_cudart_discovery_prefers_the_import_library_then_the_dll() {
         let scratch = Scratch::new("cudart");
         scratch.write("lib/x64/cudart.lib", b"lib");
-        scratch.write("lib/x64/cudart64_13.dll", b"dll");
+        scratch.write("bin/x64/cudart64_13.dll", b"dll");
         assert_eq!(
             windows_cuda_runtime_directory(&scratch.0).unwrap(),
             deltafin_sys::fs::canonicalize(scratch.0.join("lib/x64")).unwrap()
@@ -5308,13 +5368,20 @@ mod windows_graph_tests {
 
         // A DLL-only layout is still accepted for the loader.
         let dll_only = Scratch::new("cudart-dll");
-        dll_only.write("bin/cudart64_13.dll", b"dll");
-        assert!(windows_cuda_runtime_directory(&dll_only.0).is_some());
+        dll_only.write("bin/x64/cudart64_13.dll", b"dll");
+        assert_eq!(
+            windows_cuda_runtime_directory(&dll_only.0).unwrap(),
+            deltafin_sys::fs::canonicalize(dll_only.0.join("bin/x64")).unwrap()
+        );
 
-        // The import library without any DLL cannot be loaded.
-        let bare = Scratch::new("cudart-bare");
-        bare.write("lib/cudart.lib", b"lib");
-        assert!(windows_cuda_runtime_directory(&bare.0).is_none());
+        // The CUDA 13 driver-provided hybrid runtime counts as a cudart.
+        let hybrid = Scratch::new("cudart-hybrid");
+        hybrid.write("bin/x64/nvcudart_hybrid64.dll", b"dll");
+        assert!(windows_cuda_runtime_directory(&hybrid.0).is_some());
+
+        let none = Scratch::new("cudart-none");
+        fs::create_dir_all(none.0.join("lib")).unwrap();
+        assert!(windows_cuda_runtime_directory(&none.0).is_none());
     }
 
     #[test]
@@ -5323,11 +5390,11 @@ mod windows_graph_tests {
         let lib = scratch.0.join("lib");
         if target_os() == "windows" {
             // The import library names the module; the module carries the
-            // runtime import the scan reads.
+            // runtime import the scan reads (the CUDA 13 hybrid runtime).
             scratch.write("lib/c10_cuda.lib", b"import");
             scratch.write("lib/torch_cuda.lib", b"import");
-            scratch.write("lib/c10_cuda.dll", b"cudart64_13.dll\0");
-            scratch.write("lib/torch_cuda.dll", b"cudart64_13.dll\0");
+            scratch.write("lib/c10_cuda.dll", b"nvcudart_hybrid64.dll\0");
+            scratch.write("lib/torch_cuda.dll", b"nvcudart_hybrid64.dll\0");
         } else {
             scratch.write("lib/libc10_cuda.so", b"libcudart.so.13\0");
             scratch.write("lib/libtorch_cuda.so", b"libcudart.so.13\0");
@@ -5432,7 +5499,7 @@ mod windows_graph_tests {
     }
 
     #[test]
-    fn deployment_refuses_an_unexpected_cargo_layout_and_python_libraries() {
+    fn deployment_refuses_an_unexpected_cargo_layout_and_skips_python_libraries() {
         let scratch = Scratch::new("deploy-layout");
         let torch_lib = scratch.0.join("torch/lib");
         scratch.write("torch/lib/c10.dll", b"c10");
@@ -5447,16 +5514,16 @@ mod windows_graph_tests {
             .is_err()
         );
 
-        // A Python binding library is refused by name, wherever it came from.
+        // A Python binding library is skipped by name, wherever it came from,
+        // so the deployed set stays Python-free.
         scratch.write("torch/lib/torch_python.dll", b"never");
         let out = out_dir(&scratch);
-        assert!(
-            std::panic::catch_unwind(|| deploy_runtime_libraries(
-                std::slice::from_ref(&torch_lib),
-                &out
-            ))
-            .is_err()
-        );
+        deploy_runtime_libraries(std::slice::from_ref(&torch_lib), &out);
+        let profile = scratch.0.join("target/release");
+        for directory in [profile.clone(), profile.join("deps")] {
+            assert!(directory.join("c10.dll").is_file());
+            assert!(!directory.join("torch_python.dll").exists());
+        }
     }
 
     #[test]

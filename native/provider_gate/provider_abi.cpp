@@ -14,6 +14,9 @@
 #include <ATen/ops/softmax.h>
 #include <c10/core/InferenceMode.h>
 #include <torch/version.h>
+#if defined(DELTAFIN_HAVE_CUDA_PROVIDER_V1)
+#include <ATen/cuda/CUDAContextLight.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -27,6 +30,18 @@
 #include <vector>
 
 namespace {
+
+#if defined(DELTAFIN_HAVE_CUDA_PROVIDER_V1)
+// torch_cuda.dll carries the CUDA ATen kernels and registers them from its own
+// static initializers. The provider reaches CUDA only through `c10::cuda`
+// (c10_cuda) and the inline `at::cuda::getNumGPUs`, so nothing would otherwise
+// keep an import of torch_cuda. This non-const namespace-scope variable has
+// external linkage, so the object always carries the relocation and the linker
+// emits the import: the DLL loads and its kernels register before any CUDA
+// tensor operation.
+decltype(&at::cuda::getCurrentDeviceProperties) k3_torch_cuda_anchor_abi =
+    &at::cuda::getCurrentDeviceProperties;
+#endif
 
 static_assert(sizeof(DeltafinProviderInventoryV1) == 96,
               "provider inventory ABI v1 layout changed");

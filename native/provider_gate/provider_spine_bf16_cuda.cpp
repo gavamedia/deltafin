@@ -26,7 +26,21 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime_api.h>
+#if defined(_WIN32)
+#include <malloc.h>
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
+
+#if defined(DELTAFIN_HAVE_CUDA_PROVIDER_V1)
+#include <ATen/cuda/CUDAContextLight.h>
+// Force an import of torch_cuda.dll: its ATen CUDA kernels register from its
+// static initializers, but the provider otherwise reaches CUDA only through
+// `c10::cuda` (c10_cuda). External linkage keeps the relocation in the object.
+decltype(&at::cuda::getCurrentDeviceProperties) k3_torch_cuda_anchor_spine =
+    &at::cuda::getCurrentDeviceProperties;
+#endif
 
 extern "C" {
 std::uint32_t k3_cuda_spine_bf16_abi_version(void);
@@ -269,17 +283,45 @@ void record_stream(const at::Tensor& tensor,
 }
 
 std::size_t system_page_size() {
+#if defined(_WIN32)
+  SYSTEM_INFO info;
+  GetSystemInfo(&info);
+  const std::size_t page = static_cast<std::size_t>(info.dwPageSize);
+#else
   const long queried = sysconf(_SC_PAGESIZE);
   if (queried <= 0) {
     throw std::runtime_error(
         "CUDA ATS could not query the host system page size");
   }
   const std::size_t page = static_cast<std::size_t>(queried);
+#endif
   if (!std::has_single_bit(page)) {
     throw std::runtime_error(
         "CUDA ATS host system page size is not a power of two");
   }
   return page;
+}
+
+/// Page-aligned host allocation: `_aligned_malloc` on Windows (whose matching
+/// free is `_aligned_free`), `posix_memalign` elsewhere.
+void* page_aligned_alloc(const std::size_t alignment, const std::size_t bytes) {
+#if defined(_WIN32)
+  return _aligned_malloc(bytes, alignment);
+#else
+  void* allocation = nullptr;
+  if (posix_memalign(&allocation, alignment, bytes) != 0) {
+    return nullptr;
+  }
+  return allocation;
+#endif
+}
+
+void page_aligned_free(void* pointer) {
+#if defined(_WIN32)
+  _aligned_free(pointer);
+#else
+  std::free(pointer);
+#endif
 }
 
 void validate_activation(const at::Tensor& activation,
@@ -333,7 +375,8 @@ HostPointerKind classify_host_pointer(const at::Device& device,
 }
 
 bool direct_host_ats_attributes(const int device) {
-  const c10::cuda::CUDAGuard guard(at::Device(at::kCUDA, device));
+  const c10::cuda::CUDAGuard guard(
+      at::Device(at::kCUDA, static_cast<c10::DeviceIndex>(device)));
   int pageable = 0;
   int host_page_tables = 0;
   int unified_addressing = 0;
@@ -516,13 +559,13 @@ void run_finite_gemv_canary(const at::Device& device) {
 
 bool run_direct_host_canary(const at::Device& device) {
   const std::size_t page = system_page_size();
-  void* allocation = nullptr;
-  if (posix_memalign(&allocation, page, page) != 0 || allocation == nullptr) {
+  void* allocation = page_aligned_alloc(page, page);
+  if (allocation == nullptr) {
     throw std::runtime_error(
         "CUDA ATS canary could not allocate ordinary page-aligned storage");
   }
   struct FreeGuard {
-    void operator()(void* pointer) const noexcept { std::free(pointer); }
+    void operator()(void* pointer) const noexcept { page_aligned_free(pointer); }
   };
   std::unique_ptr<void, FreeGuard> allocation_guard(allocation);
   auto* weights = static_cast<std::uint16_t*>(allocation);
