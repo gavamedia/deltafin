@@ -23,6 +23,7 @@
 #endif
 
 #if defined(DELTAFIN_HAVE_CUDA_PROVIDER_V1)
+#include <ATen/Context.h>
 #include <ATen/cuda/CUDAContextLight.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAFunctions.h>
@@ -1375,6 +1376,10 @@ CudaProviderMemorySnapshot cuda_provider_memory_snapshot(
     throw std::invalid_argument(
         "CUDA memory snapshot requires an indexed CUDA device");
   }
+  // The allocator's per-device table is only sized by the lazy CUDA init that a
+  // tensor operation triggers. A snapshot can be the first CUDA touch of a run,
+  // so force that init before querying the allocator's stats.
+  at::globalContext().lazyInitDevice(at::kCUDA);
   const c10::cuda::CUDAGuard guard(device);
   if (trim_unused) {
     // The caller proves that its provider session is between transactions.
