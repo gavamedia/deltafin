@@ -4491,11 +4491,28 @@ fn target_arch() -> String {
     env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| env::consts::ARCH.to_owned())
 }
 
+/// `cl.exe` does not accept the Windows verbatim (`\\?\`) prefix that
+/// `canonicalize` produces, so the LibTorch root must be spelled as an
+/// ordinary drive path before it reaches the compiler's `/external:I`.
+fn normalize_verbatim_path(path: PathBuf) -> PathBuf {
+    if target_os() == "windows" {
+        let text = path.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path
+}
+
 fn find_torch_root(repository: &Path, emit_cargo_metadata: bool) -> PathBuf {
     let cuda_mode = cuda_mode();
     for variable in ["DELTAFIN_TORCH_ROOT", "LIBTORCH"] {
         if let Some(path) = env::var_os(variable).map(PathBuf::from) {
-            return validate_explicit_torch_root(variable, &path, emit_cargo_metadata);
+            return normalize_verbatim_path(validate_explicit_torch_root(
+                variable,
+                &path,
+                emit_cargo_metadata,
+            ));
         }
     }
 
@@ -4516,7 +4533,7 @@ fn find_torch_root(repository: &Path, emit_cargo_metadata: bool) -> PathBuf {
                 )
             });
         register_toolchain_inputs(&validated.tracked_paths, emit_cargo_metadata);
-        return validated.torch_root;
+        return normalize_verbatim_path(validated.torch_root);
     }
 
     // Migration bridge: a Deltafin binary from before the standalone
@@ -4546,7 +4563,7 @@ fn find_torch_root(repository: &Path, emit_cargo_metadata: bool) -> PathBuf {
             )
         });
     register_toolchain_inputs(&validated.tracked_paths, emit_cargo_metadata);
-    validated.torch_root
+    normalize_verbatim_path(validated.torch_root)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

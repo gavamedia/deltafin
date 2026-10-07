@@ -151,6 +151,10 @@ pub(crate) fn cpp_compile_args(
             // LibTorch's headers are the toolchain's, not ours: their
             // warnings are not this build's to fail on (`-isystem` on GNU).
             "/external:W0",
+            // C4702 from a header template is attributed to the instantiation,
+            // so `/external:W0` does not cover it. PyTorch 2.13's irange.h
+            // trips it on every translation unit; keep it out of `/WX`.
+            "/wd4702",
             "/c",
         ]
         .map(arg),

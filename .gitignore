@@ -11,6 +11,7 @@
 /.k3-draft*/
 /k3-dspark/
 /k3-draft*.install.lock
+/k3-meta.install.lock
 /k3-experts/
 /k3-experts-scale4/
 /k3-model/
