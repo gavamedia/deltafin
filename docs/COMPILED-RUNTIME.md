@@ -87,12 +87,14 @@ that limitation is deliberate and fail-closed.
 The selected LibTorch package carries dormant general-purpose build metadata,
 but the production build never evaluates it. Rust supplies the exact reviewed
 include paths, definitions, sources and link libraries. Every selected
-compiler/archiver must resolve to a native Mach-O or ELF executable, Python
+compiler/archiver must resolve to a native Mach-O, ELF or PE executable, Python
 environment variables and shell-startup hooks are removed, and conventional
 interpreter names in the private build `PATH` resolve to a compiled denial
 guard. That guard leaves a marker before failing; every native compilation and
-archive operation checks the marker. CUDA 12.6/13.0 NVCC is admitted only as a
-native executable belonging to the same major toolkit ABI as LibTorch.
+archive operation checks the marker. NVCC is admitted only as a native
+executable belonging to the same major toolkit ABI as LibTorch: CUDA 12.6 or
+any 13.x toolkit. The CUDA LibTorch root itself is supplied explicitly through
+`DELTAFIN_TORCH_ROOT` (or `LIBTORCH`) on every host.
 
 HTTPS setup and upgrades likewise avoid a generic native-package discovery
 script. Deltafin carries a narrowly maintained `curl-sys` fork whose upstream
@@ -104,8 +106,10 @@ then require libcurl 7.28 or newer with TLS and HTTPS before any transfer.
 These static and runtime checks are covered separately so a library cannot
 pass merely by having a plausible filename.
 
-The current build targets are macOS arm64 and Linux x86-64/aarch64. Windows is
-a future port and is not accepted by the provider build today.
+The current build targets are macOS arm64, Linux x86-64/aarch64 and Windows
+x86-64. Windows builds through MSVC (`cl.exe`/`lib.exe`/`link.exe`), accepts a
+CPU or a CUDA LibTorch root, and deploys the runtime DLLs beside the executable
+instead of relying on an RPATH.
 
 The provider source lives in `native/provider_gate/`. Platform arithmetic also
 reuses these audited sources:

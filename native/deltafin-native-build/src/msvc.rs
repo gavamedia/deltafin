@@ -151,6 +151,10 @@ pub(crate) fn cpp_compile_args(
             // LibTorch's headers are the toolchain's, not ours: their
             // warnings are not this build's to fail on (`-isystem` on GNU).
             "/external:W0",
+            // C4702 from a header template is attributed to the instantiation,
+            // so `/external:W0` does not cover it. PyTorch 2.13's irange.h
+            // trips it on every translation unit; keep it out of `/WX`.
+            "/wd4702",
             "/c",
         ]
         .map(arg),
@@ -283,7 +287,11 @@ pub(crate) fn link_args(
     }
     args.extend(objects.iter().map(|object| object.as_os_str().to_owned()));
     args.extend(archive.map(|archive| archive.as_os_str().to_owned()));
-    args.extend(import_libraries.iter().map(|library| OsString::from(*library)));
+    args.extend(
+        import_libraries
+            .iter()
+            .map(|library| OsString::from(*library)),
+    );
     args
 }
 
@@ -302,7 +310,9 @@ mod tests {
     use super::*;
 
     fn strings(args: &[OsString]) -> Vec<String> {
-        args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect()
+        args.iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
     }
 
     fn has(args: &[String], flag: &str) -> bool {
@@ -335,11 +345,18 @@ mod tests {
                     &["DELTAFIN_HAVE_MXFP4_CPU_V1=1", "USE_RPC"],
                 )),
             ),
-            ("kernel", strings(&c_kernel_compile_args(source, object, true))),
+            (
+                "kernel",
+                strings(&c_kernel_compile_args(source, object, true)),
+            ),
             ("test", strings(&c_test_compile_args(source, object))),
             (
                 "guard",
-                strings(&guard_compile_args(source, object, Path::new(r"C:\out\deny.exe"))),
+                strings(&guard_compile_args(
+                    source,
+                    object,
+                    Path::new(r"C:\out\deny.exe"),
+                )),
             ),
         ]
     }
@@ -348,7 +365,10 @@ mod tests {
     fn no_compile_ever_asks_for_looser_arithmetic_or_a_wider_baseline() {
         for (kind, args) in every_kind() {
             for hazard in ARITHMETIC_HAZARDS {
-                assert!(!has(&args, hazard), "{kind} compile uses {hazard}: {args:?}");
+                assert!(
+                    !has(&args, hazard),
+                    "{kind} compile uses {hazard}: {args:?}"
+                );
             }
         }
     }
@@ -367,7 +387,10 @@ mod tests {
     fn every_compile_uses_the_dynamic_crt_libtorch_uses() {
         for (kind, args) in every_kind() {
             assert!(has(&args, "/MD"), "{kind}: {args:?}");
-            assert!(!has(&args, "/MT") && !has(&args, "/MTd") && !has(&args, "/MDd"), "{kind}");
+            assert!(
+                !has(&args, "/MT") && !has(&args, "/MTd") && !has(&args, "/MDd"),
+                "{kind}"
+            );
         }
     }
 
@@ -425,7 +448,10 @@ mod tests {
     fn archives_are_lib_exe_invocations_with_the_msvc_library_name() {
         let args = strings(&archive_args(
             Path::new(r"C:\out\deltafin_provider_abi.lib"),
-            &[PathBuf::from(r"C:\out\a.obj"), PathBuf::from(r"C:\out\b.obj")],
+            &[
+                PathBuf::from(r"C:\out\a.obj"),
+                PathBuf::from(r"C:\out\b.obj"),
+            ],
         ));
         assert_eq!(
             args,
@@ -436,7 +462,10 @@ mod tests {
                 r"C:\out\b.obj"
             ]
         );
-        assert_eq!(static_library_name("deltafin_provider_abi"), "deltafin_provider_abi.lib");
+        assert_eq!(
+            static_library_name("deltafin_provider_abi"),
+            "deltafin_provider_abi.lib"
+        );
     }
 
     #[test]
@@ -484,8 +513,12 @@ mod tests {
         assert!(is_msvc_banner(
             "Microsoft (R) C/C++ Optimizing Compiler Version 19.50.35725 for x64\nCopyright (C) Microsoft Corporation."
         ));
-        assert!(is_msvc_banner("clang version 22.1.8\nTarget: x86_64-pc-windows-msvc"));
-        assert!(!is_msvc_banner("usage: cl [ option... ] filename... [ /link linkoption... ]"));
+        assert!(is_msvc_banner(
+            "clang version 22.1.8\nTarget: x86_64-pc-windows-msvc"
+        ));
+        assert!(!is_msvc_banner(
+            "usage: cl [ option... ] filename... [ /link linkoption... ]"
+        ));
         assert!(!is_msvc_banner(""));
     }
 
@@ -496,7 +529,10 @@ mod tests {
     fn discovery_without_visual_studio_says_what_to_install() {
         let error = discover("x86_64-pc-windows-msvc").unwrap_err();
         assert!(error.contains("cl.exe"), "{error}");
-        assert!(error.contains("Build Tools") && error.contains("Windows SDK"), "{error}");
+        assert!(
+            error.contains("Build Tools") && error.contains("Windows SDK"),
+            "{error}"
+        );
         // A non-MSVC target is never the MSVC toolchain's to answer.
         assert!(discover("x86_64-unknown-linux-gnu").is_err());
     }

@@ -22,7 +22,12 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime_api.h>
+#if defined(_WIN32)
+#include <malloc.h>
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 #endif
 
 namespace {
@@ -217,9 +222,15 @@ void portable_capability_test() {
 
 #if defined(DELTAFIN_HAVE_CUDA_SPINE_BF16_V1)
 
+#if defined(_WIN32)
+struct FreeDeleter {
+  void operator()(void* pointer) const noexcept { _aligned_free(pointer); }
+};
+#else
 struct FreeDeleter {
   void operator()(void* pointer) const noexcept { std::free(pointer); }
 };
+#endif
 
 std::size_t round_up(const std::size_t value, const std::size_t alignment) {
   if (value > SIZE_MAX - (alignment - 1)) {
@@ -318,8 +329,15 @@ void require_close(const at::Tensor& output,
 }
 
 void physical_cuda_device_test(const int device_index) {
-  const at::Device device(at::kCUDA, device_index);
+  const at::Device device(
+      at::kCUDA, static_cast<c10::DeviceIndex>(device_index));
+#if defined(_WIN32)
+  SYSTEM_INFO system_info;
+  GetSystemInfo(&system_info);
+  const long raw_page = static_cast<long>(system_info.dwPageSize);
+#else
   const long raw_page = sysconf(_SC_PAGESIZE);
+#endif
   if (raw_page <= 0 ||
       !std::has_single_bit(static_cast<std::size_t>(raw_page))) {
     throw std::runtime_error("test could not prove the CUDA host page size");
@@ -333,8 +351,13 @@ void physical_cuda_device_test(const int device_index) {
       second.view.matrix_byte_offset + second.view.logical_bytes;
   const std::size_t allocation_bytes = round_up(logical_slab_bytes, page);
   void* allocated = nullptr;
+#if defined(_WIN32)
+  allocated = _aligned_malloc(allocation_bytes, page);
+  if (allocated == nullptr) {
+#else
   if (posix_memalign(&allocated, page, allocation_bytes) != 0 ||
       allocated == nullptr) {
+#endif
     throw std::runtime_error(
         "could not allocate page-aligned CUDA RAW_BF16 test slab");
   }

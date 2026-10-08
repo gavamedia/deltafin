@@ -705,10 +705,7 @@ pub fn run_production_build() {
             provider.runtime_directory.display()
         );
         println!("cargo:rustc-link-lib=dylib=cudart");
-        println!(
-            "cargo:rustc-link-arg=-Wl,-rpath,{}",
-            provider.runtime_directory.display()
-        );
+        emit_rpath(&provider.runtime_directory);
     }
     if let Some(cuda) = &artifacts.cuda {
         if cuda.runtime == KernelRuntime::Cuda
@@ -736,10 +733,7 @@ pub fn run_production_build() {
                 cuda.runtime_directory.display()
             );
             println!("cargo:rustc-link-lib=dylib=amdhip64");
-            println!(
-                "cargo:rustc-link-arg=-Wl,-rpath,{}",
-                cuda.runtime_directory.display()
-            );
+            emit_rpath(&cuda.runtime_directory);
         }
         println!(
             "cargo:rustc-env=DELTAFIN_GPU_KERNEL_RUNTIME={}",
@@ -792,11 +786,32 @@ pub fn run_production_build() {
     }
     if target_os() == "windows" {
         // Windows has no RPATH: the loader finds LibTorch's DLLs beside the
-        // executable, so the authenticated ones are placed there.
-        deploy_runtime_libraries(
-            &artifacts.torch_lib,
-            &PathBuf::from(required_env("OUT_DIR")),
-        );
+        // executable, so the authenticated ones are placed there. A CUDA build
+        // additionally needs the toolkit's `cudart64_*` runtime beside it.
+        // The toolkit's `cudart64_*` is placed first so it wins the name
+        // collision with any `cudart64_*` a CUDA wheel may bundle: the provider
+        // is linked against the toolkit's import library, and a newer minor is
+        // backward compatible with what LibTorch was built against. The import
+        // library and the DLL may sit in sibling directories (`lib\x64` and
+        // `bin\x64`), so both are offered to the deployer.
+        let mut sources = Vec::new();
+        if let Some(provider) = &artifacts.cuda_provider {
+            sources.push(provider.runtime_directory.clone());
+            if let Some(root) = provider.runtime_directory.parent().and_then(Path::parent) {
+                for extra in ["bin/x64", "bin"] {
+                    let directory = root.join(extra);
+                    if directory.is_dir() {
+                        sources.push(directory);
+                    }
+                }
+            }
+            // CUDA 13's hybrid runtime comes from the driver, not the toolkit.
+            if let Some(driver) = windows_nvcudart_directory() {
+                sources.push(driver);
+            }
+        }
+        sources.push(artifacts.torch_lib.clone());
+        deploy_runtime_libraries(&sources, &PathBuf::from(required_env("OUT_DIR")));
     } else {
         println!(
             "cargo:rustc-link-arg=-Wl,-rpath,{}",
@@ -805,12 +820,21 @@ pub fn run_production_build() {
     }
 }
 
-/// Place LibTorch's DLLs where a Windows process will find them: beside the
-/// executable Cargo produces and beside the test executables in `deps/`. The
-/// files come from the authenticated toolchain (or the operator's root) and
-/// are linked rather than copied where the volume allows, so a 300 MB library
-/// is not duplicated per profile.
-fn deploy_runtime_libraries(torch_lib: &Path, out_dir: &Path) {
+/// `-Wl,-rpath` is a GNU-ld spelling; Windows `link.exe` rejects it and relies
+/// on the deployed DLLs instead.
+fn emit_rpath(directory: &Path) {
+    if target_os() != "windows" {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", directory.display());
+    }
+}
+
+/// Place LibTorch's DLLs (and, for a CUDA build, the toolkit's `cudart64_*`
+/// runtime) where a Windows process will find them: beside the executable Cargo
+/// produces and beside the test executables in `deps/`. The files come from the
+/// authenticated toolchain (or the operator's root) and are linked rather than
+/// copied where the volume allows, so a 300 MB library is not duplicated per
+/// profile.
+fn deploy_runtime_libraries(sources: &[PathBuf], out_dir: &Path) {
     // OUT_DIR is <target>/<profile>/build/<package>-<hash>/out.
     let layout_ok = out_dir
         .ancestors()
@@ -823,22 +847,39 @@ fn deploy_runtime_libraries(torch_lib: &Path, out_dir: &Path) {
             out_dir.display()
         );
     };
-    let mut libraries: Vec<PathBuf> = fs::read_dir(torch_lib)
-        .unwrap_or_else(|error| {
-            panic!("list LibTorch libraries in {}: {error}", torch_lib.display())
-        })
-        .map(|entry| {
-            entry
+    let mut libraries: Vec<PathBuf> = Vec::new();
+    for source in sources {
+        let entries = fs::read_dir(source).unwrap_or_else(|error| {
+            panic!("list runtime libraries in {}: {error}", source.display())
+        });
+        for entry in entries {
+            let path = entry
                 .unwrap_or_else(|error| {
-                    panic!("read LibTorch directory {}: {error}", torch_lib.display())
+                    panic!(
+                        "read runtime library directory {}: {error}",
+                        source.display()
+                    )
                 })
-                .path()
-        })
-        .filter(|path| {
-            path.extension()
+                .path();
+            // A CUDA wheel ships `torch_python.dll`, which imports a Python
+            // runtime; the CPU wheels omit it. Skip it here, as the bootstrap
+            // does, so the deployed set stays Python-free.
+            let is_python = path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.to_ascii_lowercase().contains("python"));
+            if path
+                .extension()
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("dll"))
-        })
-        .collect();
+                && !is_python
+                && !libraries
+                    .iter()
+                    .any(|existing| existing.file_name() == path.file_name())
+            {
+                libraries.push(path);
+            }
+        }
+    }
     libraries.sort();
     for directory in [
         profile_directory.to_path_buf(),
@@ -1168,15 +1209,6 @@ fn build_provider_artifacts(
     validate_torch_version(&torch_root, emit_cargo_metadata);
     let torch_lib = torch_root.join("lib");
     let libtorch_cxx11_abi = detect_libtorch_cxx11_abi(&torch_lib);
-    if target_os() == "windows"
-        && (library_file(&torch_lib, "torch_cuda").is_some()
-            || library_file(&torch_lib, "c10_cuda").is_some())
-    {
-        panic!(
-            "{} holds a CUDA-enabled LibTorch; the Windows native build graph supports the CPU runtime today",
-            torch_lib.display()
-        );
-    }
     let gpu_runtime = detect_gpu_runtime(&torch_lib);
     // Only NVIDIA needs the separate cudart toolkit discovery; a ROCm tree
     // resolves HIP through its own runtime and has no cudart to find.
@@ -1219,6 +1251,13 @@ fn build_provider_artifacts(
         guard
             .loader_directories
             .push(provider.runtime_directory.clone());
+        // CUDA 13's runtime is the driver-provided `nvcudart_hybrid64.dll`; no
+        // toolkit ships it, so the test loader path must reach the DriverStore.
+        if target_os() == "windows" {
+            if let Some(driver) = windows_nvcudart_directory() {
+                guard.loader_directories.push(driver);
+            }
+        }
     }
     validate_compiler(&toolchain, &toolchain.cc, "C", &guard);
     validate_compiler(&toolchain, &toolchain.cxx, "C++", &guard);
@@ -2068,10 +2107,7 @@ fn audit_pe_dependencies(binary: &Path, roots: &[PathBuf]) -> NativeBuildResult<
         ))
     })?;
     let image = deltafin_sys::pe::parse_image(&mut file).map_err(|error| {
-        NativeBuildError::new(format!(
-            "malformed PE image {}: {error}",
-            binary.display()
-        ))
+        NativeBuildError::new(format!("malformed PE image {}: {error}", binary.display()))
     })?;
     if image.headers.machine != deltafin_sys::pe::MACHINE_AMD64 || !image.headers.pe32_plus {
         return Err(NativeBuildError::new(format!(
@@ -2456,7 +2492,10 @@ fn linux_loader_cache_directories(
         if !path.is_absolute() {
             continue;
         }
-        if let Some(parent) = path.parent().and_then(|value| deltafin_sys::fs::canonicalize(value).ok()) {
+        if let Some(parent) = path
+            .parent()
+            .and_then(|value| deltafin_sys::fs::canonicalize(value).ok())
+        {
             directories.insert(parent);
         }
     }
@@ -2483,11 +2522,7 @@ impl NativeToolchain {
         let target_os = target_os();
         match target_os.as_str() {
             "macos" => Self::gnu(&["/usr/bin/clang"], &["/usr/bin/clang++"], &["/usr/bin/ar"]),
-            "linux" => Self::gnu(
-                &["cc", "clang", "gcc"],
-                &["c++", "clang++", "g++"],
-                &["ar"],
-            ),
+            "linux" => Self::gnu(&["cc", "clang", "gcc"], &["c++", "clang++", "g++"], &["ar"]),
             "windows" => Self::msvc(),
             target => panic!("native provider ABI does not support target OS {target}"),
         }
@@ -3540,12 +3575,13 @@ fn find_cuda_provider(torch_root: &Path) -> CudaProviderBuild {
                 continue;
             }
             if let Some(runtime_directory) = cuda_runtime_directory_optional(&root) {
-                let include_directory = deltafin_sys::fs::canonicalize(&include).unwrap_or_else(|error| {
-                    panic!(
-                        "resolve CUDA provider include directory {}: {error}",
-                        include.display()
-                    )
-                });
+                let include_directory =
+                    deltafin_sys::fs::canonicalize(&include).unwrap_or_else(|error| {
+                        panic!(
+                            "resolve CUDA provider include directory {}: {error}",
+                            include.display()
+                        )
+                    });
                 return CudaProviderBuild {
                     include_directory,
                     runtime_directory,
@@ -3579,9 +3615,13 @@ fn build_cuda_kernel(
     emit_cargo_metadata: bool,
 ) -> Option<CudaBuild> {
     let mode = cuda_mode();
-    if target_os() != "linux" || mode == CudaMode::Off {
+    let host_os = target_os();
+    if mode == CudaMode::Off {
+        return None;
+    }
+    if host_os != "linux" && host_os != "windows" {
         if mode == CudaMode::On {
-            panic!("DELTAFIN_CUDA_MOE=ON is supported only for a Linux target");
+            panic!("DELTAFIN_CUDA_MOE=ON is supported only for Linux and Windows targets");
         }
         return None;
     }
@@ -3591,19 +3631,28 @@ fn build_cuda_kernel(
         }
         return None;
     };
-    let plan = match runtime {
-        GpuRuntime::Cuda(major) => {
-            plan_cuda_kernel_build(major, mode, guard, emit_cargo_metadata)?
+    // The HIP port is Linux-only; a ROCm LibTorch on another host falls back to
+    // the CPU MXFP4 path.
+    if matches!(runtime, GpuRuntime::Rocm) && host_os != "linux" {
+        if mode == CudaMode::On {
+            panic!(
+                "DELTAFIN_CUDA_MOE=ON selected a ROCm/HIP LibTorch on {host_os}; the HIP kernel port is Linux-only"
+            );
         }
+        return None;
+    }
+    let plan = match runtime {
+        GpuRuntime::Cuda(major) => plan_cuda_kernel_build(major, mode, guard, emit_cargo_metadata)?,
         GpuRuntime::Rocm => plan_hip_kernel_build(mode, guard, emit_cargo_metadata)?,
     };
-    let object = native_build.join("cuda_moe_kernels.o");
-    let spine_object = native_build.join("provider_spine_bf16_cuda_kernel.o");
+    let object = native_build.join(object_file_name("cuda_moe_kernels"));
+    let spine_object = native_build.join(object_file_name("provider_spine_bf16_cuda_kernel"));
     let provider_source = repository.join("native/provider_gate");
     // Both translation units include tools/gpu_runtime_compat.h, which selects
     // the CUDA or HIP runtime headers. Only the MoE kernel finds it beside
-    // itself; the spine kernel needs the search path.
-    let compat_include = format!("-I{}", repository.join("tools").display());
+    // itself; the spine kernel needs the search path. A separate `-I` argument
+    // keeps a Windows path with spaces intact.
+    let compat_include = repository.join("tools");
     for (source, output, label) in [
         (
             repository.join("tools/cuda_moe_kernels.cu"),
@@ -3619,16 +3668,31 @@ fn build_cuda_kernel(
         let mut command = Command::new(&plan.compiler);
         match plan.runtime {
             KernelRuntime::Cuda => {
-                command
-                    .args([
-                        "-std=c++17",
-                        "-O3",
-                        "-DNDEBUG",
-                        "-Xcompiler=-fPIC",
-                        "-ccbin",
-                    ])
-                    .arg(&toolchain.cxx)
-                    .args(CUDA_IEEE_MATH_FLAGS);
+                command.args(["-std=c++17", "-O3", "-DNDEBUG"]);
+                // The host compiler is `cl.exe` on Windows and the GNU C++
+                // driver elsewhere. `cl.exe` has no `-fPIC`, needs LibTorch's
+                // dynamic CRT (mixing CRTs across the DLL boundary corrupts the
+                // heap) and the same exception/preprocessor contract as the
+                // provider translation units, and `-ccbin` names its directory.
+                let ccbin = if target_os() == "windows" {
+                    command.args([
+                        "-Xcompiler=/MD",
+                        "-Xcompiler=/EHsc",
+                        "-Xcompiler=/Zc:__cplusplus",
+                        "-DNOMINMAX",
+                        "-DWIN32_LEAN_AND_MEAN",
+                        "-D_CRT_SECURE_NO_WARNINGS",
+                    ]);
+                    toolchain
+                        .cxx
+                        .parent()
+                        .unwrap_or(toolchain.cxx.as_path())
+                        .to_path_buf()
+                } else {
+                    command.arg("-Xcompiler=-fPIC");
+                    toolchain.cxx.clone()
+                };
+                command.arg("-ccbin").arg(ccbin).args(CUDA_IEEE_MATH_FLAGS);
                 for architecture in plan.architectures.split(';') {
                     command.arg(format!(
                         "--generate-code=arch=compute_{architecture},code=[compute_{architecture},sm_{architecture}]"
@@ -3650,6 +3714,7 @@ fn build_cuda_kernel(
             }
         }
         command
+            .arg("-I")
             .arg(&compat_include)
             .arg("-c")
             .arg(source)
@@ -3677,7 +3742,7 @@ fn plan_cuda_kernel_build(
 ) -> Option<KernelBuildPlan> {
     let Some(compiler) = discover_nvcc() else {
         if mode == CudaMode::On {
-            panic!("DELTAFIN_CUDA_MOE=ON needs NVCC from exact CUDA 12.6 or 13.0");
+            panic!("DELTAFIN_CUDA_MOE=ON needs NVCC from CUDA 12.6 or any CUDA 13.x");
         }
         if emit_cargo_metadata {
             println!(
@@ -3706,9 +3771,12 @@ fn plan_cuda_kernel_build(
             compiler.display()
         );
     }
-    if !matches!((toolkit_major, toolkit_minor), (12, 6) | (13, 0)) {
+    // CUDA minor releases are ABI-compatible within a major, so any 13.x
+    // toolkit may build against the pinned cu130 LibTorch; 12.x is held to the
+    // validated 12.6.
+    if !matches!((toolkit_major, toolkit_minor), (12, 6) | (13, _)) {
         panic!(
-            "Deltafin's PyTorch 2.13 CUDA gate accepts exact CUDA 12.6 or 13.0; found {toolkit_version}"
+            "Deltafin's PyTorch 2.13 CUDA gate accepts CUDA 12.6 or any CUDA 13.x; found {toolkit_version}"
         );
     }
     let toolkit_root = cuda_toolkit_root(&compiler);
@@ -3783,6 +3851,11 @@ fn plan_hip_kernel_build(
     })
 }
 
+/// NVCC's file name on this host: `nvcc.exe` on Windows, `nvcc` elsewhere.
+fn nvcc_file_name() -> String {
+    format!("nvcc{}", std::env::consts::EXE_SUFFIX)
+}
+
 fn discover_nvcc() -> Option<PathBuf> {
     for variable in ["CUDACXX", "CMAKE_CUDA_COMPILER"] {
         if let Some(value) = env::var_os(variable) {
@@ -3797,7 +3870,7 @@ fn discover_nvcc() -> Option<PathBuf> {
                     PathBuf::from(&value).display()
                 )
             });
-            let candidate = root.join("bin/nvcc");
+            let candidate = root.join("bin").join(nvcc_file_name());
             if !candidate.is_file() {
                 // A runtime/development-header package is sufficient for the
                 // CUDA allocator provider. NVCC is independently required
@@ -3807,7 +3880,7 @@ fn discover_nvcc() -> Option<PathBuf> {
             return Some(resolve_tool_path(&candidate, "NVCC"));
         }
     }
-    find_on_path(OsStr::new("nvcc")).map(|path| resolve_tool_path(&path, "NVCC"))
+    find_on_path(OsStr::new(&nvcc_file_name())).map(|path| resolve_tool_path(&path, "NVCC"))
 }
 
 fn discover_hipcc() -> Option<PathBuf> {
@@ -3867,12 +3940,13 @@ fn hip_toolkit_root(compiler: &Path) -> PathBuf {
     // a mixed toolchain the same way a mismatched CUDA_HOME would, so the two
     // must agree before either is trusted.
     let root = explicit_root.unwrap_or(inferred);
-    let root_hipcc = deltafin_sys::fs::canonicalize(root.join("bin/hipcc")).unwrap_or_else(|error| {
-        panic!(
-            "selected ROCm root {} has no resolvable bin/hipcc: {error}",
-            root.display()
-        )
-    });
+    let root_hipcc =
+        deltafin_sys::fs::canonicalize(root.join("bin/hipcc")).unwrap_or_else(|error| {
+            panic!(
+                "selected ROCm root {} has no resolvable bin/hipcc: {error}",
+                root.display()
+            )
+        });
     if root_hipcc != compiler {
         panic!(
             "mixed ROCm toolchains are forbidden: compiler {} is not {}/bin/hipcc",
@@ -3911,9 +3985,7 @@ fn hip_architectures() -> String {
                     || !part[3..].bytes().all(|byte| byte.is_ascii_alphanumeric())
             })
         {
-            panic!(
-                "DELTAFIN_HIP_ARCHITECTURES must be a semicolon-separated list of gfx targets"
-            );
+            panic!("DELTAFIN_HIP_ARCHITECTURES must be a semicolon-separated list of gfx targets");
         }
         return value.into_owned();
     }
@@ -3979,12 +4051,13 @@ fn cuda_toolkit_root(compiler: &Path) -> PathBuf {
         }
     }
     let root = explicit_root.unwrap_or(inferred);
-    let root_nvcc = deltafin_sys::fs::canonicalize(root.join("bin/nvcc")).unwrap_or_else(|error| {
-        panic!(
-            "selected CUDA toolkit {} has no resolvable bin/nvcc: {error}",
-            root.display()
-        )
-    });
+    let root_nvcc = deltafin_sys::fs::canonicalize(root.join("bin").join(nvcc_file_name()))
+        .unwrap_or_else(|error| {
+            panic!(
+                "selected CUDA toolkit {} has no resolvable bin/nvcc: {error}",
+                root.display()
+            )
+        });
     if root_nvcc != compiler {
         panic!(
             "mixed CUDA toolchains are forbidden: compiler {} is not {}/bin/nvcc",
@@ -4005,6 +4078,9 @@ fn cuda_runtime_directory(root: &Path) -> PathBuf {
 }
 
 fn cuda_runtime_directory_optional(root: &Path) -> Option<PathBuf> {
+    if target_os() == "windows" {
+        return windows_cuda_runtime_directory(root);
+    }
     let target_arch = target_arch();
     let (target_dir, multiarch_dir) = match target_arch.as_str() {
         "x86_64" => ("x86_64-linux", "x86_64-linux-gnu"),
@@ -4021,18 +4097,97 @@ fn cuda_runtime_directory_optional(root: &Path) -> Option<PathBuf> {
             continue;
         };
         let found = entries.filter_map(Result::ok).any(|entry| {
-            entry.file_name().as_encoded_bytes().starts_with(b"libcudart.so") && entry.path().is_file()
+            entry
+                .file_name()
+                .as_encoded_bytes()
+                .starts_with(b"libcudart.so")
+                && entry.path().is_file()
         });
         if found {
-            return Some(deltafin_sys::fs::canonicalize(&candidate).unwrap_or_else(|error| {
-                panic!(
-                    "resolve CUDA runtime directory {}: {error}",
-                    candidate.display()
-                )
-            }));
+            return Some(
+                deltafin_sys::fs::canonicalize(&candidate).unwrap_or_else(|error| {
+                    panic!(
+                        "resolve CUDA runtime directory {}: {error}",
+                        candidate.display()
+                    )
+                }),
+            );
         }
     }
     None
+}
+
+/// The Windows CUDA toolkit names its runtime import library `cudart.lib` (in
+/// `lib\x64`) and the loadable runtime `cudart64_<major>.dll` (in `bin\x64`), so
+/// the two can live in sibling directories and the shared `library_file` name
+/// check does not apply. Prefer the import-library directory, since the linker
+/// needs it and the wheel usually supplies the DLL beside LibTorch.
+fn windows_cuda_runtime_directory(root: &Path) -> Option<PathBuf> {
+    for relative in ["lib/x64", "lib", "lib/Win32"] {
+        let candidate = root.join(relative);
+        if candidate.join("cudart.lib").is_file() {
+            return Some(
+                deltafin_sys::fs::canonicalize(&candidate).unwrap_or_else(|error| {
+                    panic!(
+                        "resolve CUDA runtime directory {}: {error}",
+                        candidate.display()
+                    )
+                }),
+            );
+        }
+    }
+    for relative in ["bin/x64", "bin", "lib/x64", "lib"] {
+        let candidate = root.join(relative);
+        if windows_has_cudart_dll(&candidate) {
+            return Some(
+                deltafin_sys::fs::canonicalize(&candidate).unwrap_or_else(|error| {
+                    panic!(
+                        "resolve CUDA runtime directory {}: {error}",
+                        candidate.display()
+                    )
+                }),
+            );
+        }
+    }
+    None
+}
+
+/// Whether `directory` holds a loadable CUDA runtime: the versioned `cudart64_*`
+/// forwarder or the CUDA 13 driver-provided `nvcudart_hybrid64.dll`.
+fn windows_has_cudart_dll(directory: &Path) -> bool {
+    fs::read_dir(directory).ok().is_some_and(|entries| {
+        entries.filter_map(Result::ok).any(|entry| {
+            let name = entry.file_name();
+            let bytes = name.as_encoded_bytes();
+            (bytes.starts_with(b"cudart64_") || bytes.starts_with(b"nvcudart"))
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("dll"))
+        })
+    })
+}
+
+/// Locate the CUDA 13 driver-provided hybrid runtime (`nvcudart_hybrid64.dll`).
+/// CUDA 13's `cudart64_*` and LibTorch import it, but no toolkit ships it: it
+/// comes with the display driver and lives in the DriverStore. Search the
+/// toolkit `bin`, the system directory, and the DriverStore package folders.
+fn windows_nvcudart_directory() -> Option<PathBuf> {
+    const HYBRID: &str = "nvcudart_hybrid64.dll";
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(cuda_path) = env::var_os("CUDA_PATH") {
+        candidates.push(PathBuf::from(&cuda_path).join("bin/x64"));
+        candidates.push(PathBuf::from(&cuda_path).join("bin"));
+    }
+    if let Ok(system) = deltafin_sys::fs::system_directory() {
+        candidates.push(system.clone());
+        if let Ok(entries) = fs::read_dir(system.join("DriverStore/FileRepository")) {
+            candidates.extend(entries.filter_map(Result::ok).map(|entry| entry.path()));
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|directory| directory.join(HYBRID).is_file())
 }
 
 fn cuda_architectures(major: u8, minor: u8) -> String {
@@ -4050,8 +4205,8 @@ fn cuda_architectures(major: u8, minor: u8) -> String {
         return value.into_owned();
     }
     match (major, minor, target_arch().as_str()) {
-        (13, 0, "aarch64") => "80;90;100;110;120",
-        (13, 0, "x86_64") => "75;80;86;90;100;120",
+        (13, _, "aarch64") => "80;90;100;110;120",
+        (13, _, "x86_64") => "75;80;86;90;100;120",
         (12, 6, "aarch64") => "80;90",
         (12, 6, "x86_64") => "50;60;70;75;80;86;90",
         (_, _, arch) => panic!("unsupported CUDA toolkit/target combination for {arch}"),
@@ -4231,11 +4386,31 @@ fn resolve_tool_path(path: &Path, label: &str) -> PathBuf {
 }
 
 fn find_on_path(name: &OsStr) -> Option<PathBuf> {
-    env::var_os("PATH").and_then(|path| {
-        env::split_paths(&path)
-            .map(|directory| directory.join(name))
+    let path = env::var_os("PATH")?;
+    let direct = env::split_paths(&path)
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file());
+    if direct.is_some() {
+        return direct;
+    }
+    // Windows resolves a bare name through `PATHEXT`; a name that already
+    // carries an extension is exact.
+    if target_os() != "windows" || Path::new(name).extension().is_some() {
+        return None;
+    }
+    let extensions = env::var_os("PATHEXT")
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_owned());
+    for extension in extensions.split(';').filter(|part| !part.is_empty()) {
+        let candidate_name = format!("{}{}", name.to_string_lossy(), extension);
+        if let Some(found) = env::split_paths(&path)
+            .map(|directory| directory.join(&candidate_name))
             .find(|candidate| candidate.is_file())
-    })
+        {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// Enough of a Windows program's headers to follow `e_lfanew` to its PE
@@ -4491,11 +4666,28 @@ fn target_arch() -> String {
     env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| env::consts::ARCH.to_owned())
 }
 
+/// `cl.exe` does not accept the Windows verbatim (`\\?\`) prefix that
+/// `canonicalize` produces, so the LibTorch root must be spelled as an
+/// ordinary drive path before it reaches the compiler's `/external:I`.
+fn normalize_verbatim_path(path: PathBuf) -> PathBuf {
+    if target_os() == "windows" {
+        let text = path.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path
+}
+
 fn find_torch_root(repository: &Path, emit_cargo_metadata: bool) -> PathBuf {
     let cuda_mode = cuda_mode();
     for variable in ["DELTAFIN_TORCH_ROOT", "LIBTORCH"] {
         if let Some(path) = env::var_os(variable).map(PathBuf::from) {
-            return validate_explicit_torch_root(variable, &path, emit_cargo_metadata);
+            return normalize_verbatim_path(validate_explicit_torch_root(
+                variable,
+                &path,
+                emit_cargo_metadata,
+            ));
         }
     }
 
@@ -4516,7 +4708,7 @@ fn find_torch_root(repository: &Path, emit_cargo_metadata: bool) -> PathBuf {
                 )
             });
         register_toolchain_inputs(&validated.tracked_paths, emit_cargo_metadata);
-        return validated.torch_root;
+        return normalize_verbatim_path(validated.torch_root);
     }
 
     // Migration bridge: a Deltafin binary from before the standalone
@@ -4546,7 +4738,7 @@ fn find_torch_root(repository: &Path, emit_cargo_metadata: bool) -> PathBuf {
             )
         });
     register_toolchain_inputs(&validated.tracked_paths, emit_cargo_metadata);
-    validated.torch_root
+    normalize_verbatim_path(validated.torch_root)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4611,17 +4803,18 @@ fn emit_upgrade_build_profile(
             ("DELTAFIN_CUDA_ARCHITECTURES", Some((architectures, _))) => {
                 Some(encode_profile_bytes(architectures.as_bytes()))
             }
-            ("CUDACXX" | "CMAKE_CUDA_COMPILER", Some((_, compiler))) => {
-                Some(encode_profile_bytes(compiler.as_os_str().as_encoded_bytes()))
-            }
+            ("CUDACXX" | "CMAKE_CUDA_COMPILER", Some((_, compiler))) => Some(encode_profile_bytes(
+                compiler.as_os_str().as_encoded_bytes(),
+            )),
             ("CUDAToolkit_ROOT" | "CUDA_HOME" | "CUDA_PATH", _) if cuda_provider_enabled => {
                 env::var_os(variable).map(|value| {
-                    let canonical = deltafin_sys::fs::canonicalize(&value).unwrap_or_else(|error| {
-                        panic!(
-                            "resolve CUDA build-profile path {variable}={}: {error}",
-                            PathBuf::from(&value).display()
-                        )
-                    });
+                    let canonical =
+                        deltafin_sys::fs::canonicalize(&value).unwrap_or_else(|error| {
+                            panic!(
+                                "resolve CUDA build-profile path {variable}={}: {error}",
+                                PathBuf::from(&value).display()
+                            )
+                        });
                     encode_profile_bytes(canonical.as_os_str().as_encoded_bytes())
                 })
             }
@@ -4743,8 +4936,8 @@ fn validate_explicit_torch_root(variable: &str, path: &Path, emit_cargo_metadata
         }
     }
     if cuda_mode() == CudaMode::On {
-        if target_os() != "linux" {
-            panic!("DELTAFIN_CUDA_MOE=ON is supported only for a Linux target");
+        if target_os() != "linux" && target_os() != "windows" {
+            panic!("DELTAFIN_CUDA_MOE=ON is supported only for Linux and Windows targets");
         }
         for required in [torch_cuda, c10_cuda] {
             required.unwrap_or_else(|| {
@@ -4798,16 +4991,31 @@ fn shared_library_name(name: &str) -> String {
 ///
 /// A ROCm build of PyTorch keeps the CUDA library names and the `at::kCUDA`
 /// device type, reaching AMD hardware through HIP, so the pair's presence
-/// alone cannot distinguish the two. The ELF dependency does: NVIDIA builds
-/// carry `libcudart.so.N` and ROCm builds carry `libamdhip64.so`.
+/// alone cannot distinguish the two. The dependency does: NVIDIA builds carry
+/// `libcudart.so.N` / `cudart64_N.dll` and ROCm builds carry
+/// `libamdhip64.so` / `amdhip64.dll`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GpuRuntime {
     Cuda(u8),
     Rocm,
 }
 
+/// The loadable module a runtime dependency scan must read: the shared object
+/// on Unix, the DLL on Windows. `library_file` answers the linker's question
+/// (the import library on Windows), which does not itself name the DLLs the
+/// module imports.
+fn runtime_module(directory: &Path, name: &str) -> Option<PathBuf> {
+    if target_os() == "windows" {
+        let module = directory.join(format!("{name}.dll"));
+        module.is_file().then_some(module)
+    } else {
+        library_file(directory, name)
+    }
+}
+
 fn detect_gpu_runtime(torch_lib: &Path) -> Option<GpuRuntime> {
-    if target_os() != "linux" {
+    let host_os = target_os();
+    if host_os != "linux" && host_os != "windows" {
         return None;
     }
     let cuda_libraries = [
@@ -4825,12 +5033,31 @@ fn detect_gpu_runtime(torch_lib: &Path) -> Option<GpuRuntime> {
     }
 
     // libc10_cuda owns PyTorch's low-level device runtime calls and therefore
-    // carries the direct cudart or HIP ELF dependency. Inspecting this small
-    // library avoids reading the multi-gigabyte torch payload on every build.
-    let c10_cuda = cuda_libraries[0].as_deref().expect("complete CUDA pair");
-    let found_hip = file_contains(c10_cuda, b"libamdhip64.so\0");
-    let found_12 = file_contains(c10_cuda, b"libcudart.so.12\0");
-    let found_13 = file_contains(c10_cuda, b"libcudart.so.13\0");
+    // carries the direct cudart or HIP dependency: an ELF `DT_NEEDED` entry on
+    // Unix, a PE import on Windows. Inspecting this small library avoids reading
+    // the multi-gigabyte torch payload on every build.
+    let c10_cuda = runtime_module(torch_lib, "c10_cuda").unwrap_or_else(|| {
+        panic!(
+            "selected native PyTorch root has no loadable c10_cuda module in {}",
+            torch_lib.display()
+        )
+    });
+    let (found_hip, found_12, found_13) = if host_os == "windows" {
+        (
+            file_contains(&c10_cuda, b"amdhip64.dll\0"),
+            file_contains(&c10_cuda, b"cudart64_12.dll\0"),
+            // CUDA 13 moved the runtime to the driver-provided hybrid library;
+            // some builds still import the versioned forwarder instead.
+            file_contains(&c10_cuda, b"nvcudart_hybrid64.dll\0")
+                || file_contains(&c10_cuda, b"cudart64_13.dll\0"),
+        )
+    } else {
+        (
+            file_contains(&c10_cuda, b"libamdhip64.so\0"),
+            file_contains(&c10_cuda, b"libcudart.so.12\0"),
+            file_contains(&c10_cuda, b"libcudart.so.13\0"),
+        )
+    };
     if found_hip && (found_12 || found_13) {
         panic!(
             "selected LibTorch root {} references both the HIP and CUDA runtimes",
@@ -4844,7 +5071,7 @@ fn detect_gpu_runtime(torch_lib: &Path) -> Option<GpuRuntime> {
         (true, false) => Some(GpuRuntime::Cuda(12)),
         (false, true) => Some(GpuRuntime::Cuda(13)),
         (false, false) => panic!(
-            "could not identify the GPU runtime ABI required by the selected LibTorch root {}; expected an ELF dependency on libcudart.so.12, libcudart.so.13, or libamdhip64.so",
+            "could not identify the GPU runtime ABI required by the selected LibTorch root {}; expected a dependency on libcudart.so.12/cudart64_12.dll, libcudart.so.13/cudart64_13.dll, or libamdhip64.so/amdhip64.dll",
             torch_lib.display()
         ),
         (true, true) => panic!(
@@ -5114,9 +5341,65 @@ mod windows_graph_tests {
 
     /// `<root>/target/release/build/<package>-<hash>/out`, as Cargo lays it out.
     fn out_dir(scratch: &Scratch) -> PathBuf {
-        let out = scratch.0.join("target/release/build/deltafin-0123456789abcdef/out");
+        let out = scratch
+            .0
+            .join("target/release/build/deltafin-0123456789abcdef/out");
         fs::create_dir_all(&out).unwrap();
         out
+    }
+
+    #[test]
+    fn nvcc_discovery_uses_the_host_executable_suffix() {
+        assert_eq!(
+            nvcc_file_name(),
+            format!("nvcc{}", std::env::consts::EXE_SUFFIX)
+        );
+    }
+
+    #[test]
+    fn windows_cudart_discovery_prefers_the_import_library_then_the_dll() {
+        let scratch = Scratch::new("cudart");
+        scratch.write("lib/x64/cudart.lib", b"lib");
+        scratch.write("bin/x64/cudart64_13.dll", b"dll");
+        assert_eq!(
+            windows_cuda_runtime_directory(&scratch.0).unwrap(),
+            deltafin_sys::fs::canonicalize(scratch.0.join("lib/x64")).unwrap()
+        );
+
+        // A DLL-only layout is still accepted for the loader.
+        let dll_only = Scratch::new("cudart-dll");
+        dll_only.write("bin/x64/cudart64_13.dll", b"dll");
+        assert_eq!(
+            windows_cuda_runtime_directory(&dll_only.0).unwrap(),
+            deltafin_sys::fs::canonicalize(dll_only.0.join("bin/x64")).unwrap()
+        );
+
+        // The CUDA 13 driver-provided hybrid runtime counts as a cudart.
+        let hybrid = Scratch::new("cudart-hybrid");
+        hybrid.write("bin/x64/nvcudart_hybrid64.dll", b"dll");
+        assert!(windows_cuda_runtime_directory(&hybrid.0).is_some());
+
+        let none = Scratch::new("cudart-none");
+        fs::create_dir_all(none.0.join("lib")).unwrap();
+        assert!(windows_cuda_runtime_directory(&none.0).is_none());
+    }
+
+    #[test]
+    fn gpu_runtime_detection_reads_the_c10_cuda_dependency() {
+        let scratch = Scratch::new("gpu-runtime");
+        let lib = scratch.0.join("lib");
+        if target_os() == "windows" {
+            // The import library names the module; the module carries the
+            // runtime import the scan reads (the CUDA 13 hybrid runtime).
+            scratch.write("lib/c10_cuda.lib", b"import");
+            scratch.write("lib/torch_cuda.lib", b"import");
+            scratch.write("lib/c10_cuda.dll", b"nvcudart_hybrid64.dll\0");
+            scratch.write("lib/torch_cuda.dll", b"nvcudart_hybrid64.dll\0");
+        } else {
+            scratch.write("lib/libc10_cuda.so", b"libcudart.so.13\0");
+            scratch.write("lib/libtorch_cuda.so", b"libcudart.so.13\0");
+        }
+        assert_eq!(detect_gpu_runtime(&lib), Some(GpuRuntime::Cuda(13)));
     }
 
     #[test]
@@ -5133,7 +5416,10 @@ mod windows_graph_tests {
         // file mapped does not make a no-op deployment fail.
         let before = fs::metadata(&destination).unwrap().modified().unwrap();
         deploy_one_library(&source, &destination);
-        assert_eq!(fs::metadata(&destination).unwrap().modified().unwrap(), before);
+        assert_eq!(
+            fs::metadata(&destination).unwrap().modified().unwrap(),
+            before
+        );
     }
 
     #[test]
@@ -5194,7 +5480,7 @@ mod windows_graph_tests {
         }
         let out = out_dir(&scratch);
 
-        deploy_runtime_libraries(&torch_lib, &out);
+        deploy_runtime_libraries(std::slice::from_ref(&torch_lib), &out);
 
         let profile = scratch.0.join("target/release");
         for directory in [profile.clone(), profile.join("deps")] {
@@ -5213,19 +5499,31 @@ mod windows_graph_tests {
     }
 
     #[test]
-    fn deployment_refuses_an_unexpected_cargo_layout_and_python_libraries() {
+    fn deployment_refuses_an_unexpected_cargo_layout_and_skips_python_libraries() {
         let scratch = Scratch::new("deploy-layout");
         let torch_lib = scratch.0.join("torch/lib");
         scratch.write("torch/lib/c10.dll", b"c10");
         // Not <profile>/build/<package>/out.
         let odd = scratch.0.join("somewhere/else/out");
         fs::create_dir_all(&odd).unwrap();
-        assert!(std::panic::catch_unwind(|| deploy_runtime_libraries(&torch_lib, &odd)).is_err());
+        assert!(
+            std::panic::catch_unwind(|| deploy_runtime_libraries(
+                std::slice::from_ref(&torch_lib),
+                &odd
+            ))
+            .is_err()
+        );
 
-        // A Python binding library is refused by name, wherever it came from.
+        // A Python binding library is skipped by name, wherever it came from,
+        // so the deployed set stays Python-free.
         scratch.write("torch/lib/torch_python.dll", b"never");
         let out = out_dir(&scratch);
-        assert!(std::panic::catch_unwind(|| deploy_runtime_libraries(&torch_lib, &out)).is_err());
+        deploy_runtime_libraries(std::slice::from_ref(&torch_lib), &out);
+        let profile = scratch.0.join("target/release");
+        for directory in [profile.clone(), profile.join("deps")] {
+            assert!(directory.join("c10.dll").is_file());
+            assert!(!directory.join("torch_python.dll").exists());
+        }
     }
 
     #[test]
@@ -5250,13 +5548,19 @@ mod windows_graph_tests {
         let torch_lib = scratch.0.join("torch/lib");
         scratch.write(
             "torch/lib/c10.dll",
-            &SyntheticImage::dll().importing(&["api-ms-win-core-synch-l1-2-0.dll"]).build(),
+            &SyntheticImage::dll()
+                .importing(&["api-ms-win-core-synch-l1-2-0.dll"])
+                .build(),
         );
         let test_dir = scratch.0.join("test");
         let executable = scratch.write(
             "test/test.exe",
             &SyntheticImage::executable()
-                .importing(&["api-ms-win-crt-runtime-l1-1-0.dll", "c10.dll", "no-such-library.dll"])
+                .importing(&[
+                    "api-ms-win-crt-runtime-l1-1-0.dll",
+                    "c10.dll",
+                    "no-such-library.dll",
+                ])
                 .build(),
         );
         let _ = &test_dir;
@@ -5267,7 +5571,10 @@ mod windows_graph_tests {
             let error = audit_pe_dependencies(&executable, std::slice::from_ref(&torch_lib))
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("locate the Windows system directory"), "{error}");
+            assert!(
+                error.contains("locate the Windows system directory"),
+                "{error}"
+            );
             return;
         }
         let error = audit_pe_dependencies(&executable, std::slice::from_ref(&torch_lib))
